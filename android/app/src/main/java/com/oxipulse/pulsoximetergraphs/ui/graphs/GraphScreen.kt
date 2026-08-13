@@ -217,10 +217,26 @@ private fun StatsRow(label: String, min: Int?, max: Int?, avg: Double?, unit: St
     }
 }
 
-private val TimeAxisFormatter = CartesianValueFormatter { _, value, _ ->
-    val instant = Instant.ofEpochSecond(value.toLong())
-    DateTimeFormatter.ofPattern("HH:mm").format(instant.atZone(ZoneId.systemDefault()))
-}
+// Plotted by each reading's INDEX in the (already range-filtered) list, not by its raw epoch
+// second. Vico derives its horizontal pixels-per-unit scale from the GCD of consecutive x
+// deltas in the series; real readings are sampled roughly once a second during a session but
+// can have arbitrarily large gaps between sessions, so using raw timestamps as x collapses
+// that GCD to ~1 second while the selected range can span hours or days. That blows up the
+// pixel math ((x - minX) / xStep * xSpacing) — only the very first cluster of points ends up
+// on-screen and the rest is positioned far off-canvas, which looks like the chart ignoring
+// the selected timespan, and makes any gap in the data break the whole chart rather than
+// just leaving a blank stretch. Indices always have a delta of exactly 1, so this GCD issue
+// can't happen regardless of how sparse or gappy the underlying data is — the axis label
+// formatter below maps each index back to that reading's real timestamp for display.
+@Composable
+private fun rememberTimeAxisFormatter(readings: List<ReadingEntity>): CartesianValueFormatter =
+    remember(readings) {
+        CartesianValueFormatter { _, value, _ ->
+            val reading = readings.getOrNull(value.toInt()) ?: return@CartesianValueFormatter ""
+            val instant = Instant.ofEpochSecond(reading.timestampEpochSec)
+            DateTimeFormatter.ofPattern("HH:mm").format(instant.atZone(ZoneId.systemDefault()))
+        }
+    }
 
 @Composable
 private fun SpO2ChartCard(
@@ -235,7 +251,7 @@ private fun SpO2ChartCard(
             if (readings.isNotEmpty()) {
                 lineModel {
                     series(
-                        x = readings.map { it.timestampEpochSec.toDouble() },
+                        x = readings.indices.map { it.toDouble() },
                         y = readings.map { it.spo2.toDouble() },
                     )
                 }
@@ -243,6 +259,7 @@ private fun SpO2ChartCard(
         }
     }
     val bands = rememberSpo2ThresholdBands(thresholdConfig)
+    val timeAxisFormatter = rememberTimeAxisFormatter(readings)
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
@@ -252,7 +269,7 @@ private fun SpO2ChartCard(
                     chart = rememberCartesianChart(
                         rememberLineCartesianLayer(),
                         startAxis = VerticalAxis.rememberStart(),
-                        bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = TimeAxisFormatter),
+                        bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = timeAxisFormatter),
                         decorations = bands,
                     ),
                     modelProducer = modelProducer,
@@ -274,7 +291,7 @@ private fun PulseChartCard(
             if (readings.isNotEmpty()) {
                 lineModel {
                     series(
-                        x = readings.map { it.timestampEpochSec.toDouble() },
+                        x = readings.indices.map { it.toDouble() },
                         y = readings.map { it.pulse.toDouble() },
                     )
                 }
@@ -282,6 +299,7 @@ private fun PulseChartCard(
         }
     }
     val bands = rememberPulseThresholdBands(thresholdConfig)
+    val timeAxisFormatter = rememberTimeAxisFormatter(readings)
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
@@ -291,7 +309,7 @@ private fun PulseChartCard(
                     chart = rememberCartesianChart(
                         rememberLineCartesianLayer(),
                         startAxis = VerticalAxis.rememberStart(),
-                        bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = TimeAxisFormatter),
+                        bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = timeAxisFormatter),
                         decorations = bands,
                     ),
                     modelProducer = modelProducer,
