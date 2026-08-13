@@ -48,13 +48,16 @@ import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.di.AppContainer
 import com.oxipulse.pulsoximetergraphs.ui.rangepicker.DateTimeRangePickerDialog
 import com.patrykandpatrick.vico.compose.cartesian.CartesianChartHost
+import com.patrykandpatrick.vico.compose.cartesian.Zoom
 import com.patrykandpatrick.vico.compose.cartesian.axis.HorizontalAxis
 import com.patrykandpatrick.vico.compose.cartesian.axis.VerticalAxis
 import com.patrykandpatrick.vico.compose.cartesian.data.CartesianChartModelProducer
+import com.patrykandpatrick.vico.compose.cartesian.data.CartesianLayerRangeProvider
 import com.patrykandpatrick.vico.compose.cartesian.data.CartesianValueFormatter
 import com.patrykandpatrick.vico.compose.cartesian.data.lineModel
 import com.patrykandpatrick.vico.compose.cartesian.layer.rememberLineCartesianLayer
 import com.patrykandpatrick.vico.compose.cartesian.rememberCartesianChart
+import com.patrykandpatrick.vico.compose.cartesian.rememberVicoZoomState
 import com.patrykandpatrick.vico.compose.common.ProvideVicoTheme
 import com.patrykandpatrick.vico.compose.m3.common.rememberM3VicoTheme
 import java.time.Instant
@@ -167,8 +170,8 @@ fun GraphScreen(
         ) {
             RangeSummary(selectedRange)
             StatsPanel(stats)
-            SpO2ChartCard(readings, thresholdConfig)
-            PulseChartCard(readings, thresholdConfig)
+            SpO2ChartCard(readings, thresholdConfig, minSpo2 = stats.minSpo2, maxSpo2 = stats.maxSpo2)
+            PulseChartCard(readings, thresholdConfig, minPulse = stats.minPulse, maxPulse = stats.maxPulse)
         }
     }
 }
@@ -238,10 +241,44 @@ private fun rememberTimeAxisFormatter(readings: List<ReadingEntity>): CartesianV
         }
     }
 
+/**
+ * The Y axis is padded out to the nearest multiple of 5 beyond the actual min/max for the
+ * selected range, so the data never touches the plot's top/bottom edge exactly. A value that's
+ * already an exact multiple of 5 is pushed out by one more step rather than left as-is (e.g.
+ * min=60 -> 55, not 60; max=90 -> 95, not 90), so there's always at least a little headroom.
+ */
+private fun floorToMultipleOf5(value: Int): Int = Math.floorDiv(value - 1, 5) * 5
+
+private fun ceilToMultipleOf5(value: Int): Int = Math.floorDiv(value, 5) * 5 + 5
+
+/**
+ * Wraps already-computed (padded) [minY]/[maxY] bounds as a fixed Y range, or leaves Vico on
+ * its default auto-scaling when there's no data (null) for the selected range.
+ */
+private fun fixedYRange(minY: Int?, maxY: Int?): CartesianLayerRangeProvider =
+    if (minY != null && maxY != null) {
+        CartesianLayerRangeProvider.fixed(minY = minY.toDouble(), maxY = maxY.toDouble())
+    } else {
+        CartesianLayerRangeProvider.auto()
+    }
+
+/**
+ * Zoom.Content fits the entire series into the available width, so the whole selected
+ * timespan is visible at once without scrolling/pinch-zooming — including when there's little
+ * data, which then simply stretches to fill the diagram instead of being drawn at a fixed,
+ * tightly-packed point spacing. Fixing minZoom to the same value means it can never be zoomed
+ * out further than "fit everything" (there's nothing beyond that to zoom out to); pinching in
+ * for a closer look is still allowed via the default maxZoom.
+ */
+@Composable
+private fun rememberFitContentZoomState() = rememberVicoZoomState(initialZoom = Zoom.Content, minZoom = Zoom.Content)
+
 @Composable
 private fun SpO2ChartCard(
     readings: List<ReadingEntity>,
     thresholdConfig: ThresholdConfig,
+    minSpo2: Int?,
+    maxSpo2: Int?,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
     LaunchedEffect(readings) {
@@ -260,6 +297,14 @@ private fun SpO2ChartCard(
     }
     val bands = rememberSpo2ThresholdBands(thresholdConfig)
     val timeAxisFormatter = rememberTimeAxisFormatter(readings)
+    // SpO2 is a percentage, so 100 is a hard ceiling regardless of the padding-to-5 rule above.
+    val rangeProvider = remember(minSpo2, maxSpo2) {
+        fixedYRange(
+            minY = minSpo2?.let { floorToMultipleOf5(it) },
+            maxY = maxSpo2?.let { ceilToMultipleOf5(it).coerceAtMost(100) },
+        )
+    }
+    val zoomState = rememberFitContentZoomState()
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
@@ -267,12 +312,13 @@ private fun SpO2ChartCard(
             ProvideVicoTheme(rememberM3VicoTheme()) {
                 CartesianChartHost(
                     chart = rememberCartesianChart(
-                        rememberLineCartesianLayer(),
+                        rememberLineCartesianLayer(rangeProvider = rangeProvider),
                         startAxis = VerticalAxis.rememberStart(),
                         bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = timeAxisFormatter),
                         decorations = bands,
                     ),
                     modelProducer = modelProducer,
+                    zoomState = zoomState,
                     modifier = Modifier.fillMaxWidth().height(220.dp),
                 )
             }
@@ -284,6 +330,8 @@ private fun SpO2ChartCard(
 private fun PulseChartCard(
     readings: List<ReadingEntity>,
     thresholdConfig: ThresholdConfig,
+    minPulse: Int?,
+    maxPulse: Int?,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
     LaunchedEffect(readings) {
@@ -300,6 +348,13 @@ private fun PulseChartCard(
     }
     val bands = rememberPulseThresholdBands(thresholdConfig)
     val timeAxisFormatter = rememberTimeAxisFormatter(readings)
+    val rangeProvider = remember(minPulse, maxPulse) {
+        fixedYRange(
+            minY = minPulse?.let { floorToMultipleOf5(it) },
+            maxY = maxPulse?.let { ceilToMultipleOf5(it) },
+        )
+    }
+    val zoomState = rememberFitContentZoomState()
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
@@ -307,12 +362,13 @@ private fun PulseChartCard(
             ProvideVicoTheme(rememberM3VicoTheme()) {
                 CartesianChartHost(
                     chart = rememberCartesianChart(
-                        rememberLineCartesianLayer(),
+                        rememberLineCartesianLayer(rangeProvider = rangeProvider),
                         startAxis = VerticalAxis.rememberStart(),
                         bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = timeAxisFormatter),
                         decorations = bands,
                     ),
                     modelProducer = modelProducer,
+                    zoomState = zoomState,
                     modifier = Modifier.fillMaxWidth().height(220.dp),
                 )
             }
