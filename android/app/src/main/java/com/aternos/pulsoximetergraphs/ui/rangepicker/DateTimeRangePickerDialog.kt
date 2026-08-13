@@ -93,17 +93,27 @@ fun DateTimeRangePickerDialog(
 
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Card(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.9f).padding(16.dp)) {
-            Column(modifier = Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
-                when (step) {
-                    0 -> {
+            // DateRangePicker renders its calendar months in its own internal LazyColumn, which
+            // refuses to be measured with the infinite height that Modifier.verticalScroll()
+            // hands its child — so the date-range step must NOT be wrapped in verticalScroll
+            // (that combination throws immediately on layout: "Vertically scrollable component
+            // was measured with an infinity maximum height constraints"). TimePicker has no such
+            // internal lazy layout, so it's safe to make scrollable for smaller screens.
+            when (step) {
+                0 -> {
+                    Column(modifier = Modifier.weight(1f, fill = false)) {
                         Text("Select date range", modifier = Modifier.padding(16.dp))
                         DateRangePicker(state = dateRangeState, modifier = Modifier.fillMaxWidth())
                     }
-                    1 -> {
+                }
+                1 -> {
+                    Column(modifier = Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
                         Text("Start time", modifier = Modifier.padding(16.dp))
                         TimePicker(state = startTimeState, modifier = Modifier.fillMaxWidth().padding(16.dp))
                     }
-                    else -> {
+                }
+                else -> {
+                    Column(modifier = Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
                         Text("End time", modifier = Modifier.padding(16.dp))
                         TimePicker(state = endTimeState, modifier = Modifier.fillMaxWidth().padding(16.dp))
                     }
