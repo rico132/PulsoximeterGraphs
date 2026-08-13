@@ -7,14 +7,14 @@ plugins {
 }
 
 android {
-    namespace = "com.aternos.pulsoximetergraphs"
+    namespace = "com.oxipulse.pulsoximetergraphs"
     // Latest stable platform whose toolchain floor (AGP/Gradle/JDK) this project already
     // satisfies. Verified against AGP 8.13.x's own documented max-compileSdk (36.1) —
     // see gradle/libs.versions.toml for the full version-selection notes.
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.aternos.pulsoximetergraphs"
+        applicationId = "com.oxipulse.pulsoximetergraphs"
         // GrapheneOS only runs on Pixel 6+, which shipped on Android 12 (API 31) — no
         // realistic sub-31 install base, and it drops all legacy Bluetooth-permission
         // branches (pre-S apps needed ACCESS_FINE_LOCATION for BLE scanning).
