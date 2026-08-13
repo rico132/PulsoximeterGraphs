@@ -1,0 +1,180 @@
+// StoredRecordDownloader.h — Auto/Manual stored-record metadata download and
+// nibble-packed datum decoding, ported from the GPLv3-licensed `pulseoxdl`
+// reference project (see COPYING and the attribution comment in the .cpp).
+//
+// This header has two halves, deliberately split by an #ifdef ARDUINO guard:
+//
+//   1. The `StoredRecordDecode` namespace: the actual ported nibble-decoding
+//      algorithm (process_nibbles_auto/process_nibbles_manual and
+//      store_datum_auto/store_datum_manual in pulseoxdl.c). It is pure C++
+//      operating on caller-supplied byte buffers via a small HidReportSource
+//      interface — no Arduino/IDF includes — so it is exercised byte-for-byte
+//      in PlatformIO's native test env against pulseoxdl's own captured Auto
+//      and Manual fixtures (test/test_stored_record_downloader/). This is the
+//      "genuinely intricate bit-packed logic" the plan calls out as most
+//      worth porting line-for-line and validating byte-identically.
+//
+//   2. The `StoredRecordDownloader` class: the USB exchange orchestration
+//      (STORED_PRESENT / GET_RECORD_METADATA_* / datum download / delete),
+//      which necessarily depends on UsbHidOxHost, ICsvBuffer and Preferences
+//      (NVS-backed test-mode flag) and so only compiles under the Arduino
+//      framework. Guarding its declaration (and the Arduino-only #includes it
+//      needs) keeps this header safely includable from the native test
+//      build, which only ever needs half 1.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace StoredRecordDecode {
+
+// --- Auto mode geometry (pulseoxdl.c enum stored_auto) ---------------------
+constexpr uint8_t kAutoPacketLen = 30;   // AUTO_RECORD_LEN / LEN_DATUMS_CMD
+constexpr uint8_t kAutoDatumsStart = 8;  // AUTO_DATUMS_START
+constexpr uint8_t kAutoDatumsEnd = 29;   // AUTO_DATUMS_END; also the checksum index
+constexpr uint8_t kAutoSeqLsbIdx = 3;    // AUTO_SEQUENCE_START
+constexpr uint8_t kAutoSeqMsbIdx = 4;    // AUTO_SEQUENCE_END
+constexpr uint8_t kAutoFlagsLsbIdx = 5;
+constexpr uint8_t kAutoFlagsMidIdx = 6;
+constexpr uint8_t kAutoFlagsMsbIdx = 7;
+constexpr uint8_t kAutoAdjustMultiplicand = 16; // MULTIPLICAND
+
+// --- Manual mode geometry (pulseoxdl.c enum stored_manual) ------------------
+constexpr uint8_t kManualPacketLen = 20;  // MANUAL_RECORD_LEN
+constexpr uint8_t kManualDatumsStart = 5; // MANUAL_DATUMS_START
+constexpr uint8_t kManualDatumsEnd = 19;  // MANUAL_DATUMS_END; also checksum index
+constexpr uint8_t kManualSeqLsbIdx = 1;   // MANUAL_SEQUENCE_START
+constexpr uint8_t kManualSeqMsbIdx = 2;   // MANUAL_SEQUENCE_END
+constexpr uint8_t kManualFlagsLsbIdx = 3;
+constexpr uint8_t kManualFlagsMsbIdx = 4;
+constexpr uint8_t kManualDatumBytesPerGroup = 14; // MANUAL_DATUM_BYTES_CNT
+
+// enum artifacts in pulseoxdl.c.
+constexpr uint8_t kArtifactSpo2 = 127;
+constexpr uint8_t kArtifactPr = 255;
+
+// State that upstream keeps as file-static globals across an entire Auto (or
+// Manual) mode download session — i.e. NOT reset between records, only where
+// pulseoxdl.c itself explicitly resets it (see below). Ported faithfully,
+// including that persistence, to keep decoded output byte-identical: since
+// records are downloaded back-to-back within one session, whatever state a
+// record's PR decode leaves behind is (deliberately, in the reference tool)
+// the starting state for the next record's SpO2 decode.
+struct AutoState {
+  uint8_t top = 0;
+  bool first = true; // upstream's "first" toggle for the 2-part adjustment
+};
+
+// Manual mode's "datum" running absolute-value tracker and its 14-byte group
+// position both persist across a session the same way; `byteIndexInGroup` is
+// explicitly reset to 0 by the caller when switching from SpO2 to PR within
+// one record (mirroring extract_datums()'s explicit `mdatumbytesused = 0`
+// "reset to sync to the absolute value" — see pulseoxdl.c) but NOT otherwise.
+struct ManualState {
+  uint8_t datum = 0;
+  uint32_t byteIndexInGroup = 0;
+};
+
+// Supplies one 64-byte HID INPUT report at a time, on demand, exactly as
+// pulseoxdl.c's extract_datums() calls read_report(dev) in a loop. A real
+// caller backs this with UsbHidOxHost::readReport(); tests back it with an
+// in-memory reader over a captured fixture file.
+class HidReportSource {
+public:
+  virtual ~HidReportSource() = default;
+  // Fills the first 64 bytes of `report` with the next INPUT report. Returns
+  // false on read failure/timeout (StoredRecordDownloader distinguishes this
+  // from label/checksum/sequence errors below).
+  virtual bool readReport(uint8_t report[64]) = 0;
+};
+
+enum class DecodeResult {
+  Ok,
+  ChecksumError,  // a datums-command packet's checksum didn't match
+  SequenceError,  // a datums-command packet arrived out of sequence
+  ReadError,      // HidReportSource::readReport() failed
+};
+
+// Ported from process_nibbles_auto()/store_datum_auto() plus the
+// extract_datums() packet-reassembly loop specialized for Auto mode. `state`
+// must be reused (not reset) across the SpO2 and PR downloads of one Auto
+// mode download session — see AutoState's comment above. `out` receives the
+// decoded values in chronological order (out[0] == earliest second of the
+// record) — the reference implementation's countdown-indexed store buffer is
+// provably equivalent to simple in-order appending here (validated against
+// pulseoxdl's own fixtures; see the .cpp for why), which is what this does.
+DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
+                        AutoState &state, std::vector<uint8_t> &out);
+
+// Ported from process_nibbles_manual()/store_datum_manual(), specialized for
+// Manual mode. `artifactValue` is kArtifactSpo2 or kArtifactPr depending on
+// which measurement is being downloaded (matches extract_datums() setting
+// `artifact` before each measurement's download).
+DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
+                          uint8_t artifactValue, ManualState &state,
+                          std::vector<uint8_t> &out);
+
+} // namespace StoredRecordDecode
+
+#ifdef ARDUINO
+
+#include <Preferences.h>
+
+#include "ICsvBuffer.h"
+#include "UsbHidOxHost.h"
+
+// Orchestrates the full "download stored records, convert to CSV, maybe
+// delete" flow described in the plan's "Stored-record download + test mode"
+// section. Runs on UsbHidOxHost's USB task after STORED_PRESENT indicates
+// there is something to fetch, before falling through to live streaming.
+class StoredRecordDownloader {
+public:
+  StoredRecordDownloader(UsbHidOxHost &usbHost, ICsvBuffer &csvBuffer);
+
+  // Loads the persisted test-mode flag from NVS (default ON — see
+  // Config::kDefaultTestMode) and reads it back for the BLE server's
+  // SET_TEST_MODE opcode handler / status mirroring.
+  void begin();
+  bool testModeEnabled() const;
+  void setTestMode(bool enabled); // persists to NVS immediately
+
+  // Sends STORED_PRESENT and, if any record(s) are present, downloads and
+  // decodes every one of them (Auto or Manual, per the device's reported
+  // mode), appending decoded rows to csvBuffer, then deletes each record
+  // from the device unless testModeEnabled() is true. Safe to call whether
+  // or not any records are actually present (STORED_PRESENT reports that).
+  // Returns false only on a transport-level failure talking to the device
+  // (e.g. it was unplugged mid-download); a false return means the caller
+  // should not proceed to start live streaming this session.
+  bool downloadAndMaybeDelete();
+
+private:
+  // Sends a fixed write command (zero-padded to 64 bytes, checksum appended
+  // at writeChecksumLen-1 if writeChecksumLen>0) and reads back one 64-byte
+  // response, validating its checksum (at readChecksumLen-1) if
+  // readChecksumLen>0, then copying its first readLen bytes into readBuf.
+  bool sendExchange(const uint8_t *writeData, size_t writeLen,
+                    uint8_t writeChecksumLen, uint8_t *readBuf,
+                    size_t readLen, uint8_t readChecksumLen);
+  // Sends a datum-download request command (no response read here — the
+  // response is the stream of datums-command HID reports consumed by
+  // StoredRecordDecode::decodeAuto/decodeManual instead).
+  bool sendRequest(const uint8_t *writeData, size_t writeLen,
+                  uint8_t writeChecksumLen);
+  bool downloadOneAutoRecord(uint8_t recordIndex, int64_t startEpochSeconds,
+                             uint32_t datumCount,
+                             StoredRecordDecode::AutoState &autoState);
+  bool downloadOneManualRecord(int64_t startEpochSeconds, uint32_t datumCount,
+                               StoredRecordDecode::ManualState &manualState);
+  void appendDecodedRecord(int64_t startEpochSeconds,
+                           const std::vector<uint8_t> &spo2,
+                           const std::vector<uint8_t> &pr);
+
+  UsbHidOxHost &usbHost_;
+  ICsvBuffer &csvBuffer_;
+  Preferences preferences_;
+  bool testModeEnabled_ = true;
+};
+
+#endif // ARDUINO

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- BLE hardware is required; the app has no useful non-BLE-only mode. -->
+    <uses-feature
+        android:name="android.hardware.bluetooth_le"
+        android:required="true" />
+
+    <!--
+      minSdk = 31, so only the modern (API 31+) runtime Bluetooth permissions are needed —
+      no legacy ACCESS_FINE_LOCATION-for-scanning branch. `neverForLocation` on the scan
+      permission is safe here: the scan filter is by service UUID only, this app never
+      derives physical location from scan results. No `tools:targetApi` guard needed —
+      minSdk is already 31.
+    -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- ENTER_OTA_MODE / SET_WIFI_CREDENTIALS don't require network access from the phone
+         side (the ESP32 does the WiFi work); no INTERNET permission is needed. -->
+
+    <application
+        android:name=".PulsoxApplication"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PulsoximeterGraphs">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.PulsoximeterGraphs">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

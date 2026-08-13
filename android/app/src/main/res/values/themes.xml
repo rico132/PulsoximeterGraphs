@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base application theme — only used for the window/splash background before Compose
+         takes over; all real theming (colors, typography, dark mode) lives in
+         ui/theme/Theme.kt as a Compose MaterialTheme. -->
+    <style name="Theme.PulsoximeterGraphs" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
