@@ -48,6 +48,8 @@ import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.di.AppContainer
 import com.oxipulse.pulsoximetergraphs.ui.rangepicker.DateTimeRangePickerDialog
 import com.patrykandpatrick.vico.compose.cartesian.CartesianChartHost
+import com.patrykandpatrick.vico.compose.cartesian.VicoScrollState
+import com.patrykandpatrick.vico.compose.cartesian.VicoZoomState
 import com.patrykandpatrick.vico.compose.cartesian.Zoom
 import com.patrykandpatrick.vico.compose.cartesian.axis.HorizontalAxis
 import com.patrykandpatrick.vico.compose.cartesian.axis.VerticalAxis
@@ -57,13 +59,16 @@ import com.patrykandpatrick.vico.compose.cartesian.data.CartesianValueFormatter
 import com.patrykandpatrick.vico.compose.cartesian.data.lineModel
 import com.patrykandpatrick.vico.compose.cartesian.layer.rememberLineCartesianLayer
 import com.patrykandpatrick.vico.compose.cartesian.rememberCartesianChart
+import com.patrykandpatrick.vico.compose.cartesian.rememberVicoScrollState
 import com.patrykandpatrick.vico.compose.cartesian.rememberVicoZoomState
 import com.patrykandpatrick.vico.compose.common.ProvideVicoTheme
 import com.patrykandpatrick.vico.compose.m3.common.rememberM3VicoTheme
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -94,13 +99,18 @@ fun GraphScreen(
         contract = ActivityResultContracts.OpenDocument(),
     ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
-        val text = context.contentResolver.openInputStream(uri)
-            ?.bufferedReader()
-            ?.use { it.readText() }
-        if (text != null) {
-            viewModel.importCsvText(text) { inserted, skipped ->
-                coroutineScope.launch {
-                    snackbarHostState.showSnackbar("Imported $inserted rows ($skipped skipped)")
+        // The activity-result callback runs on the main thread, and reading through a SAF
+        // content-provider stream is a blocking IPC round trip — for anything but a tiny file
+        // this froze the UI for a couple of seconds right after picking it. Do the read on IO.
+        coroutineScope.launch {
+            val text = withContext(Dispatchers.IO) {
+                context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            }
+            if (text != null) {
+                viewModel.importCsvText(text) { inserted, skipped ->
+                    coroutineScope.launch {
+                        snackbarHostState.showSnackbar("Imported $inserted rows ($skipped skipped)")
+                    }
                 }
             }
         }
@@ -161,6 +171,17 @@ fun GraphScreen(
         },
         snackbarHost = { SnackbarHost(snackbarHostState) { Snackbar(it) } },
     ) { padding ->
+        // Shared between both charts so panning/zooming one moves the other in lockstep —
+        // Vico syncs charts by having them read the same VicoScrollState/VicoZoomState
+        // instance. Created once here (not read from at this level, just passed down by
+        // reference), so this doesn't cause GraphScreen itself to recompose on every pan/zoom
+        // frame — only the CartesianChartHosts that actually read the state do.
+        val sharedZoomState = rememberVicoZoomState(initialZoom = Zoom.Content, minZoom = Zoom.Content)
+        val sharedScrollState = rememberVicoScrollState()
+        // Capped and decimated once so both charts plot the exact same x-indices (required for
+        // the shared scroll/zoom state above to actually line them up) — see decimateKeepingExtremes.
+        val plottedReadings = remember(readings) { decimateKeepingExtremes(readings) }
+
         Column(
             modifier = Modifier
                 .padding(padding)
@@ -170,8 +191,22 @@ fun GraphScreen(
         ) {
             RangeSummary(selectedRange)
             StatsPanel(stats)
-            SpO2ChartCard(readings, thresholdConfig, minSpo2 = stats.minSpo2, maxSpo2 = stats.maxSpo2)
-            PulseChartCard(readings, thresholdConfig, minPulse = stats.minPulse, maxPulse = stats.maxPulse)
+            SpO2ChartCard(
+                plottedReadings,
+                thresholdConfig,
+                minSpo2 = stats.minSpo2,
+                maxSpo2 = stats.maxSpo2,
+                zoomState = sharedZoomState,
+                scrollState = sharedScrollState,
+            )
+            PulseChartCard(
+                plottedReadings,
+                thresholdConfig,
+                minPulse = stats.minPulse,
+                maxPulse = stats.maxPulse,
+                zoomState = sharedZoomState,
+                scrollState = sharedScrollState,
+            )
         }
     }
 }
@@ -262,16 +297,45 @@ private fun fixedYRange(minY: Int?, maxY: Int?): CartesianLayerRangeProvider =
         CartesianLayerRangeProvider.auto()
     }
 
+private const val MAX_PLOTTED_POINTS = 500
+
 /**
- * Zoom.Content fits the entire series into the available width, so the whole selected
- * timespan is visible at once without scrolling/pinch-zooming — including when there's little
- * data, which then simply stretches to fill the diagram instead of being drawn at a fixed,
- * tightly-packed point spacing. Fixing minZoom to the same value means it can never be zoomed
- * out further than "fit everything" (there's nothing beyond that to zoom out to); pinching in
- * for a closer look is still allowed via the default maxZoom.
+ * Vico doesn't cull off-screen points, so line-rendering cost (and pan/zoom smoothness) scales
+ * with point count regardless of how zoomed in the user currently is — a big CSV import or a
+ * wide, densely-sampled date range could otherwise mean tracing tens of thousands of points on
+ * every frame. Cap it by splitting the range into buckets and keeping each bucket's local
+ * min/max for *both* SpO2 and pulse (not just picking every Nth reading), so a brief
+ * desaturation or a short spike still shows up on the chart instead of silently getting
+ * skipped — this is a monitoring app, so hiding a real (if brief) out-of-range reading purely
+ * for smoother scrolling isn't an acceptable trade. Both charts must decimate to the exact same
+ * indices (computed once, shared) for the pan/zoom sync above to actually line them up.
  */
-@Composable
-private fun rememberFitContentZoomState() = rememberVicoZoomState(initialZoom = Zoom.Content, minZoom = Zoom.Content)
+private fun decimateKeepingExtremes(readings: List<ReadingEntity>): List<ReadingEntity> {
+    if (readings.size <= MAX_PLOTTED_POINTS) return readings
+    val bucketCount = (MAX_PLOTTED_POINTS / 4).coerceAtLeast(1)
+    val bucketSize = (readings.size + bucketCount - 1) / bucketCount
+    val kept = sortedSetOf<Int>()
+    var bucketStart = 0
+    while (bucketStart < readings.size) {
+        val bucketEnd = (bucketStart + bucketSize).coerceAtMost(readings.size)
+        var minSpo2 = bucketStart
+        var maxSpo2 = bucketStart
+        var minPulse = bucketStart
+        var maxPulse = bucketStart
+        for (i in bucketStart until bucketEnd) {
+            if (readings[i].spo2 < readings[minSpo2].spo2) minSpo2 = i
+            if (readings[i].spo2 > readings[maxSpo2].spo2) maxSpo2 = i
+            if (readings[i].pulse < readings[minPulse].pulse) minPulse = i
+            if (readings[i].pulse > readings[maxPulse].pulse) maxPulse = i
+        }
+        kept += minSpo2
+        kept += maxSpo2
+        kept += minPulse
+        kept += maxPulse
+        bucketStart = bucketEnd
+    }
+    return kept.map { readings[it] }
+}
 
 @Composable
 private fun SpO2ChartCard(
@@ -279,6 +343,8 @@ private fun SpO2ChartCard(
     thresholdConfig: ThresholdConfig,
     minSpo2: Int?,
     maxSpo2: Int?,
+    zoomState: VicoZoomState,
+    scrollState: VicoScrollState,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
     LaunchedEffect(readings) {
@@ -304,7 +370,6 @@ private fun SpO2ChartCard(
             maxY = maxSpo2?.let { ceilToMultipleOf5(it).coerceAtMost(100) },
         )
     }
-    val zoomState = rememberFitContentZoomState()
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
@@ -318,6 +383,7 @@ private fun SpO2ChartCard(
                         decorations = bands,
                     ),
                     modelProducer = modelProducer,
+                    scrollState = scrollState,
                     zoomState = zoomState,
                     modifier = Modifier.fillMaxWidth().height(220.dp),
                 )
@@ -332,6 +398,8 @@ private fun PulseChartCard(
     thresholdConfig: ThresholdConfig,
     minPulse: Int?,
     maxPulse: Int?,
+    zoomState: VicoZoomState,
+    scrollState: VicoScrollState,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
     LaunchedEffect(readings) {
@@ -354,7 +422,6 @@ private fun PulseChartCard(
             maxY = maxPulse?.let { ceilToMultipleOf5(it) },
         )
     }
-    val zoomState = rememberFitContentZoomState()
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
@@ -368,6 +435,7 @@ private fun PulseChartCard(
                         decorations = bands,
                     ),
                     modelProducer = modelProducer,
+                    scrollState = scrollState,
                     zoomState = zoomState,
                     modifier = Modifier.fillMaxWidth().height(220.dp),
                 )
