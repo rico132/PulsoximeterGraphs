@@ -58,10 +58,7 @@ jobs:
           echo "version=$next" >> "$GITHUB_OUTPUT"
 
       - name: Build debug APK
-        working-directory: android
-        run: |
-          chmod +x ./gradlew
-          ./gradlew assembleDebug --no-daemon
+        run: ./android/build.sh assembleDebug --no-daemon
 
       - name: Rename APK for release
         id: apk
