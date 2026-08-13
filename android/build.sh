@@ -11,8 +11,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # Android SDK location. ANDROID_SDK_ROOT is the modern name; ANDROID_HOME is kept
-# for compatibility with older tooling. Falls back to this sandbox's SDK install.
-export ANDROID_HOME="${ANDROID_HOME:-/home/agent/android-sdk}"
+# for compatibility with older tooling. Falls back to the standard SDK install path.
+export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
 export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
 
 export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
