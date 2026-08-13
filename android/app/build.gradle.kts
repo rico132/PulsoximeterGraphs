@@ -20,8 +20,11 @@ android {
         // branches (pre-S apps needed ACCESS_FINE_LOCATION for BLE scanning).
         minSdk = 31
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        // Overridable via -PappVersionCode=/-PappVersionName= (the release workflow passes
+        // these so the built APK's version matches the GitHub release tag); these literals
+        // are just the fallback for local/manual builds that don't pass them.
+        versionCode = (project.findProperty("appVersionCode") as String?)?.toIntOrNull() ?: 1
+        versionName = (project.findProperty("appVersionName") as String?) ?: "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true

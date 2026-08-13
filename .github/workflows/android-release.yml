@@ -56,9 +56,15 @@ jobs:
           fi
           echo "Previous tag: ${latest:-<none>}; next: $next"
           echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "version_name=${next#v}" >> "$GITHUB_OUTPUT"
 
+      # versionName matches the release tag (minus the leading "v"); versionCode just needs
+      # to strictly increase build-over-build, which the workflow run number already does.
       - name: Build debug APK
-        run: ./android/build.sh assembleDebug --no-daemon
+        run: >
+          ./android/build.sh assembleDebug --no-daemon
+          -PappVersionName=${{ steps.version.outputs.version_name }}
+          -PappVersionCode=${{ github.run_number }}
 
       - name: Rename APK for release
         id: apk
