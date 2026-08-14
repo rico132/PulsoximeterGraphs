@@ -3,9 +3,14 @@ package com.oxipulse.pulsoximetergraphs.ui.graphs
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -16,6 +21,7 @@ import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.ZoomOut
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -32,12 +38,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -67,6 +77,7 @@ import com.patrykandpatrick.vico.compose.m3.common.rememberM3VicoTheme
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -91,6 +102,7 @@ fun GraphScreen(
     val thresholdConfig by viewModel.thresholdConfig.collectAsState()
     val selectedRange by viewModel.selectedRange.collectAsState()
     val syncState by viewModel.syncState.collectAsState()
+    val canZoomOut by viewModel.canZoomOut.collectAsState()
 
     var showRangePicker by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -151,6 +163,11 @@ fun GraphScreen(
             TopAppBar(
                 title = { Text("Pulsoximeter Graphs") },
                 actions = {
+                    if (canZoomOut) {
+                        IconButton(onClick = { viewModel.zoomOut() }) {
+                            Icon(Icons.Filled.ZoomOut, contentDescription = "Zoom out")
+                        }
+                    }
                     IconButton(onClick = { showRangePicker = true }) {
                         Icon(Icons.Filled.DateRange, contentDescription = "Select date range")
                     }
@@ -172,28 +189,20 @@ fun GraphScreen(
         },
         snackbarHost = { SnackbarHost(snackbarHostState) { Snackbar(it) } },
     ) { padding ->
-        // Shared between both charts so panning/zooming one moves the other in lockstep —
-        // Vico syncs charts by having them read the same VicoScrollState/VicoZoomState
-        // instance. Created once per selected range (not read from at this level, just passed
-        // down by reference), so this doesn't cause GraphScreen itself to recompose on every
-        // pan/zoom frame — only the CartesianChartHosts that actually read the state do.
-        //
-        // Re-created (via `key(selectedRange)`) whenever the picked range changes, rather than
-        // remembered forever: readings are plotted by index (see rememberTimeAxisFormatter), so
-        // a scroll/zoom position computed against one range's index space is meaningless once
-        // the range changes — e.g. narrowing to a shorter span shrinks the reading count, and a
-        // stale scroll offset from the larger range then points past the end of the new,
-        // shorter list. The axis label formatter returns "" for an out-of-range index, and Vico
-        // treats a blank axis label as a fatal error, crashing the app. Keying on selectedRange
-        // (rather than on the readings/plottedReadings list itself) avoids resetting the user's
-        // pan/zoom on every incidental data refresh — e.g. new rows streaming in during a BLE
-        // sync — while still resetting it whenever the index space actually changes shape.
-        val (sharedZoomState, sharedScrollState) = key(selectedRange) {
-            rememberVicoZoomState(initialZoom = Zoom.Content, minZoom = Zoom.Content) to
-                rememberVicoScrollState()
-        }
-        // Capped and decimated once so both charts plot the exact same x-indices (required for
-        // the shared scroll/zoom state above to actually line them up) — see decimateKeepingExtremes.
+        // Pinch/drag zoom is intentionally disabled (zoomEnabled/scrollEnabled = false below) in
+        // favor of drag-to-zoom (see DragToZoomOverlay): Vico's charts don't render more of the
+        // underlying data as you zoom in, only the same already-decimated points bigger, so
+        // interactive zoom here would just be a magnifying glass, not more detail. Dragging a
+        // selection instead narrows the *selected range itself*, which re-queries the DB for just
+        // that window and (usually) renders it at full resolution. Shared between both charts
+        // purely because CartesianChartHost requires a scroll/zoom state instance per chart, not
+        // because they need to stay in sync anymore — with interactivity off there's no live state
+        // to drift out of sync in the first place.
+        val sharedZoomState = rememberVicoZoomState(zoomEnabled = false, initialZoom = Zoom.Content)
+        val sharedScrollState = rememberVicoScrollState(scrollEnabled = false)
+        // Capped and decimated once for the currently selected range — see decimateKeepingExtremes.
+        // Dragging a selection (below) replaces this with a narrower selectedRange rather than
+        // trying to re-decimate this same list on the fly.
         val plottedReadings = remember(readings) { decimateKeepingExtremes(readings) }
 
         Column(
@@ -212,6 +221,7 @@ fun GraphScreen(
                 maxSpo2 = stats.maxSpo2,
                 zoomState = sharedZoomState,
                 scrollState = sharedScrollState,
+                onRangeSelected = viewModel::setRange,
             )
             PulseChartCard(
                 plottedReadings,
@@ -220,6 +230,7 @@ fun GraphScreen(
                 maxPulse = stats.maxPulse,
                 zoomState = sharedZoomState,
                 scrollState = sharedScrollState,
+                onRangeSelected = viewModel::setRange,
             )
         }
     }
@@ -365,6 +376,106 @@ private fun decimateKeepingExtremes(readings: List<ReadingEntity>): List<Reading
     return kept.map { readings[it] }
 }
 
+/** Below this fraction of the chart's width, a drag is treated as an accidental tap/jitter, not a zoom. */
+private const val MIN_DRAG_FRACTION = 0.03f
+
+/**
+ * Wraps [content] (a chart) with a horizontal drag-to-select gesture: dragging draws a
+ * translucent band with a live time-range label, and releasing narrows the range to it via
+ * [onRangeSelected]. Maps the drag's pixel position to an index in [readings] by straight
+ * fraction-of-width, which is only accurate because the wrapped chart's own zoom/scroll is
+ * disabled (see GraphScreen) — with pan/zoom off, index 0 always sits at the left edge of this
+ * Box and the last index at the right edge, with no live pan offset to account for. This doesn't
+ * correct for the vertical axis's label gutter eating into the left edge of that width, so the
+ * mapping is approximate near the edges — acceptable for "roughly select a section," and cheap
+ * to redo since every drag is undoable via the toolbar's zoom-out button.
+ */
+@Composable
+private fun DragToZoomOverlay(
+    readings: List<ReadingEntity>,
+    onRangeSelected: (ClosedRange<Instant>) -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable BoxScope.() -> Unit,
+) {
+    var dragStartX by remember { mutableStateOf<Float?>(null) }
+    var dragCurrentX by remember { mutableStateOf<Float?>(null) }
+    var widthPx by remember { mutableStateOf(0f) }
+
+    fun indexAt(x: Float): Int =
+        if (widthPx <= 0f) {
+            0
+        } else {
+            (x / widthPx * (readings.size - 1)).roundToInt().coerceIn(readings.indices)
+        }
+
+    Box(
+        modifier = modifier
+            .onSizeChanged { widthPx = it.width.toFloat() }
+            .pointerInput(readings) {
+                if (readings.size < 2) return@pointerInput
+                detectHorizontalDragGestures(
+                    onDragStart = { offset ->
+                        dragStartX = offset.x
+                        dragCurrentX = offset.x
+                    },
+                    onDragEnd = {
+                        val startX = dragStartX
+                        val endX = dragCurrentX
+                        if (startX != null && endX != null && widthPx > 0f &&
+                            kotlin.math.abs(endX - startX) / widthPx >= MIN_DRAG_FRACTION
+                        ) {
+                            val loIndex = indexAt(minOf(startX, endX))
+                            val hiIndex = indexAt(maxOf(startX, endX))
+                            if (hiIndex > loIndex) {
+                                onRangeSelected(
+                                    Instant.ofEpochSecond(readings[loIndex].timestampEpochSec)..
+                                        Instant.ofEpochSecond(readings[hiIndex].timestampEpochSec),
+                                )
+                            }
+                        }
+                        dragStartX = null
+                        dragCurrentX = null
+                    },
+                    onDragCancel = {
+                        dragStartX = null
+                        dragCurrentX = null
+                    },
+                    onHorizontalDrag = { change, _ -> dragCurrentX = change.position.x },
+                )
+            },
+    ) {
+        content()
+
+        val startX = dragStartX
+        val endX = dragCurrentX
+        if (startX != null && endX != null && readings.size >= 2) {
+            val selectionColor = MaterialTheme.colorScheme.primary
+            val left = minOf(startX, endX)
+            val right = maxOf(startX, endX)
+            Canvas(modifier = Modifier.matchParentSize()) {
+                drawRect(
+                    color = selectionColor.copy(alpha = 0.2f),
+                    topLeft = Offset(left, 0f),
+                    size = Size(right - left, size.height),
+                )
+                val edgeWidth = 2.dp.toPx()
+                drawLine(selectionColor, Offset(left, 0f), Offset(left, size.height), strokeWidth = edgeWidth)
+                drawLine(selectionColor, Offset(right, 0f), Offset(right, size.height), strokeWidth = edgeWidth)
+            }
+            val zone = ZoneId.systemDefault()
+            val timeFormatter = DateTimeFormatter.ofPattern("HH:mm")
+            val loInstant = Instant.ofEpochSecond(readings[indexAt(left)].timestampEpochSec)
+            val hiInstant = Instant.ofEpochSecond(readings[indexAt(right)].timestampEpochSec)
+            Text(
+                "${timeFormatter.format(loInstant.atZone(zone))} – ${timeFormatter.format(hiInstant.atZone(zone))}",
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 4.dp),
+                style = MaterialTheme.typography.labelMedium,
+                color = selectionColor,
+            )
+        }
+    }
+}
+
 @Composable
 private fun SpO2ChartCard(
     readings: List<ReadingEntity>,
@@ -373,6 +484,7 @@ private fun SpO2ChartCard(
     maxSpo2: Int?,
     zoomState: VicoZoomState,
     scrollState: VicoScrollState,
+    onRangeSelected: (ClosedRange<Instant>) -> Unit,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
     LaunchedEffect(readings) {
@@ -403,18 +515,24 @@ private fun SpO2ChartCard(
         Column(modifier = Modifier.padding(16.dp)) {
             Text("SpO2 (%)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             ProvideVicoTheme(rememberM3VicoTheme()) {
-                CartesianChartHost(
-                    chart = rememberCartesianChart(
-                        rememberLineCartesianLayer(rangeProvider = rangeProvider),
-                        startAxis = VerticalAxis.rememberStart(),
-                        bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = timeAxisFormatter),
-                        decorations = bands,
-                    ),
-                    modelProducer = modelProducer,
-                    scrollState = scrollState,
-                    zoomState = zoomState,
+                DragToZoomOverlay(
+                    readings = readings,
+                    onRangeSelected = onRangeSelected,
                     modifier = Modifier.fillMaxWidth().height(220.dp),
-                )
+                ) {
+                    CartesianChartHost(
+                        chart = rememberCartesianChart(
+                            rememberLineCartesianLayer(rangeProvider = rangeProvider),
+                            startAxis = VerticalAxis.rememberStart(),
+                            bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = timeAxisFormatter),
+                            decorations = bands,
+                        ),
+                        modelProducer = modelProducer,
+                        scrollState = scrollState,
+                        zoomState = zoomState,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
             }
         }
     }
@@ -428,6 +546,7 @@ private fun PulseChartCard(
     maxPulse: Int?,
     zoomState: VicoZoomState,
     scrollState: VicoScrollState,
+    onRangeSelected: (ClosedRange<Instant>) -> Unit,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
     LaunchedEffect(readings) {
@@ -455,18 +574,24 @@ private fun PulseChartCard(
         Column(modifier = Modifier.padding(16.dp)) {
             Text("Pulse (bpm)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             ProvideVicoTheme(rememberM3VicoTheme()) {
-                CartesianChartHost(
-                    chart = rememberCartesianChart(
-                        rememberLineCartesianLayer(rangeProvider = rangeProvider),
-                        startAxis = VerticalAxis.rememberStart(),
-                        bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = timeAxisFormatter),
-                        decorations = bands,
-                    ),
-                    modelProducer = modelProducer,
-                    scrollState = scrollState,
-                    zoomState = zoomState,
+                DragToZoomOverlay(
+                    readings = readings,
+                    onRangeSelected = onRangeSelected,
                     modifier = Modifier.fillMaxWidth().height(220.dp),
-                )
+                ) {
+                    CartesianChartHost(
+                        chart = rememberCartesianChart(
+                            rememberLineCartesianLayer(rangeProvider = rangeProvider),
+                            startAxis = VerticalAxis.rememberStart(),
+                            bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = timeAxisFormatter),
+                            decorations = bands,
+                        ),
+                        modelProducer = modelProducer,
+                        scrollState = scrollState,
+                        zoomState = zoomState,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
             }
         }
     }

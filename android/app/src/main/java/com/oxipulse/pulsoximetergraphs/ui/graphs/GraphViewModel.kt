@@ -37,6 +37,14 @@ class GraphViewModel(
     private val _selectedRange = MutableStateFlow(defaultRange())
     val selectedRange: StateFlow<ClosedRange<Instant>> = _selectedRange.asStateFlow()
 
+    // Every range change (manual date/time picks and drag-to-zoom alike) pushes the range it
+    // replaced here first, so a single "zoom out" action can undo either kind of change — the
+    // two are otherwise indistinguishable to the user. Capped defensively; a real session won't
+    // come close before the SharingStarted timeout would tear this ViewModel down anyway.
+    private val rangeHistory = ArrayDeque<ClosedRange<Instant>>()
+    private val _canZoomOut = MutableStateFlow(false)
+    val canZoomOut: StateFlow<Boolean> = _canZoomOut.asStateFlow()
+
     val thresholdConfig: StateFlow<ThresholdConfig> = thresholdsRepository.config
 
     val readings: StateFlow<List<ReadingEntity>> = selectedRange
@@ -51,7 +59,17 @@ class GraphViewModel(
     val syncState: StateFlow<BleGattClient.SyncState> = bleGattClient.syncState
 
     fun setRange(range: ClosedRange<Instant>) {
+        rangeHistory.addLast(_selectedRange.value)
+        if (rangeHistory.size > MAX_RANGE_HISTORY) rangeHistory.removeFirst()
         _selectedRange.value = range
+        _canZoomOut.value = true
+    }
+
+    /** Undoes the last [setRange] call (manual pick or drag-to-zoom), restoring the range it replaced. */
+    fun zoomOut() {
+        val previous = rangeHistory.removeLastOrNull() ?: return
+        _selectedRange.value = previous
+        _canZoomOut.value = rangeHistory.isNotEmpty()
     }
 
     fun importCsvText(text: String, onResult: (inserted: Int, skipped: Int) -> Unit) {
@@ -70,6 +88,8 @@ class GraphViewModel(
     }
 
     companion object {
+        private const val MAX_RANGE_HISTORY = 50
+
         private fun defaultRange(): ClosedRange<Instant> {
             val end = Instant.now()
             val start = end.minus(24, ChronoUnit.HOURS)
