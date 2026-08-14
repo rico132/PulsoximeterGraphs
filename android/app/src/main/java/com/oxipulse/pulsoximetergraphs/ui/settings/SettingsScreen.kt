@@ -23,6 +23,8 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -39,6 +41,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.di.AppContainer
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -59,6 +62,7 @@ fun SettingsScreen(
     var draft by remember(config) { mutableStateOf(config) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var savedMessage by remember { mutableStateOf<String?>(null) }
+    var selectedTab by remember { mutableStateOf(0) }
 
     Scaffold(
         topBar = {
@@ -72,49 +76,74 @@ fun SettingsScreen(
             )
         },
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .padding(padding)
-                .padding(16.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Text("Thresholds", style = MaterialTheme.typography.titleMedium)
-
-            ThresholdNumberField("SpO2 orange", draft.spo2Orange) { draft = draft.copy(spo2Orange = it) }
-            ThresholdNumberField("SpO2 red", draft.spo2Red) { draft = draft.copy(spo2Red = it) }
-            ThresholdNumberField("Pulse low orange", draft.pulseLowOrange) { draft = draft.copy(pulseLowOrange = it) }
-            ThresholdNumberField("Pulse low red", draft.pulseLowRed) { draft = draft.copy(pulseLowRed = it) }
-            ThresholdNumberField("Pulse high orange", draft.pulseHighOrange) { draft = draft.copy(pulseHighOrange = it) }
-            ThresholdNumberField("Pulse high red", draft.pulseHighRed) { draft = draft.copy(pulseHighRed = it) }
-
-            val liveError = draft.validate()
-            if (liveError != null) {
-                Text(liveError, color = MaterialTheme.colorScheme.error)
+        Column(modifier = Modifier.padding(padding)) {
+            TabRow(selectedTabIndex = selectedTab) {
+                SETTINGS_TABS.forEachIndexed { index, title ->
+                    Tab(
+                        selected = selectedTab == index,
+                        onClick = { selectedTab = index },
+                        text = { Text(title) },
+                    )
+                }
             }
-            errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            savedMessage?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
-
-            Button(
-                onClick = {
-                    val error = viewModel.save(draft)
-                    errorMessage = error
-                    savedMessage = if (error == null) "Saved" else null
-                },
-                enabled = liveError == null,
-                modifier = Modifier.wrapContentSize(),
+            Column(
+                modifier = Modifier
+                    .padding(16.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Text("Save")
+                when (selectedTab) {
+                    0 -> ConfigTab(
+                        draft = draft,
+                        onDraftChange = { draft = it },
+                        errorMessage = errorMessage,
+                        savedMessage = savedMessage,
+                        onSave = {
+                            val error = viewModel.save(draft)
+                            errorMessage = error
+                            savedMessage = if (error == null) "Saved" else null
+                        },
+                    )
+                    1 -> DeviceSection(viewModel, testModeEnabled)
+                    2 -> DebugLogSection(debugLog, onClear = viewModel::clearDebugLog)
+                }
             }
-
-            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-
-            DeviceSection(viewModel, testModeEnabled)
-
-            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-
-            DebugLogSection(debugLog, onClear = viewModel::clearDebugLog)
         }
+    }
+}
+
+private val SETTINGS_TABS = listOf("Config", "OTA", "BLE Log")
+
+@Composable
+private fun ConfigTab(
+    draft: ThresholdConfig,
+    onDraftChange: (ThresholdConfig) -> Unit,
+    errorMessage: String?,
+    savedMessage: String?,
+    onSave: () -> Unit,
+) {
+    Text("Thresholds", style = MaterialTheme.typography.titleMedium)
+
+    ThresholdNumberField("SpO2 orange", draft.spo2Orange) { onDraftChange(draft.copy(spo2Orange = it)) }
+    ThresholdNumberField("SpO2 red", draft.spo2Red) { onDraftChange(draft.copy(spo2Red = it)) }
+    ThresholdNumberField("Pulse low orange", draft.pulseLowOrange) { onDraftChange(draft.copy(pulseLowOrange = it)) }
+    ThresholdNumberField("Pulse low red", draft.pulseLowRed) { onDraftChange(draft.copy(pulseLowRed = it)) }
+    ThresholdNumberField("Pulse high orange", draft.pulseHighOrange) { onDraftChange(draft.copy(pulseHighOrange = it)) }
+    ThresholdNumberField("Pulse high red", draft.pulseHighRed) { onDraftChange(draft.copy(pulseHighRed = it)) }
+
+    val liveError = draft.validate()
+    if (liveError != null) {
+        Text(liveError, color = MaterialTheme.colorScheme.error)
+    }
+    errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+    savedMessage?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
+
+    Button(
+        onClick = onSave,
+        enabled = liveError == null,
+        modifier = Modifier.wrapContentSize(),
+    ) {
+        Text("Save")
     }
 }
 
