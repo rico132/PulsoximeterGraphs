@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalContentColor
@@ -58,6 +59,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.oxipulse.pulsoximetergraphs.data.ble.BleGattClient
@@ -223,8 +225,7 @@ fun GraphScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            RangeSummary(selectedRange)
-            StatsPanel(stats)
+            StatsPanel(selectedRange, stats)
             ChartsCard(
                 readings = plottedReadings,
                 thresholdConfig = thresholdConfig,
@@ -377,27 +378,80 @@ private fun RangeSummary(range: ClosedRange<Instant>) {
     )
 }
 
+/**
+ * The selected time span now lives at the top of this card (previously a separate [Text] floating
+ * above it) — it's a summary of exactly the data the stats/charts below are for, so it reads
+ * better as this card's own header than as an unrelated line sitting above it.
+ */
 @Composable
-private fun StatsPanel(stats: ReadingStats) {
+private fun StatsPanel(range: ClosedRange<Instant>, stats: ReadingStats) {
     Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            RangeSummary(range)
+            HorizontalDivider()
             Text("Stats", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            StatsRow("SpO2", stats.minSpo2, stats.maxSpo2, stats.avgSpo2, unit = "%")
-            StatsRow("Pulse", stats.minPulse, stats.maxPulse, stats.avgPulse, unit = "bpm")
+            StatsTable(stats)
         }
     }
 }
 
+/**
+ * A proper table (metric name + one column per statistic) instead of one concatenated string per
+ * row: SpO2's "%" and Pulse's "bpm" differ in length, so appending the unit straight onto each
+ * number ("92%" vs "92bpm") shifted every later number in that row sideways by a different amount
+ * per metric — nothing lined up between the SpO2 and Pulse rows. Each column here is a fixed
+ * weight instead, so min/max/avg/p95 all land in the same horizontal position regardless of which
+ * row they're in; the unit moves into the metric-name cell (once per row) instead of being
+ * repeated on every value.
+ */
 @Composable
-private fun StatsRow(label: String, min: Int?, max: Int?, avg: Double?, unit: String) {
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(label, style = MaterialTheme.typography.bodyMedium)
-        if (min == null || max == null || avg == null) {
-            Text("no data", style = MaterialTheme.typography.bodyMedium)
-        } else {
+private fun StatsTable(stats: ReadingStats) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        StatsTableRow(
+            metric = "",
+            min = "Min",
+            max = "Max",
+            avg = "Avg",
+            p95 = "P95",
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.Bold,
+        )
+        StatsTableRow(
+            metric = "SpO2 (%)",
+            min = stats.minSpo2?.toString() ?: "–",
+            max = stats.maxSpo2?.toString() ?: "–",
+            avg = stats.avgSpo2?.let { "%.1f".format(it) } ?: "–",
+            p95 = stats.p95Spo2?.toString() ?: "–",
+        )
+        StatsTableRow(
+            metric = "Pulse (bpm)",
+            min = stats.minPulse?.toString() ?: "–",
+            max = stats.maxPulse?.toString() ?: "–",
+            avg = stats.avgPulse?.let { "%.1f".format(it) } ?: "–",
+            p95 = stats.p95Pulse?.toString() ?: "–",
+        )
+    }
+}
+
+@Composable
+private fun StatsTableRow(
+    metric: String,
+    min: String,
+    max: String,
+    avg: String,
+    p95: String,
+    style: TextStyle = MaterialTheme.typography.bodyMedium,
+    fontWeight: FontWeight? = null,
+) {
+    Row(modifier = Modifier.fillMaxWidth()) {
+        Text(metric, style = style, fontWeight = fontWeight, modifier = Modifier.weight(1.4f))
+        for (value in listOf(min, max, avg, p95)) {
             Text(
-                "min $min$unit  ·  max $max$unit  ·  avg ${"%.1f".format(avg)}$unit",
-                style = MaterialTheme.typography.bodyMedium,
+                value,
+                style = style,
+                fontWeight = fontWeight,
+                textAlign = TextAlign.End,
+                modifier = Modifier.weight(1f),
             )
         }
     }

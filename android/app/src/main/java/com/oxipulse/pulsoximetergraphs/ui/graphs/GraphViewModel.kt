@@ -13,6 +13,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.temporal.ChronoUnit
+import kotlin.math.ceil
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -25,9 +26,22 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 private val EMPTY_STATS = ReadingStats(
-    minSpo2 = null, maxSpo2 = null, avgSpo2 = null,
-    minPulse = null, maxPulse = null, avgPulse = null,
+    minSpo2 = null, maxSpo2 = null, avgSpo2 = null, p95Spo2 = null,
+    minPulse = null, maxPulse = null, avgPulse = null, p95Pulse = null,
 )
+
+/**
+ * Nearest-rank 95th percentile (not interpolated, so the result is always one of the actual
+ * readings — consistent with min/max, which are likewise real observed values). Computed here in
+ * Kotlin from the same in-memory list already loaded for the chart, rather than via SQL (see
+ * ReadingStats's own doc for why).
+ */
+private fun percentile95(values: List<Int>): Int? {
+    if (values.isEmpty()) return null
+    val sorted = values.sorted()
+    val index = (ceil(sorted.size * 0.95).toInt() - 1).coerceIn(0, sorted.size - 1)
+    return sorted[index]
+}
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class GraphViewModel(
@@ -53,9 +67,21 @@ class GraphViewModel(
         .flatMapLatest { range -> readingsRepository.observeRange(range) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    /** Recomputed via the DAO's SQL aggregate query whenever the range or underlying data changes. */
-    val stats: StateFlow<ReadingStats> = combine(selectedRange, readings) { range, _ -> range }
-        .map { range -> readingsRepository.statsForRange(range) }
+    /**
+     * min/max/avg come from the DAO's SQL aggregate query; p95Spo2/p95Pulse are computed in
+     * Kotlin from [readings] itself (the same, already-loaded rows for this exact range) rather
+     * than by the query, since percentile support isn't reliably available across the SQLite
+     * versions this app's supported Android versions ship with — see ReadingStats's own doc.
+     */
+    val stats: StateFlow<ReadingStats> = combine(selectedRange, readings) { range, currentReadings ->
+        range to currentReadings
+    }
+        .map { (range, currentReadings) ->
+            readingsRepository.statsForRange(range).copy(
+                p95Spo2 = percentile95(currentReadings.map { it.spo2 }),
+                p95Pulse = percentile95(currentReadings.map { it.pulse }),
+            )
+        }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), EMPTY_STATS)
 
     val syncState: StateFlow<BleGattClient.SyncState> = bleGattClient.syncState
