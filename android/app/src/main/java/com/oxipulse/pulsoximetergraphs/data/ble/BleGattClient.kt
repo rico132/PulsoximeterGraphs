@@ -87,6 +87,8 @@ class BleGattClient(
 
     private val receiveBuffer = ByteArrayOutputStream()
     private var receiveStartMs = 0L
+    private var chunkArrivalLogCount = 0
+    private var lastChunkArrivalMs = 0L
     private var timeoutJob: Job? = null
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
@@ -108,6 +110,8 @@ class BleGattClient(
         log("Sync started")
         receiveBuffer.reset()
         lastProgressEmitMs = 0L
+        chunkArrivalLogCount = 0
+        lastChunkArrivalMs = 0L
         _syncState.value = SyncState.Scanning
         armTimeout()
 
@@ -296,6 +300,22 @@ class BleGattClient(
         if (value.size == 1 && value[0] == BleConstants.DATA_TERMINATOR[0]) {
             onTransferComplete()
             return
+        }
+        // There's no public Android API to read the actual negotiated connection interval (see
+        // onPhyUpdate's comment for the PHY equivalent) — requestConnectionPriority() is only a
+        // request, and whether the peer actually granted a short interval is otherwise invisible.
+        // But the interval controls how often a notification can go out at all, so timing raw
+        // chunk arrivals directly reveals it: a steady multi-ms gap between chunks *is* the
+        // interval, no HCI snoop needed. Logged unthrottled (unlike the progress state below) for
+        // only the first few chunks of each transfer, since that's all that's needed to see the
+        // pattern and this must stay off for the rest of a large transfer to avoid reintroducing
+        // the same per-chunk main-thread cost the progress throttle above exists to avoid.
+        if (chunkArrivalLogCount < CHUNK_ARRIVAL_LOG_LIMIT) {
+            val nowMs = SystemClock.elapsedRealtime()
+            val gap = if (chunkArrivalLogCount == 0) 0L else nowMs - lastChunkArrivalMs
+            lastChunkArrivalMs = nowMs
+            chunkArrivalLogCount++
+            log("Chunk #$chunkArrivalLogCount: ${value.size} bytes, +${gap}ms since previous chunk")
         }
         receiveBuffer.write(value)
         // GATT callbacks are delivered on the main thread (no Handler/Executor was passed to
@@ -488,5 +508,6 @@ class BleGattClient(
         private const val TAG = "BleGattClient"
         private const val SYNC_TIMEOUT_MS = 30_000L
         private const val PROGRESS_EMIT_INTERVAL_MS = 100L
+        private const val CHUNK_ARRIVAL_LOG_LIMIT = 20
     }
 }
