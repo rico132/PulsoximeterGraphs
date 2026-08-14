@@ -2,6 +2,7 @@ package com.oxipulse.pulsoximetergraphs.data.ble
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
@@ -16,6 +17,7 @@ import android.content.Context
 import android.os.Build
 import android.os.ParcelUuid
 import android.os.SystemClock
+import android.util.Log
 import com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
@@ -84,6 +86,7 @@ class BleGattClient(
     private var dataCharacteristic: BluetoothGattCharacteristic? = null
 
     private val receiveBuffer = ByteArrayOutputStream()
+    private var receiveStartMs = 0L
     private var timeoutJob: Job? = null
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
@@ -152,7 +155,14 @@ class BleGattClient(
         _syncState.value = SyncState.Connecting
         val adapter = bluetoothAdapter ?: return fail("Bluetooth adapter unavailable")
         val device = adapter.getRemoteDevice(address)
-        bluetoothGatt = device.connectGatt(context, false, gattCallback, android.bluetooth.BluetoothDevice.TRANSPORT_LE)
+        bluetoothGatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    private fun phyName(phy: Int): String = when (phy) {
+        BluetoothDevice.PHY_LE_1M -> "1M"
+        BluetoothDevice.PHY_LE_2M -> "2M"
+        BluetoothDevice.PHY_LE_CODED -> "CODED"
+        else -> "unknown($phy)"
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -167,6 +177,14 @@ class BleGattClient(
                 // actually speeds up the transfer; it must happen as early as possible since the
                 // renegotiation itself takes a moment to take effect.
                 gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                // 1M PHY is ~1Mbps raw air rate; 2M PHY roughly doubles it. Falls back silently
+                // to 1M if either side (this phone's adapter or the peer's) doesn't support it —
+                // there's no separate capability check needed before asking.
+                gatt.setPreferredPhy(
+                    BluetoothDevice.PHY_LE_2M_MASK,
+                    BluetoothDevice.PHY_LE_2M_MASK,
+                    BluetoothDevice.PHY_OPTION_NO_PREFERRED,
+                )
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 if (_syncState.value !is SyncState.Success && _syncState.value !is SyncState.Failed) {
@@ -201,8 +219,19 @@ class BleGattClient(
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             // Whether or not the negotiation succeeded, proceed with whatever MTU we have —
             // the protocol must also work correctly at the default, un-negotiated MTU of 23.
+            Log.d(TAG, "MTU negotiated: $mtu (status $status)")
             armTimeout()
             enableDataNotifications(gatt)
+        }
+
+        // The actual negotiated connection interval (the real throughput lever behind
+        // requestConnectionPriority — see onConnectionStateChange) has no public read API at
+        // all; onConnectionUpdated exists but is a hidden/system callback, not part of the SDK
+        // (confirmed against the platform's android.jar — it doesn't override anything here).
+        // PHY is the one comparable lever Android *does* expose a public result callback for.
+        @SuppressLint("MissingPermission")
+        override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
+            Log.d(TAG, "PHY updated: tx=${phyName(txPhy)} rx=${phyName(rxPhy)} (status $status)")
         }
 
         @SuppressLint("MissingPermission")
@@ -277,6 +306,10 @@ class BleGattClient(
     private var lastProgressEmitMs = 0L
 
     private fun onTransferComplete() {
+        val elapsedMs = SystemClock.elapsedRealtime() - receiveStartMs
+        val bytes = receiveBuffer.size()
+        val kbPerSec = if (elapsedMs > 0) bytes / elapsedMs.toDouble() else 0.0
+        Log.d(TAG, "Transfer complete: $bytes bytes in ${elapsedMs}ms (${"%.1f".format(kbPerSec)} KB/s)")
         _syncState.value = SyncState.Inserting
         val csvText = receiveBuffer.toString(Charsets.US_ASCII.name())
         scope.launch {
@@ -341,6 +374,7 @@ class BleGattClient(
     private fun writeRequestData(gatt: BluetoothGatt) {
         _syncState.value = SyncState.RequestingData
         lastControlWrite = ControlWrite.REQUEST_DATA
+        receiveStartMs = SystemClock.elapsedRealtime()
         writeControl(gatt, byteArrayOf(BleConstants.OPCODE_REQUEST_DATA))
     }
 
@@ -438,6 +472,7 @@ class BleGattClient(
     }
 
     companion object {
+        private const val TAG = "BleGattClient"
         private const val SYNC_TIMEOUT_MS = 30_000L
         private const val PROGRESS_EMIT_INTERVAL_MS = 100L
     }
