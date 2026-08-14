@@ -15,6 +15,7 @@ import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Build
 import android.os.ParcelUuid
+import android.os.SystemClock
 import com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
@@ -102,6 +103,7 @@ class BleGattClient(
         }
 
         receiveBuffer.reset()
+        lastProgressEmitMs = 0L
         _syncState.value = SyncState.Scanning
         armTimeout()
 
@@ -256,8 +258,23 @@ class BleGattClient(
             return
         }
         receiveBuffer.write(value)
-        _syncState.value = SyncState.ReceivingData(receiveBuffer.size())
+        // GATT callbacks are delivered on the main thread (no Handler/Executor was passed to
+        // connectGatt), which is also where Compose recomposes. ReceivingData is a data class
+        // keyed on the byte count, so emitting it on every single notification forced a full
+        // recomposition (+ a LaunchedEffect(syncState) relaunch in GraphScreen) per chunk — with
+        // a fast link, that main-thread work becomes the actual bottleneck: the UI can't keep up
+        // with notification arrival, so the app lags behind the radio instead of the other way
+        // around. Throttle to ~10 updates/sec, same as the sender script already throttles its
+        // own progress print (see ble_csv_sender.py's send_csv) — the buffer itself still
+        // captures every byte immediately, only the UI-visible progress is coalesced.
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastProgressEmitMs >= PROGRESS_EMIT_INTERVAL_MS) {
+            lastProgressEmitMs = now
+            _syncState.value = SyncState.ReceivingData(receiveBuffer.size())
+        }
     }
+
+    private var lastProgressEmitMs = 0L
 
     private fun onTransferComplete() {
         _syncState.value = SyncState.Inserting
@@ -422,5 +439,6 @@ class BleGattClient(
 
     companion object {
         private const val SYNC_TIMEOUT_MS = 30_000L
+        private const val PROGRESS_EMIT_INTERVAL_MS = 100L
     }
 }
