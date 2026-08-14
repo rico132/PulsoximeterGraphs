@@ -74,6 +74,27 @@ class GraphViewModel(
         _canZoomOut.value = rangeHistory.isNotEmpty()
     }
 
+    /**
+     * Narrows the current range to [ZOOM_IN_FACTOR] of its span, centered on its midpoint —
+     * the button-driven counterpart to drag-to-zoom (which narrows to an arbitrary dragged
+     * span instead). Goes through [setRange] like every other range change, so it's undoable
+     * with [zoomOut] the same way a drag-to-zoom is. A no-op once the range is already at or
+     * below [MIN_ZOOM_SPAN_SECONDS], so repeated taps can't zoom into an unusably tiny or empty
+     * window.
+     */
+    fun zoomIn() {
+        val current = _selectedRange.value
+        val currentSpanSeconds = current.endInclusive.epochSecond - current.start.epochSecond
+        if (currentSpanSeconds <= MIN_ZOOM_SPAN_SECONDS) return
+        val newSpanSeconds = (currentSpanSeconds * ZOOM_IN_FACTOR)
+            .toLong()
+            .coerceAtLeast(MIN_ZOOM_SPAN_SECONDS)
+        val centerEpochSecond = current.start.epochSecond + currentSpanSeconds / 2
+        val newStart = Instant.ofEpochSecond(centerEpochSecond - newSpanSeconds / 2)
+        val newEnd = Instant.ofEpochSecond(centerEpochSecond + newSpanSeconds / 2)
+        setRange(newStart..newEnd)
+    }
+
     fun importCsvText(text: String, onResult: (inserted: Int, skipped: Int) -> Unit) {
         viewModelScope.launch {
             val result = readingsRepository.importCsv(text)
@@ -89,8 +110,14 @@ class GraphViewModel(
         bleGattClient.resetState()
     }
 
+    fun cancelSync() {
+        bleGattClient.cancelSync()
+    }
+
     companion object {
         private const val MAX_RANGE_HISTORY = 50
+        private const val ZOOM_IN_FACTOR = 0.5
+        private const val MIN_ZOOM_SPAN_SECONDS = 60L
 
         // Both ends are rounded independently to the *local wall-clock* hour (not truncated as
         // a raw Instant, which would snap to UTC hour boundaries and land on the wrong minute in
