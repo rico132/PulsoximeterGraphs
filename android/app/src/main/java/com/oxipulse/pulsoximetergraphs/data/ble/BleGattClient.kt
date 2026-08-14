@@ -105,6 +105,7 @@ class BleGattClient(
             return // A sync is already in progress.
         }
 
+        log("Sync started")
         receiveBuffer.reset()
         lastProgressEmitMs = 0L
         _syncState.value = SyncState.Scanning
@@ -152,6 +153,7 @@ class BleGattClient(
 
     @SuppressLint("MissingPermission")
     private fun connect(address: String) {
+        log("Found device, connecting to $address")
         _syncState.value = SyncState.Connecting
         val adapter = bluetoothAdapter ?: return fail("Bluetooth adapter unavailable")
         val device = adapter.getRemoteDevice(address)
@@ -165,11 +167,18 @@ class BleGattClient(
         else -> "unknown($phy)"
     }
 
+    /** Logs to logcat and mirrors into [BleDebugLog] so a sync can be diagnosed without adb. */
+    private fun log(message: String) {
+        Log.d(TAG, message)
+        BleDebugLog.add(message)
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
 
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                log("Connected (status $status), requesting priority + PHY")
                 // Without this, Android negotiates its default "balanced" connection interval
                 // (tens of ms per connection event), which caps real throughput far below what
                 // the negotiated MTU/chunk size would allow — raising MTU alone doesn't touch
@@ -187,6 +196,7 @@ class BleGattClient(
                 )
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                log("Disconnected (status $status)")
                 if (_syncState.value !is SyncState.Success && _syncState.value !is SyncState.Failed) {
                     fail("Device disconnected before sync completed")
                 }
@@ -211,6 +221,7 @@ class BleGattClient(
                 fail("Required characteristics not found")
                 return
             }
+            log("Services discovered, requesting MTU ${BleConstants.REQUESTED_MTU}")
             armTimeout()
             gatt.requestMtu(BleConstants.REQUESTED_MTU)
         }
@@ -219,7 +230,7 @@ class BleGattClient(
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             // Whether or not the negotiation succeeded, proceed with whatever MTU we have —
             // the protocol must also work correctly at the default, un-negotiated MTU of 23.
-            Log.d(TAG, "MTU negotiated: $mtu (status $status)")
+            log("MTU negotiated: $mtu (status $status)")
             armTimeout()
             enableDataNotifications(gatt)
         }
@@ -231,7 +242,7 @@ class BleGattClient(
         // PHY is the one comparable lever Android *does* expose a public result callback for.
         @SuppressLint("MissingPermission")
         override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
-            Log.d(TAG, "PHY updated: tx=${phyName(txPhy)} rx=${phyName(rxPhy)} (status $status)")
+            log("PHY updated: tx=${phyName(txPhy)} rx=${phyName(rxPhy)} (status $status)")
         }
 
         @SuppressLint("MissingPermission")
@@ -309,7 +320,7 @@ class BleGattClient(
         val elapsedMs = SystemClock.elapsedRealtime() - receiveStartMs
         val bytes = receiveBuffer.size()
         val kbPerSec = if (elapsedMs > 0) bytes / elapsedMs.toDouble() else 0.0
-        Log.d(TAG, "Transfer complete: $bytes bytes in ${elapsedMs}ms (${"%.1f".format(kbPerSec)} KB/s)")
+        log("Transfer complete: $bytes bytes in ${elapsedMs}ms (${"%.1f".format(kbPerSec)} KB/s)")
         _syncState.value = SyncState.Inserting
         val csvText = receiveBuffer.toString(Charsets.US_ASCII.name())
         scope.launch {
@@ -323,6 +334,7 @@ class BleGattClient(
             }
             _syncState.value = SyncState.ClearingBuffer
             writeClearBuffer(gatt)
+            log("Sync succeeded: ${result.readings.size} rows inserted, ${result.skippedRowCount} skipped")
             _syncState.value = SyncState.Success(result.readings.size, result.skippedRowCount)
         }
     }
@@ -448,6 +460,7 @@ class BleGattClient(
     }
 
     private fun fail(message: String) {
+        log("FAILED: $message")
         cancelTimeout()
         _syncState.value = SyncState.Failed(message)
         disconnect()

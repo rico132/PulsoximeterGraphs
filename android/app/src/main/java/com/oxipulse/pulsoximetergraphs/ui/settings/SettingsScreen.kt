@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.rememberScrollState
@@ -18,6 +19,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
@@ -30,6 +32,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -47,6 +52,7 @@ fun SettingsScreen(
     )
     val config by viewModel.config.collectAsState()
     val testModeEnabled by viewModel.testModeEnabled.collectAsState()
+    val debugLog by viewModel.debugLog.collectAsState()
 
     // Local editable draft, seeded from the persisted config and reset whenever it changes
     // externally (e.g. after a successful save round-trips a new StateFlow value).
@@ -104,6 +110,10 @@ fun SettingsScreen(
             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
             DeviceSection(viewModel, testModeEnabled)
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+            DebugLogSection(debugLog, onClear = viewModel::clearDebugLog)
         }
     }
 }
@@ -200,6 +210,52 @@ private fun DeviceSection(viewModel: SettingsViewModel, testModeEnabled: Boolean
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
+            }
+        }
+    }
+}
+
+/**
+ * Live mirror of [com.oxipulse.pulsoximetergraphs.data.ble.BleDebugLog], the app's own trace of
+ * the last BLE sync (connection state, negotiated MTU/PHY, per-transfer throughput) — for
+ * diagnosing a sync without adb/logcat access. "Copy log" puts the whole thing on the clipboard
+ * in one tap; the text is also directly selectable if only part of it is needed.
+ */
+@Composable
+private fun DebugLogSection(debugLog: String, onClear: () -> Unit) {
+    val clipboardManager = LocalClipboardManager.current
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text("BLE Debug Log", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Trace of the last BLE sync attempt — run a sync, then copy this and share it.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(240.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(12.dp),
+            ) {
+                Text(
+                    text = debugLog.ifBlank { "(empty — run a BLE sync to populate this)" },
+                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                )
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { clipboardManager.setText(AnnotatedString(debugLog)) },
+                enabled = debugLog.isNotBlank(),
+            ) {
+                Text("Copy log")
+            }
+            OutlinedButton(onClick = onClear, enabled = debugLog.isNotBlank()) {
+                Text("Clear")
             }
         }
     }

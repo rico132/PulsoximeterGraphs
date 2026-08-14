@@ -2,6 +2,7 @@ package com.oxipulse.pulsoximetergraphs.ui.settings
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import com.oxipulse.pulsoximetergraphs.data.ble.BleDebugLog
 import com.oxipulse.pulsoximetergraphs.data.ble.BleGattClient
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdsRepository
@@ -15,6 +16,9 @@ class SettingsViewModel(
     val config: StateFlow<ThresholdConfig> = thresholdsRepository.config
     val testModeEnabled: StateFlow<Boolean?> = bleGattClient.testModeEnabled
     val syncState: StateFlow<BleGattClient.SyncState> = bleGattClient.syncState
+    val debugLog: StateFlow<String> = BleDebugLog.entries
+
+    fun clearDebugLog() = BleDebugLog.clear()
 
     /** Returns null on success, or a validation-error message. Never persists an invalid config. */
     fun save(newConfig: ThresholdConfig): String? = thresholdsRepository.update(newConfig)
