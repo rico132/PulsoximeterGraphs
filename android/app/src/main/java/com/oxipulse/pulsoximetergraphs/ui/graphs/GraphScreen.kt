@@ -4,7 +4,6 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,9 +14,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
@@ -51,7 +48,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
@@ -70,7 +66,6 @@ import com.patrykandpatrick.vico.compose.cartesian.CartesianChartHost
 import com.patrykandpatrick.vico.compose.cartesian.VicoScrollState
 import com.patrykandpatrick.vico.compose.cartesian.VicoZoomState
 import com.patrykandpatrick.vico.compose.cartesian.Zoom
-import com.patrykandpatrick.vico.compose.cartesian.axis.Axis
 import com.patrykandpatrick.vico.compose.cartesian.axis.HorizontalAxis
 import com.patrykandpatrick.vico.compose.cartesian.axis.VerticalAxis
 import com.patrykandpatrick.vico.compose.cartesian.axis.rememberAxisLabelComponent
@@ -179,6 +174,11 @@ fun GraphScreen(
             TopAppBar(
                 title = { Text("Pulsoximeter Graphs") },
                 actions = {
+                    if (canZoomOut) {
+                        IconButton(onClick = { viewModel.zoomOut() }) {
+                            Icon(Icons.Filled.ZoomOut, contentDescription = "Zoom out")
+                        }
+                    }
                     IconButton(onClick = { showRangePicker = true }) {
                         Icon(Icons.Filled.DateRange, contentDescription = "Select date range")
                     }
@@ -233,15 +233,23 @@ fun GraphScreen(
         ) {
             RangeSummary(selectedRange)
             StatsPanel(stats)
-            CombinedChartCard(
+            SpO2ChartCard(
                 readings = plottedReadings,
                 thresholdConfig = thresholdConfig,
-                stats = stats,
+                minSpo2 = stats.minSpo2,
+                maxSpo2 = stats.maxSpo2,
                 zoomState = sharedZoomState,
                 scrollState = sharedScrollState,
                 onRangeSelected = viewModel::setRange,
-                canZoomOut = canZoomOut,
-                onZoomOut = { viewModel.zoomOut() },
+            )
+            PulseChartCard(
+                readings = plottedReadings,
+                thresholdConfig = thresholdConfig,
+                minPulse = stats.minPulse,
+                maxPulse = stats.maxPulse,
+                zoomState = sharedZoomState,
+                scrollState = sharedScrollState,
+                onRangeSelected = viewModel::setRange,
             )
         }
     }
@@ -487,45 +495,38 @@ private fun DragToZoomOverlay(
     }
 }
 
+// Thinner than Vico's 2dp default line, kept from the combined-chart layout this replaced —
+// even with each metric back on its own card, a thinner line reads as less noisy against the
+// threshold bands drawn behind it.
+private val CHART_LINE_STROKE = LineCartesianLayer.LineStroke.Continuous(thickness = 1.2.dp)
+
 /**
- * A single chart plotting both metrics as separate lines against separate Y-axes — Pulse on the
- * start (left) axis, SpO2 on the end (right) axis — rather than the two-cards-with-shared-
- * scroll-state approach this replaced. Both series come from ONE [CartesianChartModelProducer]:
- * a `lineModel { }` call inside [CartesianChartModelProducer.runTransaction] adds one
- * layer-model, matched *by position* to the corresponding [rememberLineCartesianLayer] in
- * [rememberCartesianChart] below — so the two `lineModel` calls here (pulse, then SpO2) must
- * stay in the same order as the two layers passed to the chart.
- *
- * Two Y-scales on one chart is usually the wrong call for comparing values (see the dataviz
- * skill's anti-patterns), but that's not what this is for: pulse (bpm) and SpO2 (%) aren't
- * comparable magnitudes in the first place, so there's no shared scale to distort — this is
- * "two independent metrics over the same timeline," where a dual axis is a deliberate,
- * requested layout rather than an attempt to make two series look correlated.
+ * SpO2 and Pulse are two separate cards, each with its own chart, scale, and threshold bands —
+ * NOT one dual-axis chart. The thresholds for the two metrics visually overlap in places (e.g. a
+ * pulse-high-orange band and an spo2-red band can land at the same on-screen height once each is
+ * mapped onto its own axis), which reads as one metric's danger zone bleeding into the other's
+ * when both are drawn on a shared plot — splitting them back into independent charts removes
+ * that ambiguity even though the two share the horizontal (time) axis conceptually. `zoomState`/
+ * `scrollState` are still shared between both cards purely because pinch/drag zoom is disabled on
+ * both (see the comment on `sharedZoomState` in [GraphScreen]) — there's no live pan/zoom to keep
+ * in sync, just a single state instance CartesianChartHost requires per chart.
  */
 @Composable
-private fun CombinedChartCard(
+private fun SpO2ChartCard(
     readings: List<ReadingEntity>,
     thresholdConfig: ThresholdConfig,
-    stats: ReadingStats,
+    minSpo2: Int?,
+    maxSpo2: Int?,
     zoomState: VicoZoomState,
     scrollState: VicoScrollState,
     onRangeSelected: (ClosedRange<Instant>) -> Unit,
-    canZoomOut: Boolean,
-    onZoomOut: () -> Unit,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
     LaunchedEffect(readings) {
         modelProducer.runTransaction {
-            // A series must be non-empty (Vico throws otherwise), so only add either one when
-            // there's actually data for the selected range — an empty transaction just renders
-            // no lines. Order matches the layer order in rememberCartesianChart below.
+            // A series must be non-empty (Vico throws otherwise), so only add one when there's
+            // actually data for the selected range — an empty transaction just renders no line.
             if (readings.isNotEmpty()) {
-                lineModel {
-                    series(
-                        x = readings.indices.map { it.toDouble() },
-                        y = readings.map { it.pulse.toDouble() },
-                    )
-                }
                 lineModel {
                     series(
                         x = readings.indices.map { it.toDouble() },
@@ -536,100 +537,44 @@ private fun CombinedChartCard(
         }
     }
 
-    val pulseColor = MaterialTheme.extendedColors.chartPulse
     val spo2Color = MaterialTheme.extendedColors.chartSpo2
     val timeAxisFormatter = rememberTimeAxisFormatter(readings)
-
-    // Computed once and shared between each axis's range provider and its threshold bands
-    // (below), so the bands are guaranteed to clamp to *exactly* the range actually on screen —
-    // see ThresholdBands.kt for why that clamp is necessary (unclamped bands bled past the
-    // chart's own bounds).
-    val pulseMinY = stats.minPulse?.let { floorToMultipleOf5(it) }
-    val pulseMaxY = stats.maxPulse?.let { ceilToMultipleOf5(it) }
-    // SpO2 is a percentage, so 100 is a hard ceiling regardless of the padding-to-5 rule.
-    val spo2MinY = stats.minSpo2?.let { floorToMultipleOf5(it) }
-    val spo2MaxY = stats.maxSpo2?.let { ceilToMultipleOf5(it).coerceAtMost(100) }
-
-    val pulseBands = rememberPulseThresholdBands(
-        thresholdConfig,
-        visibleMinY = pulseMinY?.toDouble(),
-        visibleMaxY = pulseMaxY?.toDouble(),
-    )
-    val spo2Bands = rememberSpo2ThresholdBands(
-        thresholdConfig,
-        visibleMinY = spo2MinY?.toDouble(),
-        visibleMaxY = spo2MaxY?.toDouble(),
-    )
-    val pulseRangeProvider = remember(pulseMinY, pulseMaxY) { fixedYRange(pulseMinY, pulseMaxY) }
-    val spo2RangeProvider = remember(spo2MinY, spo2MaxY) { fixedYRange(spo2MinY, spo2MaxY) }
-
-    // Thinner than Vico's 2dp default: with two series sharing one chart now, two full-weight
-    // lines read as cluttered, especially wherever they cross.
-    val lineStroke = LineCartesianLayer.LineStroke.Continuous(thickness = 1.2.dp)
-    val pulseLine = LineCartesianLayer.rememberLine(
-        fill = LineCartesianLayer.LineFill.single(Fill(pulseColor)),
-        stroke = lineStroke,
-    )
+    // SpO2 is a percentage, so 100 is a hard ceiling regardless of the padding-to-5 rule below.
+    val minY = minSpo2?.let { floorToMultipleOf5(it) }
+    val maxY = maxSpo2?.let { ceilToMultipleOf5(it).coerceAtMost(100) }
+    // Same rounded bounds passed to the range provider, so the bands clamp to exactly what's
+    // on screen — see ThresholdBands.kt for why that clamp is necessary.
+    val bands = rememberSpo2ThresholdBands(thresholdConfig, visibleMinY = minY?.toDouble(), visibleMaxY = maxY?.toDouble())
+    val rangeProvider = remember(minY, maxY) { fixedYRange(minY, maxY) }
     val spo2Line = LineCartesianLayer.rememberLine(
         fill = LineCartesianLayer.LineFill.single(Fill(spo2Color)),
-        stroke = lineStroke,
+        stroke = CHART_LINE_STROKE,
     )
     val labelFontSize = MaterialTheme.typography.labelSmall.fontSize
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column {
-                    Text("SpO2 & Pulse", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                        LegendEntry(color = pulseColor, label = "Pulse (bpm)")
-                        LegendEntry(color = spo2Color, label = "SpO2 (%)")
-                    }
-                }
-                // Placed on the card itself (not the top app bar) so it sits next to the chart
-                // it actually affects.
-                if (canZoomOut) {
-                    IconButton(onClick = onZoomOut) {
-                        Icon(Icons.Filled.ZoomOut, contentDescription = "Zoom out")
-                    }
-                }
-            }
+            Text("SpO2 (%)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             ProvideVicoTheme(rememberM3VicoTheme()) {
                 DragToZoomOverlay(
                     readings = readings,
                     onRangeSelected = onRangeSelected,
-                    modifier = Modifier.fillMaxWidth().height(260.dp),
+                    modifier = Modifier.fillMaxWidth().height(220.dp),
                 ) {
                     CartesianChartHost(
                         chart = rememberCartesianChart(
                             rememberLineCartesianLayer(
-                                lineProvider = LineCartesianLayer.LineProvider.series(pulseLine),
-                                rangeProvider = pulseRangeProvider,
-                                verticalAxisPosition = Axis.Position.Vertical.Start,
-                            ),
-                            rememberLineCartesianLayer(
                                 lineProvider = LineCartesianLayer.LineProvider.series(spo2Line),
-                                rangeProvider = spo2RangeProvider,
-                                verticalAxisPosition = Axis.Position.Vertical.End,
+                                rangeProvider = rangeProvider,
                             ),
                             startAxis = VerticalAxis.rememberStart(
-                                line = rememberAxisLineComponent(fill = Fill(pulseColor)),
-                                label = rememberAxisLabelComponent(
-                                    style = TextStyle(color = pulseColor, fontSize = labelFontSize),
-                                ),
-                            ),
-                            endAxis = VerticalAxis.rememberEnd(
                                 line = rememberAxisLineComponent(fill = Fill(spo2Color)),
                                 label = rememberAxisLabelComponent(
                                     style = TextStyle(color = spo2Color, fontSize = labelFontSize),
                                 ),
                             ),
                             bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = timeAxisFormatter),
-                            decorations = pulseBands + spo2Bands,
+                            decorations = bands,
                         ),
                         modelProducer = modelProducer,
                         scrollState = scrollState,
@@ -642,12 +587,73 @@ private fun CombinedChartCard(
     }
 }
 
-/** A small colored dot + label — the "direct label" relief the dataviz skill requires whenever
- * a chart's categorical colors don't clear the full contrast/CVD bar on their own. */
 @Composable
-private fun LegendEntry(color: Color, label: String) {
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-        Box(modifier = Modifier.size(8.dp).background(color, shape = CircleShape))
-        Text(label, style = MaterialTheme.typography.labelMedium)
+private fun PulseChartCard(
+    readings: List<ReadingEntity>,
+    thresholdConfig: ThresholdConfig,
+    minPulse: Int?,
+    maxPulse: Int?,
+    zoomState: VicoZoomState,
+    scrollState: VicoScrollState,
+    onRangeSelected: (ClosedRange<Instant>) -> Unit,
+) {
+    val modelProducer = remember { CartesianChartModelProducer() }
+    LaunchedEffect(readings) {
+        modelProducer.runTransaction {
+            if (readings.isNotEmpty()) {
+                lineModel {
+                    series(
+                        x = readings.indices.map { it.toDouble() },
+                        y = readings.map { it.pulse.toDouble() },
+                    )
+                }
+            }
+        }
+    }
+
+    val pulseColor = MaterialTheme.extendedColors.chartPulse
+    val timeAxisFormatter = rememberTimeAxisFormatter(readings)
+    val minY = minPulse?.let { floorToMultipleOf5(it) }
+    val maxY = maxPulse?.let { ceilToMultipleOf5(it) }
+    val bands = rememberPulseThresholdBands(thresholdConfig, visibleMinY = minY?.toDouble(), visibleMaxY = maxY?.toDouble())
+    val rangeProvider = remember(minY, maxY) { fixedYRange(minY, maxY) }
+    val pulseLine = LineCartesianLayer.rememberLine(
+        fill = LineCartesianLayer.LineFill.single(Fill(pulseColor)),
+        stroke = CHART_LINE_STROKE,
+    )
+    val labelFontSize = MaterialTheme.typography.labelSmall.fontSize
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text("Pulse (bpm)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            ProvideVicoTheme(rememberM3VicoTheme()) {
+                DragToZoomOverlay(
+                    readings = readings,
+                    onRangeSelected = onRangeSelected,
+                    modifier = Modifier.fillMaxWidth().height(220.dp),
+                ) {
+                    CartesianChartHost(
+                        chart = rememberCartesianChart(
+                            rememberLineCartesianLayer(
+                                lineProvider = LineCartesianLayer.LineProvider.series(pulseLine),
+                                rangeProvider = rangeProvider,
+                            ),
+                            startAxis = VerticalAxis.rememberStart(
+                                line = rememberAxisLineComponent(fill = Fill(pulseColor)),
+                                label = rememberAxisLabelComponent(
+                                    style = TextStyle(color = pulseColor, fontSize = labelFontSize),
+                                ),
+                            ),
+                            bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = timeAxisFormatter),
+                            decorations = bands,
+                        ),
+                        modelProducer = modelProducer,
+                        scrollState = scrollState,
+                        zoomState = zoomState,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+            }
+        }
     }
 }

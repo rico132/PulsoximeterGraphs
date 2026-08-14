@@ -76,8 +76,8 @@ Bundled as the Android app's `assets/default_thresholds.json`; not used by the f
   "spo2Red": 90,
   "pulseLowOrange": 50,
   "pulseLowRed": 45,
-  "pulseHighOrange": 100,
-  "pulseHighRed": 120
+  "pulseHighOrange": 90,
+  "pulseHighRed": 100
 }
 ```
 

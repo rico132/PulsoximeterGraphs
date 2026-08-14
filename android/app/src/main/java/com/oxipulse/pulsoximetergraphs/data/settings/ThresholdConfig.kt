@@ -16,8 +16,8 @@ data class ThresholdConfig(
     val spo2Red: Int = 90,
     val pulseLowOrange: Int = 50,
     val pulseLowRed: Int = 45,
-    val pulseHighOrange: Int = 100,
-    val pulseHighRed: Int = 120,
+    val pulseHighOrange: Int = 90,
+    val pulseHighRed: Int = 100,
 ) {
     /** Returns a human-readable validation error, or null if [this] is valid. */
     fun validate(): String? = when {
