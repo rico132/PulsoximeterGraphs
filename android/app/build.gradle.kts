@@ -30,10 +30,36 @@ android {
         vectorDrawables.useSupportLibrary = true
     }
 
+    // Release builds must be reproducibly signed with the *same* certificate build-over-build —
+    // otherwise Android refuses to install an update over whatever's already on the device
+    // ("signatures do not match", surfaced by installers like Obtainium as a package conflict).
+    // The release workflow used to build assembleDebug, whose keystore is auto-generated fresh
+    // by AGP on every CI run (GitHub Actions runners have no persisted ~/.android/debug.keystore),
+    // so every past release was signed with a different, throwaway key. A real release keystore
+    // is decoded from a GitHub Actions secret into RELEASE_KEYSTORE_PATH by the workflow; when
+    // that env var isn't set (e.g. local `./gradlew assembleRelease`), release stays unsigned —
+    // same as before this was introduced.
+    val releaseKeystorePath = System.getenv("RELEASE_KEYSTORE_PATH")
+    val hasReleaseSigning = releaseKeystorePath != null && file(releaseKeystorePath).exists()
+
+    if (hasReleaseSigning) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

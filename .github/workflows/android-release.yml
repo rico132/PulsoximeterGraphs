@@ -1,6 +1,7 @@
 name: Build and release APK
 
-# Builds the Android debug APK and publishes it as a GitHub release on every push to main
+# Builds the Android release APK, signed with the fixed keystore in the RELEASE_KEYSTORE_*
+# secrets (see build.gradle.kts), and publishes it as a GitHub release on every push to main
 # (or on manual trigger). The version tag is computed automatically and is always a 0.x.y
 # tag — this workflow will never create or touch a 1.0.0+ tag. Once the app is ready for a
 # real 1.0.0, that release should be tagged/published by hand.
@@ -58,11 +59,27 @@ jobs:
           echo "version=$next" >> "$GITHUB_OUTPUT"
           echo "version_name=${next#v}" >> "$GITHUB_OUTPUT"
 
+      # Decode the release keystore from its base64 secret into a file outside the repo/workspace
+      # tree, so every release is signed with the same certificate — required for Android to
+      # accept an update over whatever's already installed (see build.gradle.kts for why this
+      # replaced building assembleDebug, whose signing key was regenerated fresh on every run).
+      - name: Decode release keystore
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          keystore_path="$RUNNER_TEMP/release.keystore"
+          echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$keystore_path"
+          echo "RELEASE_KEYSTORE_PATH=$keystore_path" >> "$GITHUB_ENV"
+
       # versionName matches the release tag (minus the leading "v"); versionCode just needs
       # to strictly increase build-over-build, which the workflow run number already does.
-      - name: Build debug APK
+      - name: Build release APK
+        env:
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: >
-          ./android/build.sh assembleDebug --no-daemon
+          ./android/build.sh assembleRelease --no-daemon
           -PappVersionName=${{ steps.version.outputs.version_name }}
           -PappVersionCode=${{ github.run_number }}
 
@@ -70,8 +87,8 @@ jobs:
         id: apk
         run: |
           version="${{ steps.version.outputs.version }}"
-          src="android/app/build/outputs/apk/debug/app-debug.apk"
-          dest="android/app/build/outputs/apk/debug/PulsoximeterGraphs-${version}.apk"
+          src="android/app/build/outputs/apk/release/app-release.apk"
+          dest="android/app/build/outputs/apk/release/PulsoximeterGraphs-${version}.apk"
           mv "$src" "$dest"
           echo "path=$dest" >> "$GITHUB_OUTPUT"
 
