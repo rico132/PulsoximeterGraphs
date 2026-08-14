@@ -28,10 +28,13 @@ pulls the file, and this script exits on its own once the app confirms the impor
 
 Speed:
 - The defaults (--chunk-size 180, --chunk-delay 0.01) are a conservative middle ground.
-  If a transfer feels slow, --chunk-size can go as high as ~240 (just under the 244-byte
-  payload the app's requested 247-byte MTU allows) and --chunk-delay can go lower, even to
+  If a transfer feels slow, --chunk-size can go as high as ~500 (just under the 500-byte
+  payload the app's requested 503-byte MTU allows) and --chunk-delay can go lower, even to
   0 — push both up/down together and re-run; if rows come out missing or corrupted in the
-  app afterward, that combination was too aggressive for your adapter, so back off.
+  app afterward, that combination was too aggressive for your adapter, so back off. Note
+  that a *lower* chunk size always keeps working too, at any MTU: reassembly on the app
+  side just concatenates notifications in arrival order until the terminator, so it never
+  assumes chunks are any particular size — 500 is a ceiling, not a requirement.
 
 Troubleshooting:
 - "Could not locate bluetooth adapter" / D-Bus permission errors: make sure
@@ -282,9 +285,9 @@ def main():
         "--chunk-size",
         type=int,
         default=180,
-        help="Bytes per BLE notification (default: 180 — under the ~244-byte payload the "
-        "app's requested 247-byte MTU allows; raise it for speed, up to ~240, or lower it "
-        "if the app reports dropped/corrupt rows)",
+        help="Bytes per BLE notification (default: 180 — well under the ~500-byte payload "
+        "the app's requested 503-byte MTU allows; raise it for speed, up to ~500, or lower "
+        "it if the app reports dropped/corrupt rows)",
     )
     parser.add_argument(
         "--chunk-delay",

@@ -71,8 +71,14 @@ enum ControlOpcode : uint8_t {
 // containing a single 0x00 byte (CSV text never contains 0x00).
 constexpr uint8_t kEndOfTransferByte = 0x00;
 
-// MTU negotiation: request 247, must also work at the default un-negotiated 23.
-constexpr uint16_t kPreferredMtu = 247;
+// MTU negotiation: request 503 (500-byte chunks; NimBLE's own ceiling is
+// BLE_ATT_MTU_MAX == 527, see ble_att.h), must also work at the default
+// un-negotiated 23. BLE MTU exchange settles on the *smaller* of what each
+// side proposes, so this value is what actually caps the negotiated MTU on
+// a real device even if the phone asks for more -- it must be raised here,
+// not just in the Android app's BleConstants.kt, for hardware syncs to see
+// any benefit from a higher chunk size (PROTOCOL.md's shared contract).
+constexpr uint16_t kPreferredMtu = 503;
 constexpr uint16_t kMinMtu = 23;
 
 // ---------------------------------------------------------------------------

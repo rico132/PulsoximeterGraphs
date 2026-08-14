@@ -33,7 +33,7 @@ import kotlinx.coroutines.launch
  * BLE GATT client implementing exactly the sync sequence from PROTOCOL.md:
  *
  * 1. Scan by service UUID, connect, discover services.
- * 2. Request MTU 247 (falls back gracefully to whatever is negotiated, including the
+ * 2. Request MTU 503 (falls back gracefully to whatever is negotiated, including the
  *    un-negotiated default of 23 — chunk math always uses the actual negotiated value).
  * 3. Write SET_TIME (every connection).
  * 4. Write REQUEST_DATA.

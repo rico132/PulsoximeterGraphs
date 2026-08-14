@@ -45,8 +45,13 @@ object BleConstants {
     /** End-of-transfer marker on the Data characteristic: exactly one 0x00 byte. */
     val DATA_TERMINATOR: ByteArray = byteArrayOf(0x00)
 
-    /** Requested MTU per PROTOCOL.md; the protocol must also work at the default MTU of 23. */
-    const val REQUESTED_MTU = 247
+    /**
+     * Requested MTU per PROTOCOL.md — 503 so a sender can chunk up to 500 bytes/notification
+     * (well under NimBLE's own 527 ceiling and Android's accepted requestMtu() range); the
+     * protocol must also work at the default MTU of 23, and at any smaller chunk size a sender
+     * chooses, since reassembly on this side never assumes a fixed chunk length.
+     */
+    const val REQUESTED_MTU = 503
 
     /** Default (un-negotiated) BLE MTU, floor for chunk-size math. */
     const val DEFAULT_MTU = 23

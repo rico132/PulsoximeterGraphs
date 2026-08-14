@@ -49,7 +49,9 @@ ESP32 = peripheral/server. Phone = central/client. Advertised device name: `Puls
 ### Data characteristic (notify)
 
 - Raw CSV ASCII bytes (including `\r\n`), chunked to `negotiatedMtu - 3` bytes per notification
-  (request MTU 247; must also work correctly at the default un-negotiated MTU of 23).
+  (request MTU 503, i.e. up to a 500-byte chunk; must also work correctly at the default
+  un-negotiated MTU of 23, and at any smaller chunk size a sender chooses to use — chunk size
+  is not fixed, notifications are just concatenated in arrival order until the terminator).
 - BLE notifications on one characteristic are delivered in order on a connected link, so no
   sequence numbers are used.
 - End-of-transfer marker: one final notification containing **exactly one `0x00` byte**
@@ -57,7 +59,7 @@ ESP32 = peripheral/server. Phone = central/client. Advertised device name: `Puls
 
 ### Recommended sync sequence (phone side)
 
-1. Connect, discover services, request MTU 247.
+1. Connect, discover services, request MTU 503.
 2. Write `SET_TIME` (always, every connection).
 3. Write `REQUEST_DATA`.
 4. Reassemble Data notifications until the `0x00` terminator; parse the CSV blob.
