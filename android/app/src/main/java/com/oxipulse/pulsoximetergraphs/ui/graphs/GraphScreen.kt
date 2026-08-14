@@ -95,6 +95,9 @@ import com.patrykandpatrick.vico.compose.m3.common.rememberM3VicoTheme
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlin.math.floor
+import kotlin.math.log10
+import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -460,6 +463,48 @@ private fun fixedYRange(minY: Int?, maxY: Int?): CartesianLayerRangeProvider =
         CartesianLayerRangeProvider.auto()
     }
 
+private const val TARGET_Y_AXIS_LABEL_COUNT = 5
+private val NICE_STEP_FRACTIONS = doubleArrayOf(1.0, 2.0, 5.0, 10.0)
+
+/**
+ * "Nice numbers" step chooser for the Y axis: a step of {1, 2, 5} times a power of ten, sized so
+ * roughly [TARGET_Y_AXIS_LABEL_COUNT] labels show regardless of how wide or narrow [minY]/[maxY]
+ * (already padded by [floorToMultipleOf5]/[ceilToMultipleOf5]) end up being.
+ *
+ * Vico's own default vertical-axis step (used when no [VerticalAxis.ItemPlacer] is passed to
+ * [VerticalAxis.rememberStart]) picks its step purely from the order of magnitude of `maxY` —
+ * see StepVerticalAxisItemPlacer's `requestedOrDefaultStep`, `10.0.pow(floor(log10(maxY)) - 1)` —
+ * which implicitly assumes the axis starts near zero. That's exactly wrong for this app's fixed,
+ * non-zero-based ranges: a mostly-normal SpO2 session with minY=85/maxY=100 gets a default step
+ * of 10 from that heuristic (10^(floor(log10(100))-1) = 10^1), leaving only two or three labels
+ * visible across a 15-point span that reads far more clearly labeled every 5. Computing the step
+ * from the actual span instead keeps the label count roughly constant no matter how tight the
+ * visible range is.
+ */
+private fun niceYAxisStep(minY: Int, maxY: Int): Double {
+    val span = (maxY - minY).toDouble()
+    if (span <= 0) return 1.0
+    val roughStep = span / TARGET_Y_AXIS_LABEL_COUNT
+    val magnitude = 10.0.pow(floor(log10(roughStep)))
+    val niceFraction = NICE_STEP_FRACTIONS.first { it * magnitude >= roughStep }
+    return niceFraction * magnitude
+}
+
+/**
+ * Y-axis item placer using [niceYAxisStep], or Vico's own default when there's no data for the
+ * selected range (matches [fixedYRange]'s null-range fallback to auto-scaling).
+ */
+@Composable
+private fun rememberYAxisItemPlacer(minY: Int?, maxY: Int?): VerticalAxis.ItemPlacer =
+    remember(minY, maxY) {
+        if (minY != null && maxY != null) {
+            val step = niceYAxisStep(minY, maxY)
+            VerticalAxis.ItemPlacer.step(step = { step })
+        } else {
+            VerticalAxis.ItemPlacer.step()
+        }
+    }
+
 private const val MAX_PLOTTED_POINTS = 500
 
 /**
@@ -656,6 +701,7 @@ private fun SpO2ChartCard(
     // on screen — see ThresholdBands.kt for why that clamp is necessary.
     val bands = rememberSpo2ThresholdBands(thresholdConfig, visibleMinY = minY?.toDouble(), visibleMaxY = maxY?.toDouble())
     val rangeProvider = remember(minY, maxY) { fixedYRange(minY, maxY) }
+    val yAxisItemPlacer = rememberYAxisItemPlacer(minY, maxY)
     val spo2Line = LineCartesianLayer.rememberLine(
         fill = LineCartesianLayer.LineFill.single(Fill(spo2Color)),
         stroke = CHART_LINE_STROKE,
@@ -682,6 +728,7 @@ private fun SpO2ChartCard(
                                 label = rememberAxisLabelComponent(
                                     style = TextStyle(color = spo2Color, fontSize = labelFontSize),
                                 ),
+                                itemPlacer = yAxisItemPlacer,
                             ),
                             bottomAxis = HorizontalAxis.rememberBottom(
                                 valueFormatter = timeAxisFormatter,
@@ -737,6 +784,7 @@ private fun PulseChartCard(
     val maxY = maxPulse?.let { ceilToMultipleOf5(maxOf(it, thresholdConfig.pulseHighRed)) }
     val bands = rememberPulseThresholdBands(thresholdConfig, visibleMinY = minY?.toDouble(), visibleMaxY = maxY?.toDouble())
     val rangeProvider = remember(minY, maxY) { fixedYRange(minY, maxY) }
+    val yAxisItemPlacer = rememberYAxisItemPlacer(minY, maxY)
     val pulseLine = LineCartesianLayer.rememberLine(
         fill = LineCartesianLayer.LineFill.single(Fill(pulseColor)),
         stroke = CHART_LINE_STROKE,
@@ -763,6 +811,7 @@ private fun PulseChartCard(
                                 label = rememberAxisLabelComponent(
                                     style = TextStyle(color = pulseColor, fontSize = labelFontSize),
                                 ),
+                                itemPlacer = yAxisItemPlacer,
                             ),
                             bottomAxis = HorizontalAxis.rememberBottom(
                                 valueFormatter = timeAxisFormatter,
