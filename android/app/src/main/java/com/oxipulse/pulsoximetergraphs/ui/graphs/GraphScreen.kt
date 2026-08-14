@@ -469,7 +469,7 @@ private fun DragToZoomOverlay(
                     topLeft = Offset(left, 0f),
                     size = Size(right - left, size.height),
                 )
-                val edgeWidth = 2.dp.toPx()
+                val edgeWidth = 1.dp.toPx()
                 drawLine(selectionColor, Offset(left, 0f), Offset(left, size.height), strokeWidth = edgeWidth)
                 drawLine(selectionColor, Offset(right, 0f), Offset(right, size.height), strokeWidth = edgeWidth)
             }
@@ -538,26 +538,42 @@ private fun CombinedChartCard(
 
     val pulseColor = MaterialTheme.extendedColors.chartPulse
     val spo2Color = MaterialTheme.extendedColors.chartSpo2
-    val pulseBands = rememberPulseThresholdBands(thresholdConfig)
-    val spo2Bands = rememberSpo2ThresholdBands(thresholdConfig)
     val timeAxisFormatter = rememberTimeAxisFormatter(readings)
 
-    val pulseRangeProvider = remember(stats.minPulse, stats.maxPulse) {
-        fixedYRange(
-            minY = stats.minPulse?.let { floorToMultipleOf5(it) },
-            maxY = stats.maxPulse?.let { ceilToMultipleOf5(it) },
-        )
-    }
+    // Computed once and shared between each axis's range provider and its threshold bands
+    // (below), so the bands are guaranteed to clamp to *exactly* the range actually on screen —
+    // see ThresholdBands.kt for why that clamp is necessary (unclamped bands bled past the
+    // chart's own bounds).
+    val pulseMinY = stats.minPulse?.let { floorToMultipleOf5(it) }
+    val pulseMaxY = stats.maxPulse?.let { ceilToMultipleOf5(it) }
     // SpO2 is a percentage, so 100 is a hard ceiling regardless of the padding-to-5 rule.
-    val spo2RangeProvider = remember(stats.minSpo2, stats.maxSpo2) {
-        fixedYRange(
-            minY = stats.minSpo2?.let { floorToMultipleOf5(it) },
-            maxY = stats.maxSpo2?.let { ceilToMultipleOf5(it).coerceAtMost(100) },
-        )
-    }
+    val spo2MinY = stats.minSpo2?.let { floorToMultipleOf5(it) }
+    val spo2MaxY = stats.maxSpo2?.let { ceilToMultipleOf5(it).coerceAtMost(100) }
 
-    val pulseLine = LineCartesianLayer.rememberLine(fill = LineCartesianLayer.LineFill.single(Fill(pulseColor)))
-    val spo2Line = LineCartesianLayer.rememberLine(fill = LineCartesianLayer.LineFill.single(Fill(spo2Color)))
+    val pulseBands = rememberPulseThresholdBands(
+        thresholdConfig,
+        visibleMinY = pulseMinY?.toDouble(),
+        visibleMaxY = pulseMaxY?.toDouble(),
+    )
+    val spo2Bands = rememberSpo2ThresholdBands(
+        thresholdConfig,
+        visibleMinY = spo2MinY?.toDouble(),
+        visibleMaxY = spo2MaxY?.toDouble(),
+    )
+    val pulseRangeProvider = remember(pulseMinY, pulseMaxY) { fixedYRange(pulseMinY, pulseMaxY) }
+    val spo2RangeProvider = remember(spo2MinY, spo2MaxY) { fixedYRange(spo2MinY, spo2MaxY) }
+
+    // Thinner than Vico's 2dp default: with two series sharing one chart now, two full-weight
+    // lines read as cluttered, especially wherever they cross.
+    val lineStroke = LineCartesianLayer.LineStroke.Continuous(thickness = 1.2.dp)
+    val pulseLine = LineCartesianLayer.rememberLine(
+        fill = LineCartesianLayer.LineFill.single(Fill(pulseColor)),
+        stroke = lineStroke,
+    )
+    val spo2Line = LineCartesianLayer.rememberLine(
+        fill = LineCartesianLayer.LineFill.single(Fill(spo2Color)),
+        stroke = lineStroke,
+    )
     val labelFontSize = MaterialTheme.typography.labelSmall.fontSize
 
     Card(modifier = Modifier.fillMaxWidth()) {
