@@ -12,3 +12,11 @@ local.properties
 app/build/
 # Room's exported schema history (app/schemas/) is intentionally NOT ignored — it's
 # meant to be committed and used for migration testing as the schema evolves.
+
+# Release signing key material must never be committed (CI decodes it from GitHub secrets —
+# see build.gradle.kts's signingConfigs.release). Ignored wherever it's placed, in case someone
+# builds locally with the keystore sitting inside the project tree.
+*.keystore
+*.jks
+*.p12
+*.pfx
