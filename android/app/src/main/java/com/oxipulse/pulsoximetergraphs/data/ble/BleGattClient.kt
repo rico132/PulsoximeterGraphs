@@ -237,6 +237,15 @@ class BleGattClient(
             // Whether or not the negotiation succeeded, proceed with whatever MTU we have —
             // the protocol must also work correctly at the default, un-negotiated MTU of 23.
             log("MTU negotiated: $mtu (status $status)")
+            // Confirmed from real logs: the requestConnectionPriority() call in
+            // onConnectionStateChange, fired the instant the link comes up, is unreliable —
+            // back-to-back runs of the identical file landed at both ~15ms and ~80ms per
+            // notification despite requesting HIGH priority every time, and there's no
+            // completion callback for that call to detect which happened. Re-requesting it here,
+            // ~1s into the connection after service discovery and MTU exchange have already
+            // completed, gives the link a second chance to actually apply it once it's had time
+            // to settle — repeating a request that already succeeded is a harmless no-op.
+            gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
             armTimeout()
             enableDataNotifications(gatt)
         }
