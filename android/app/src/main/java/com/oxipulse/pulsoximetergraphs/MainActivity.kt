@@ -6,10 +6,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.oxipulse.pulsoximetergraphs.data.ble.BlePermissions
+import com.oxipulse.pulsoximetergraphs.data.settings.ThemeMode
 import com.oxipulse.pulsoximetergraphs.ui.graphs.GraphScreen
 import com.oxipulse.pulsoximetergraphs.ui.settings.SettingsScreen
 import com.oxipulse.pulsoximetergraphs.ui.theme.PulsoximeterGraphsTheme
@@ -24,7 +27,10 @@ class MainActivity : ComponentActivity() {
         val appContainer = (application as PulsoxApplication).container
 
         setContent {
-            PulsoximeterGraphsTheme {
+            val themeMode by appContainer.themePreferenceRepository.themeMode.collectAsState()
+            val isDarkTheme = themeMode == ThemeMode.DARK
+
+            PulsoximeterGraphsTheme(darkTheme = isDarkTheme) {
                 val permissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions(),
                 ) { /* Results are re-checked lazily by BlePermissions before each BLE action. */ }
@@ -43,6 +49,8 @@ class MainActivity : ComponentActivity() {
                         GraphScreen(
                             appContainer = appContainer,
                             onOpenSettings = { navController.navigate(ROUTE_SETTINGS) },
+                            isDarkTheme = isDarkTheme,
+                            onToggleTheme = { appContainer.themePreferenceRepository.toggle() },
                         )
                     }
                     composable(ROUTE_SETTINGS) {

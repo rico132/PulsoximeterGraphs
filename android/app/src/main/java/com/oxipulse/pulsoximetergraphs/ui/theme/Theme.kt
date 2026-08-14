@@ -9,16 +9,22 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 
-/** Extra color roles M3's default [MaterialTheme.colorScheme] doesn't cover. */
+/**
+ * Extra color roles M3's default [MaterialTheme.colorScheme] doesn't cover — specifically the
+ * two chart-series identity colors (SpO2/Pulse), which are deliberately NOT this app's
+ * primary/tertiary roles (see Color.kt for why) but still need to adapt per light/dark mode,
+ * unlike the fixed status colors used for threshold bands.
+ */
 data class ExtendedColors(
-    val orange: Color,
+    val chartSpo2: Color,
+    val chartPulse: Color,
 )
 
 private val LocalExtendedColors = staticCompositionLocalOf {
-    ExtendedColors(orange = OrangeLight)
+    ExtendedColors(chartSpo2 = ChartSpo2Light, chartPulse = ChartPulseLight)
 }
 
-/** Access via `MaterialTheme.extendedColors.orange` (see the extension property below). */
+/** Access via `MaterialTheme.extendedColors.chartPulse` / `.chartSpo2` (see the property below). */
 val MaterialTheme.extendedColors: ExtendedColors
     @Composable get() = LocalExtendedColors.current
 
@@ -40,7 +46,10 @@ fun PulsoximeterGraphsTheme(
     content: @Composable () -> Unit,
 ) {
     val colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme
-    val extendedColors = ExtendedColors(orange = if (darkTheme) OrangeDark else OrangeLight)
+    val extendedColors = ExtendedColors(
+        chartSpo2 = if (darkTheme) ChartSpo2Dark else ChartSpo2Light,
+        chartPulse = if (darkTheme) ChartPulseDark else ChartPulseLight,
+    )
 
     CompositionLocalProvider(LocalExtendedColors provides extendedColors) {
         MaterialTheme(

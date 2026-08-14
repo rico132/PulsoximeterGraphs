@@ -4,6 +4,7 @@ import android.content.Context
 import com.oxipulse.pulsoximetergraphs.data.ble.BleGattClient
 import com.oxipulse.pulsoximetergraphs.data.db.AppDatabase
 import com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository
+import com.oxipulse.pulsoximetergraphs.data.settings.ThemePreferenceRepository
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdsRepository
 
 /**
@@ -27,5 +28,9 @@ class AppContainer(context: Context) {
 
     val bleGattClient: BleGattClient by lazy {
         BleGattClient(appContext, readingsRepository)
+    }
+
+    val themePreferenceRepository: ThemePreferenceRepository by lazy {
+        ThemePreferenceRepository(appContext)
     }
 }

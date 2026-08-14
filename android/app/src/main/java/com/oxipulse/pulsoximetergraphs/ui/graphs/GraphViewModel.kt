@@ -10,6 +10,8 @@ import com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdsRepository
 import java.time.Instant
+import java.time.ZoneId
+import java.time.ZonedDateTime
 import java.time.temporal.ChronoUnit
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -90,10 +92,20 @@ class GraphViewModel(
     companion object {
         private const val MAX_RANGE_HISTORY = 50
 
+        // Both ends are rounded independently to the *local wall-clock* hour (not truncated as
+        // a raw Instant, which would snap to UTC hour boundaries and land on the wrong minute in
+        // any zone with a non-whole-hour UTC offset) — floor the start, ceil the end — rather
+        // than deriving one from the other. E.g. opening at 8:54 gives 8:00 the day before to
+        // 9:00 today: a plain "end minus 24h" would instead put the start at 9:00 the day
+        // before, an hour later than the floor of "24h ago" actually is.
         private fun defaultRange(): ClosedRange<Instant> {
-            val end = Instant.now()
-            val start = end.minus(24, ChronoUnit.HOURS)
-            return start..end
+            val zone = ZoneId.systemDefault()
+            val now = ZonedDateTime.now(zone)
+            val dayAgo = now.minusHours(24)
+            val start = dayAgo.truncatedTo(ChronoUnit.HOURS)
+            val flooredNow = now.truncatedTo(ChronoUnit.HOURS)
+            val end = if (flooredNow == now) flooredNow else flooredNow.plusHours(1)
+            return start.toInstant()..end.toInstant()
         }
 
         fun factory(
