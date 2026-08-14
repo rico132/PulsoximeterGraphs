@@ -141,14 +141,25 @@ class PulsoxRelay:
     async def send_csv(self):
         assert self.server is not None
         data_char = self.server.get_characteristic(DATA_CHARACTERISTIC_UUID)
-        for offset in range(0, len(self.csv_bytes), self.chunk_size):
+        total = len(self.csv_bytes)
+        sent = 0
+        for offset in range(0, total, self.chunk_size):
             chunk = self.csv_bytes[offset : offset + self.chunk_size]
             data_char.value = bytearray(chunk)
             self.server.update_value(SERVICE_UUID, DATA_CHARACTERISTIC_UUID)
+            sent += len(chunk)
+            # A transient \r-overwritten line rather than one log.info per chunk — at a 20-100
+            # byte chunk size a multi-KB file is thousands of chunks, and logging each on its
+            # own line would drown out the stage-change messages around it that actually matter
+            # (SET_TIME/REQUEST_DATA/CLEAR_BUFFER). Mirrors the app's own live byte counter (see
+            # GraphScreen.kt's SyncStatusRow) so both sides show matching progress side by side.
+            percent = sent * 100 // total if total else 100
+            print(f"\r  sending... {percent:3d}% ({sent}/{total} bytes)", end="", flush=True)
             # BlueZ's D-Bus notify path has no backpressure of its own — pacing chunks
             # avoids outrunning the link and dropping one, which the app would silently
             # read as gappy CSV.
             await asyncio.sleep(self.chunk_delay)
+        print()  # end the progress line before the next log.info
         data_char.value = bytearray(DATA_TERMINATOR)
         self.server.update_value(SERVICE_UUID, DATA_CHARACTERISTIC_UUID)
         log.info("Transfer complete, sent terminator. Waiting for the app's CLEAR_BUFFER...")

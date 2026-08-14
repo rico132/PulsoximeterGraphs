@@ -3,6 +3,11 @@ package com.oxipulse.pulsoximetergraphs.ui.graphs
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -14,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -25,10 +31,10 @@ import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.ZoomOut
 import androidx.compose.material3.Card
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Snackbar
@@ -48,6 +54,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
@@ -187,7 +196,7 @@ fun GraphScreen(
                     }
                     IconButton(onClick = { viewModel.startBleSync() }) {
                         if (isSyncing(syncState)) {
-                            CircularProgressIndicator(modifier = Modifier.height(24.dp))
+                            BleSyncSpinner()
                         } else {
                             Icon(Icons.Filled.Bluetooth, contentDescription = "Sync via BLE")
                         }
@@ -231,6 +240,7 @@ fun GraphScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            syncStatusText(syncState)?.let { SyncStatusRow(it) }
             RangeSummary(selectedRange)
             StatsPanel(stats)
             SpO2ChartCard(
@@ -261,6 +271,67 @@ private fun isSyncing(state: BleGattClient.SyncState): Boolean = when (state) {
     is BleGattClient.SyncState.Failed,
     -> false
     else -> true
+}
+
+/**
+ * Human-readable label for whichever step of PROTOCOL.md's sync sequence is currently in
+ * flight, or null once it's back to Idle/Success/Failed (those are surfaced via the snackbar
+ * instead — see the LaunchedEffect(syncState) above). [BleGattClient.SyncState.ReceivingData]
+ * carries a live byte count straight from the Data characteristic's notifications, so this
+ * updates continuously while the transfer is running rather than sitting on one static label —
+ * mirrors the per-chunk progress the sending side (tools/ble_csv_sender.py) prints.
+ */
+private fun syncStatusText(state: BleGattClient.SyncState): String? = when (state) {
+    BleGattClient.SyncState.Scanning -> "Scanning for PulsoxRelay…"
+    BleGattClient.SyncState.Connecting -> "Connecting…"
+    BleGattClient.SyncState.RequestingData -> "Requesting data…"
+    is BleGattClient.SyncState.ReceivingData -> "Receiving data… (${state.bytesReceived} bytes)"
+    BleGattClient.SyncState.Inserting -> "Saving to database…"
+    BleGattClient.SyncState.ClearingBuffer -> "Finishing up…"
+    BleGattClient.SyncState.Idle,
+    is BleGattClient.SyncState.Success,
+    is BleGattClient.SyncState.Failed,
+    -> null
+}
+
+@Composable
+private fun SyncStatusRow(status: String) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        BleSyncSpinner()
+        Text(status, style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
+/**
+ * A small rotating ring, sized to exactly match the 24dp icon it stands in for in the top app
+ * bar's Bluetooth button. Material's default [androidx.compose.material3.CircularProgressIndicator]
+ * ships at its own much larger default track/size and only had `height` constrained here (not
+ * `width`), so it rendered oversized and lopsided next to the other icon buttons instead of
+ * reading as "this icon is now busy."
+ */
+@Composable
+private fun BleSyncSpinner(modifier: Modifier = Modifier) {
+    val rotation by rememberInfiniteTransition(label = "ble-sync-spinner").animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(animation = tween(durationMillis = 900, easing = LinearEasing)),
+        label = "rotation",
+    )
+    val color = LocalContentColor.current
+    Canvas(modifier = modifier.size(24.dp)) {
+        rotate(rotation) {
+            drawArc(
+                color = color,
+                startAngle = 0f,
+                sweepAngle = 270f,
+                useCenter = false,
+                style = Stroke(width = 2.5.dp.toPx(), cap = StrokeCap.Round),
+            )
+        }
+    }
 }
 
 @Composable
