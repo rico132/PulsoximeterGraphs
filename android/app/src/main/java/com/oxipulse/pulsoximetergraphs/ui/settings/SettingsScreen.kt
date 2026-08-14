@@ -1,5 +1,8 @@
 package com.oxipulse.pulsoximetergraphs.ui.settings
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -32,9 +35,11 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
@@ -43,6 +48,9 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.di.AppContainer
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -51,7 +59,11 @@ fun SettingsScreen(
     onBack: () -> Unit,
 ) {
     val viewModel: SettingsViewModel = viewModel(
-        factory = SettingsViewModel.factory(appContainer.thresholdsRepository, appContainer.bleGattClient),
+        factory = SettingsViewModel.factory(
+            appContainer.thresholdsRepository,
+            appContainer.bleGattClient,
+            appContainer.readingsRepository,
+        ),
     )
     val config by viewModel.config.collectAsState()
     val testModeEnabled by viewModel.testModeEnabled.collectAsState()
@@ -106,13 +118,14 @@ fun SettingsScreen(
                     )
                     1 -> DeviceSection(viewModel, testModeEnabled)
                     2 -> DebugLogSection(debugLog, onClear = viewModel::clearDebugLog)
+                    3 -> ImportTab(viewModel)
                 }
             }
         }
     }
 }
 
-private val SETTINGS_TABS = listOf("Config", "OTA", "BLE Log")
+private val SETTINGS_TABS = listOf("Config", "OTA", "BLE Log", "Import")
 
 @Composable
 private fun ConfigTab(
@@ -287,5 +300,52 @@ private fun DebugLogSection(debugLog: String, onClear: () -> Unit) {
                 Text("Clear")
             }
         }
+    }
+}
+
+/**
+ * Direct CSV import (SAF file picker), independent of a BLE sync — moved here from the graphs
+ * screen's top app bar so device settings, OTA/WiFi, and both ways of getting readings into the
+ * app live under one Settings destination.
+ */
+@Composable
+private fun ImportTab(viewModel: SettingsViewModel) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    var statusMessage by remember { mutableStateOf<String?>(null) }
+
+    val openDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { uri: Uri? ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        statusMessage = null
+        // The activity-result callback runs on the main thread, and reading through a SAF
+        // content-provider stream is a blocking IPC round trip — for anything but a tiny file
+        // this would otherwise freeze the UI for a couple of seconds right after picking it.
+        coroutineScope.launch {
+            val text = withContext(Dispatchers.IO) {
+                context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            }
+            if (text != null) {
+                viewModel.importCsvText(text) { inserted, skipped ->
+                    statusMessage = "Imported $inserted rows ($skipped skipped)"
+                }
+            } else {
+                statusMessage = "Could not read that file"
+            }
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text("Import CSV", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Import a CSV file (DATE,TIME,SPO2,PULSE format) directly, without a BLE sync — " +
+                "e.g. a file exported earlier or shared from another device.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Button(onClick = { openDocumentLauncher.launch(arrayOf("text/csv", "*/*")) }) {
+            Text("Choose CSV file")
+        }
+        statusMessage?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
     }
 }

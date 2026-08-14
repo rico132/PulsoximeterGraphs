@@ -2,15 +2,19 @@ package com.oxipulse.pulsoximetergraphs.ui.settings
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
 import com.oxipulse.pulsoximetergraphs.data.ble.BleDebugLog
 import com.oxipulse.pulsoximetergraphs.data.ble.BleGattClient
+import com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdsRepository
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 
 class SettingsViewModel(
     private val thresholdsRepository: ThresholdsRepository,
     val bleGattClient: BleGattClient,
+    private val readingsRepository: ReadingsRepository,
 ) : ViewModel() {
 
     val config: StateFlow<ThresholdConfig> = thresholdsRepository.config
@@ -19,6 +23,14 @@ class SettingsViewModel(
     val debugLog: StateFlow<String> = BleDebugLog.entries
 
     fun clearDebugLog() = BleDebugLog.clear()
+
+    /** Moved here from GraphViewModel along with the Import tab's UI (see SettingsScreen). */
+    fun importCsvText(text: String, onResult: (inserted: Int, skipped: Int) -> Unit) {
+        viewModelScope.launch {
+            val result = readingsRepository.importCsv(text)
+            onResult(result.readings.size, result.skippedRowCount)
+        }
+    }
 
     /** Returns null on success, or a validation-error message. Never persists an invalid config. */
     fun save(newConfig: ThresholdConfig): String? = thresholdsRepository.update(newConfig)
@@ -44,10 +56,11 @@ class SettingsViewModel(
         fun factory(
             thresholdsRepository: ThresholdsRepository,
             bleGattClient: BleGattClient,
+            readingsRepository: ReadingsRepository,
         ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T =
-                SettingsViewModel(thresholdsRepository, bleGattClient) as T
+                SettingsViewModel(thresholdsRepository, bleGattClient, readingsRepository) as T
         }
     }
 }

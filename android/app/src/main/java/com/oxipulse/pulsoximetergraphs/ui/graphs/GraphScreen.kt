@@ -1,8 +1,5 @@
 package com.oxipulse.pulsoximetergraphs.ui.graphs
 
-import android.net.Uri
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -23,14 +20,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.DateRange
-import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.ZoomIn
-import androidx.compose.material.icons.filled.ZoomOut
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -51,7 +46,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,7 +56,6 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -107,9 +100,6 @@ import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.pow
 import kotlin.math.roundToInt
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -119,7 +109,6 @@ fun GraphScreen(
     isDarkTheme: Boolean,
     onToggleTheme: () -> Unit,
 ) {
-    val context = LocalContext.current
     val viewModel: GraphViewModel = viewModel(
         factory = GraphViewModel.factory(
             appContainer.readingsRepository,
@@ -137,28 +126,6 @@ fun GraphScreen(
 
     var showRangePicker by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
-    val coroutineScope = rememberCoroutineScope()
-
-    val openDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument(),
-    ) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        // The activity-result callback runs on the main thread, and reading through a SAF
-        // content-provider stream is a blocking IPC round trip — for anything but a tiny file
-        // this froze the UI for a couple of seconds right after picking it. Do the read on IO.
-        coroutineScope.launch {
-            val text = withContext(Dispatchers.IO) {
-                context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-            }
-            if (text != null) {
-                viewModel.importCsvText(text) { inserted, skipped ->
-                    coroutineScope.launch {
-                        snackbarHostState.showSnackbar("Imported $inserted rows ($skipped skipped)")
-                    }
-                }
-            }
-        }
-    }
 
     // Surface BLE sync completion/failure as a snackbar, then reset state so re-tapping the
     // sync button starts a fresh sync instead of showing a stale result.
@@ -190,8 +157,10 @@ fun GraphScreen(
     }
 
     // The dialog (below) is now the only place sync progress shows — the toolbar icon stays a
-    // plain, static Bluetooth glyph regardless of sync state, and the top nav's old zoom-out
-    // button has moved to the top of the charts card (see ChartsCard) alongside a new zoom-in.
+    // plain, static Bluetooth glyph regardless of sync state. CSV import has moved to Settings'
+    // Import tab, and the zoom in/out buttons that briefly lived atop the charts card are gone
+    // again in favor of a single Undo button here, undoing the last range change of any kind
+    // (zoom or manual date pick alike — see GraphViewModel.zoomOut's own doc).
     if (isSyncing(syncState)) {
         BleSyncDialog(syncState = syncState, onCancel = viewModel::cancelSync)
     }
@@ -201,11 +170,11 @@ fun GraphScreen(
             TopAppBar(
                 title = { Text("Pulsoximeter Graphs") },
                 actions = {
+                    IconButton(onClick = { viewModel.zoomOut() }, enabled = canZoomOut) {
+                        Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = "Undo zoom")
+                    }
                     IconButton(onClick = { showRangePicker = true }) {
                         Icon(Icons.Filled.DateRange, contentDescription = "Select date range")
-                    }
-                    IconButton(onClick = { openDocumentLauncher.launch(arrayOf("text/csv", "*/*")) }) {
-                        Icon(Icons.Filled.FileUpload, contentDescription = "Import CSV")
                     }
                     IconButton(onClick = { viewModel.startBleSync() }) {
                         Icon(Icons.Filled.Bluetooth, contentDescription = "Sync via BLE")
@@ -265,8 +234,6 @@ fun GraphScreen(
                 onRangeSelected = viewModel::setRange,
                 timeAxisItemPlacer = timeAxisItemPlacer,
                 canZoomOut = canZoomOut,
-                onZoomIn = viewModel::zoomIn,
-                onZoomOut = viewModel::zoomOut,
             )
         }
     }
@@ -781,11 +748,12 @@ private val CHART_LINE_STROKE = LineCartesianLayer.LineStroke.Continuous(thickne
  * thresholds for the two metrics visually overlap in places, e.g. a pulse-high-orange band and an
  * spo2-red band can land at the same on-screen height once each is mapped onto its own axis,
  * which reads as one metric's danger zone bleeding into the other's when both are drawn on a
- * shared plot). A top row carries the zoom in/out controls — moved here from the top app bar so
- * they sit next to what they actually act on. `zoomState`/`scrollState` are shared between both
- * charts purely because pinch/drag zoom is disabled on both (see the comment on `sharedZoomState`
- * in [GraphScreen]) — there's no live pan/zoom to keep in sync, just a single state instance
- * CartesianChartHost requires per chart.
+ * shared plot). [canZoomOut] isn't used for any button here (that's the top app bar's Undo button
+ * now) — it's only forwarded to both charts as `zoomedIn`, since it also gates whether the Y axis
+ * widens to always show threshold bands (see the comment on that in Spo2ChartContent).
+ * `zoomState`/`scrollState` are shared between both charts purely because pinch/drag zoom is
+ * disabled on both (see the comment on `sharedZoomState` in [GraphScreen]) — there's no live
+ * pan/zoom to keep in sync, just a single state instance CartesianChartHost requires per chart.
  */
 @Composable
 private fun ChartsCard(
@@ -797,19 +765,9 @@ private fun ChartsCard(
     onRangeSelected: (ClosedRange<Instant>) -> Unit,
     timeAxisItemPlacer: HorizontalAxis.ItemPlacer,
     canZoomOut: Boolean,
-    onZoomIn: () -> Unit,
-    onZoomOut: () -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                IconButton(onClick = onZoomIn) {
-                    Icon(Icons.Filled.ZoomIn, contentDescription = "Zoom in")
-                }
-                IconButton(onClick = onZoomOut, enabled = canZoomOut) {
-                    Icon(Icons.Filled.ZoomOut, contentDescription = "Zoom out")
-                }
-            }
             Spo2ChartContent(
                 readings = readings,
                 thresholdConfig = thresholdConfig,
