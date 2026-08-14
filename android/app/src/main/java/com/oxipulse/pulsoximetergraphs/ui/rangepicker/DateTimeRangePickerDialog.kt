@@ -55,8 +55,9 @@ fun DateTimeRangePickerDialog(
     val initialStart = initialRange.start.atZone(zone)
     val initialEnd = initialRange.endInclusive.atZone(zone)
 
+    val originalStartDateMillis = remember { initialStart.toLocalDate().toEpochMilliUtc() }
     val dateRangeState = rememberDateRangePickerState(
-        initialSelectedStartDateMillis = initialStart.toLocalDate().toEpochMilliUtc(),
+        initialSelectedStartDateMillis = originalStartDateMillis,
         initialSelectedEndDateMillis = initialEnd.toLocalDate().toEpochMilliUtc(),
     )
     val startTimeState = rememberTimePickerState(
@@ -71,6 +72,35 @@ fun DateTimeRangePickerDialog(
     )
 
     var step by remember { mutableIntStateOf(0) }
+
+    /**
+     * Called when advancing off the date-range step (0) or the start-time step (1) — NOT plain
+     * per-recomposition logic, since [TimePickerState]'s `hour`/`minute` are mutable and meant to
+     * be written imperatively like this (the same way [TimePicker] itself writes to them), rather
+     * than re-derived reactively on every recomposition (which would fight the user's own edits).
+     */
+    fun advanceFromStep(completedStep: Int) {
+        when (completedStep) {
+            0 -> {
+                // A freshly picked start day carries no meaningful time-of-day yet — reset to
+                // midnight rather than carrying over whatever the *previous* day's time was.
+                // Left alone if the start day wasn't actually changed (e.g. only the end date
+                // was, or the user just paged through months and landed back on it).
+                if (dateRangeState.selectedStartDateMillis != originalStartDateMillis) {
+                    startTimeState.hour = 0
+                    startTimeState.minute = 0
+                }
+            }
+            1 -> {
+                // Defaults the end time to whatever start time was just picked — usually much
+                // closer to the intended end time than whatever stale value was there before,
+                // since a session's end is far more often "later the same time-of-day" than not.
+                endTimeState.hour = startTimeState.hour
+                endTimeState.minute = startTimeState.minute
+            }
+        }
+        step = completedStep + 1
+    }
 
     fun confirmAndClose() {
         val startMillis = dateRangeState.selectedStartDateMillis ?: initialStart.toLocalDate().toEpochMilliUtc()
@@ -132,7 +162,7 @@ fun DateTimeRangePickerDialog(
                 }
                 Button(
                     onClick = {
-                        if (step < 2) step += 1 else confirmAndClose()
+                        if (step < 2) advanceFromStep(step) else confirmAndClose()
                     },
                 ) {
                     Text(if (step < 2) "Next" else "Apply")
