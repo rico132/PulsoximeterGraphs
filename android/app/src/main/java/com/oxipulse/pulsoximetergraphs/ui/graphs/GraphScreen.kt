@@ -232,6 +232,11 @@ fun GraphScreen(
         // Dragging a selection (below) replaces this with a narrower selectedRange rather than
         // trying to re-decimate this same list on the fly.
         val plottedReadings = remember(readings) { decimateKeepingExtremes(readings) }
+        // Shared between both charts' bottom axes so they pick the exact same tick indices —
+        // see the parameter doc on rememberSharedTimeAxisItemPlacer for why leaving each chart
+        // to compute its own (Vico's default) caused SpO2 and Pulse to show different times for
+        // what's supposed to be the same x-position.
+        val timeAxisItemPlacer = rememberSharedTimeAxisItemPlacer(plottedReadings.size)
 
         Column(
             modifier = Modifier
@@ -251,6 +256,7 @@ fun GraphScreen(
                 zoomState = sharedZoomState,
                 scrollState = sharedScrollState,
                 onRangeSelected = viewModel::setRange,
+                timeAxisItemPlacer = timeAxisItemPlacer,
             )
             PulseChartCard(
                 readings = plottedReadings,
@@ -260,6 +266,7 @@ fun GraphScreen(
                 zoomState = sharedZoomState,
                 scrollState = sharedScrollState,
                 onRangeSelected = viewModel::setRange,
+                timeAxisItemPlacer = timeAxisItemPlacer,
             )
         }
     }
@@ -403,6 +410,33 @@ private fun rememberTimeAxisFormatter(readings: List<ReadingEntity>): CartesianV
             val instant = Instant.ofEpochSecond(reading.timestampEpochSec)
             DateTimeFormatter.ofPattern("HH:mm").format(instant.atZone(ZoneId.systemDefault()))
         }
+    }
+
+private const val TARGET_TIME_AXIS_LABEL_COUNT = 6
+
+/**
+ * A [HorizontalAxis.ItemPlacer] shared by both chart cards' bottom axes, so they land on the
+ * exact same label indices instead of each computing its own.
+ *
+ * Vico's default `HorizontalAxis.ItemPlacer.aligned()` auto-widens its tick spacing to avoid
+ * overlapping labels, based on each chart's *own* available plot width — which is the chart's
+ * total width minus whatever its vertical axis's label gutter reserves. SpO2 and Pulse render
+ * different-width gutters (their values have different typical digit counts, e.g. "45" vs
+ * "100"), so each chart ends up with a slightly different plot width and picks a different tick
+ * spacing — visibly, the SpO2 chart labeling a point "5:46" right where the Pulse chart labels
+ * the same x-position "5:45", even though both plot the exact same [ReadingEntity] list by the
+ * exact same index. Since both charts already share one x-domain (identical indices, xStep
+ * always 1 — see rememberTimeAxisFormatter above), tick placement here is instead computed from
+ * point count alone via an explicit `spacing`, with `addExtremeLabelPadding` off — that flag is
+ * what reintroduces a pixel-width-dependent multiplier even with an explicit spacing (see
+ * AlignedHorizontalAxisItemPlacer.getLabelValues), so turning it off is what actually makes this
+ * deterministic across the two charts rather than just "usually the same."
+ */
+@Composable
+private fun rememberSharedTimeAxisItemPlacer(pointCount: Int): HorizontalAxis.ItemPlacer =
+    remember(pointCount) {
+        val spacing = (pointCount / TARGET_TIME_AXIS_LABEL_COUNT).coerceAtLeast(1)
+        HorizontalAxis.ItemPlacer.aligned(spacing = { spacing }, addExtremeLabelPadding = false)
     }
 
 /**
@@ -591,6 +625,7 @@ private fun SpO2ChartCard(
     zoomState: VicoZoomState,
     scrollState: VicoScrollState,
     onRangeSelected: (ClosedRange<Instant>) -> Unit,
+    timeAxisItemPlacer: HorizontalAxis.ItemPlacer,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
     LaunchedEffect(readings) {
@@ -610,8 +645,12 @@ private fun SpO2ChartCard(
 
     val spo2Color = MaterialTheme.extendedColors.chartSpo2
     val timeAxisFormatter = rememberTimeAxisFormatter(readings)
-    // SpO2 is a percentage, so 100 is a hard ceiling regardless of the padding-to-5 rule below.
-    val minY = minSpo2?.let { floorToMultipleOf5(it) }
+    // Widened to also cover spo2Red if the actual readings never dip that low: without this, a
+    // user whose SpO2 stays comfortably in the high 90s would never see the red/orange bands at
+    // all, since clamping them to a visible window that sits entirely above the bands collapses
+    // both to zero height (see ThresholdBands.kt's clampToVisible) — same fix as Pulse below.
+    // SpO2 is a percentage, so 100 is a hard ceiling regardless of the padding-to-5 rule.
+    val minY = minSpo2?.let { floorToMultipleOf5(minOf(it, thresholdConfig.spo2Red)) }
     val maxY = maxSpo2?.let { ceilToMultipleOf5(it).coerceAtMost(100) }
     // Same rounded bounds passed to the range provider, so the bands clamp to exactly what's
     // on screen — see ThresholdBands.kt for why that clamp is necessary.
@@ -644,7 +683,10 @@ private fun SpO2ChartCard(
                                     style = TextStyle(color = spo2Color, fontSize = labelFontSize),
                                 ),
                             ),
-                            bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = timeAxisFormatter),
+                            bottomAxis = HorizontalAxis.rememberBottom(
+                                valueFormatter = timeAxisFormatter,
+                                itemPlacer = timeAxisItemPlacer,
+                            ),
                             decorations = bands,
                         ),
                         modelProducer = modelProducer,
@@ -667,6 +709,7 @@ private fun PulseChartCard(
     zoomState: VicoZoomState,
     scrollState: VicoScrollState,
     onRangeSelected: (ClosedRange<Instant>) -> Unit,
+    timeAxisItemPlacer: HorizontalAxis.ItemPlacer,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
     LaunchedEffect(readings) {
@@ -684,8 +727,14 @@ private fun PulseChartCard(
 
     val pulseColor = MaterialTheme.extendedColors.chartPulse
     val timeAxisFormatter = rememberTimeAxisFormatter(readings)
-    val minY = minPulse?.let { floorToMultipleOf5(it) }
-    val maxY = maxPulse?.let { ceilToMultipleOf5(it) }
+    // Widened to also cover the configured low/high-red thresholds if the actual readings never
+    // reach them: otherwise a visible window computed purely from the data (e.g. resting-range
+    // readings that never dip toward pulseLowRed) sits entirely above/below a threshold band,
+    // which collapses that band to zero height once clamped to the visible window (see
+    // ThresholdBands.kt's clampToVisible) — i.e. the low bands silently never render just
+    // because this user's pulse happens to stay comfortably inside the normal range.
+    val minY = minPulse?.let { floorToMultipleOf5(minOf(it, thresholdConfig.pulseLowRed)) }
+    val maxY = maxPulse?.let { ceilToMultipleOf5(maxOf(it, thresholdConfig.pulseHighRed)) }
     val bands = rememberPulseThresholdBands(thresholdConfig, visibleMinY = minY?.toDouble(), visibleMaxY = maxY?.toDouble())
     val rangeProvider = remember(minY, maxY) { fixedYRange(minY, maxY) }
     val pulseLine = LineCartesianLayer.rememberLine(
@@ -715,7 +764,10 @@ private fun PulseChartCard(
                                     style = TextStyle(color = pulseColor, fontSize = labelFontSize),
                                 ),
                             ),
-                            bottomAxis = HorizontalAxis.rememberBottom(valueFormatter = timeAxisFormatter),
+                            bottomAxis = HorizontalAxis.rememberBottom(
+                                valueFormatter = timeAxisFormatter,
+                                itemPlacer = timeAxisItemPlacer,
+                            ),
                             decorations = bands,
                         ),
                         modelProducer = modelProducer,
