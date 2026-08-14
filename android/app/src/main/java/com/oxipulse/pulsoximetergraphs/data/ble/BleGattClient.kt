@@ -89,6 +89,8 @@ class BleGattClient(
     private var receiveStartMs = 0L
     private var chunkArrivalLogCount = 0
     private var lastChunkArrivalMs = 0L
+    private var snapshotBytes = 0
+    private var lastSnapshotMs = 0L
     private var timeoutJob: Job? = null
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
@@ -301,6 +303,7 @@ class BleGattClient(
             onTransferComplete()
             return
         }
+        val now = SystemClock.elapsedRealtime()
         // There's no public Android API to read the actual negotiated connection interval (see
         // onPhyUpdate's comment for the PHY equivalent) — requestConnectionPriority() is only a
         // request, and whether the peer actually granted a short interval is otherwise invisible.
@@ -311,13 +314,30 @@ class BleGattClient(
         // pattern and this must stay off for the rest of a large transfer to avoid reintroducing
         // the same per-chunk main-thread cost the progress throttle above exists to avoid.
         if (chunkArrivalLogCount < CHUNK_ARRIVAL_LOG_LIMIT) {
-            val nowMs = SystemClock.elapsedRealtime()
-            val gap = if (chunkArrivalLogCount == 0) 0L else nowMs - lastChunkArrivalMs
-            lastChunkArrivalMs = nowMs
+            val gap = if (chunkArrivalLogCount == 0) 0L else now - lastChunkArrivalMs
+            lastChunkArrivalMs = now
             chunkArrivalLogCount++
             log("Chunk #$chunkArrivalLogCount: ${value.size} bytes, +${gap}ms since previous chunk")
         }
         receiveBuffer.write(value)
+        // Two known-slow and known-fast runs of the *same* file showed wildly different overall
+        // throughput (7.9 KB/s vs 32.4 KB/s) despite identical negotiated MTU/PHY -- but the
+        // per-chunk log above only samples the first 20 chunks, so it can't tell a transfer that's
+        // slow from the start apart from one that starts fine and degrades partway through (a
+        // known real-world pattern: BLE/Wi-Fi radio coexistence throttling can kick in once
+        // there's been enough airtime, not just at connection time). A periodic snapshot across
+        // the *whole* transfer answers that with only a couple dozen extra log lines even on a
+        // 90-second transfer, instead of re-logging every chunk for its full duration.
+        if (now - lastSnapshotMs >= SNAPSHOT_INTERVAL_MS) {
+            val bytesSinceSnapshot = receiveBuffer.size() - snapshotBytes
+            val elapsed = (now - lastSnapshotMs).coerceAtLeast(1)
+            log(
+                "Snapshot: ${receiveBuffer.size()} bytes total, " +
+                    "${"%.1f".format(bytesSinceSnapshot / elapsed.toDouble())} KB/s in the last ${elapsed}ms",
+            )
+            snapshotBytes = receiveBuffer.size()
+            lastSnapshotMs = now
+        }
         // GATT callbacks are delivered on the main thread (no Handler/Executor was passed to
         // connectGatt), which is also where Compose recomposes. ReceivingData is a data class
         // keyed on the byte count, so emitting it on every single notification forced a full
@@ -327,7 +347,6 @@ class BleGattClient(
         // around. Throttle to ~10 updates/sec, same as the sender script already throttles its
         // own progress print (see ble_csv_sender.py's send_csv) — the buffer itself still
         // captures every byte immediately, only the UI-visible progress is coalesced.
-        val now = SystemClock.elapsedRealtime()
         if (now - lastProgressEmitMs >= PROGRESS_EMIT_INTERVAL_MS) {
             lastProgressEmitMs = now
             _syncState.value = SyncState.ReceivingData(receiveBuffer.size())
@@ -407,6 +426,8 @@ class BleGattClient(
         _syncState.value = SyncState.RequestingData
         lastControlWrite = ControlWrite.REQUEST_DATA
         receiveStartMs = SystemClock.elapsedRealtime()
+        snapshotBytes = 0
+        lastSnapshotMs = receiveStartMs
         writeControl(gatt, byteArrayOf(BleConstants.OPCODE_REQUEST_DATA))
     }
 
@@ -509,5 +530,6 @@ class BleGattClient(
         private const val SYNC_TIMEOUT_MS = 30_000L
         private const val PROGRESS_EMIT_INTERVAL_MS = 100L
         private const val CHUNK_ARRIVAL_LOG_LIMIT = 20
+        private const val SNAPSHOT_INTERVAL_MS = 2_000L
     }
 }
