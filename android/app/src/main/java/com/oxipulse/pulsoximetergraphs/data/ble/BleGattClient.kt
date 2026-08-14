@@ -158,6 +158,13 @@ class BleGattClient(
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                // Without this, Android negotiates its default "balanced" connection interval
+                // (tens of ms per connection event), which caps real throughput far below what
+                // the negotiated MTU/chunk size would allow — raising MTU alone doesn't touch
+                // this ceiling. Requesting HIGH here (shortest interval Android permits) is what
+                // actually speeds up the transfer; it must happen as early as possible since the
+                // renegotiation itself takes a moment to take effect.
+                gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 if (_syncState.value !is SyncState.Success && _syncState.value !is SyncState.Failed) {
