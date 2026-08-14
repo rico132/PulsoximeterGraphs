@@ -819,6 +819,7 @@ private fun ChartsCard(
                 scrollState = scrollState,
                 onRangeSelected = onRangeSelected,
                 timeAxisItemPlacer = timeAxisItemPlacer,
+                zoomedIn = canZoomOut,
             )
             PulseChartContent(
                 readings = readings,
@@ -829,6 +830,7 @@ private fun ChartsCard(
                 scrollState = scrollState,
                 onRangeSelected = onRangeSelected,
                 timeAxisItemPlacer = timeAxisItemPlacer,
+                zoomedIn = canZoomOut,
             )
         }
     }
@@ -844,6 +846,7 @@ private fun Spo2ChartContent(
     scrollState: VicoScrollState,
     onRangeSelected: (ClosedRange<Instant>) -> Unit,
     timeAxisItemPlacer: HorizontalAxis.ItemPlacer,
+    zoomedIn: Boolean,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
     LaunchedEffect(readings) {
@@ -867,8 +870,15 @@ private fun Spo2ChartContent(
     // user whose SpO2 stays comfortably in the high 90s would never see the red/orange bands at
     // all, since clamping them to a visible window that sits entirely above the bands collapses
     // both to zero height (see ThresholdBands.kt's clampToVisible) — same fix as Pulse below.
+    // Only applied at the default (not zoomed-in) view, though: once the user has deliberately
+    // narrowed the range (zoomIn/drag-to-zoom/date picker — anything that makes zoomOut
+    // available), the whole point is to see that window's own data at a tighter scale, and
+    // pinning the axis to a constant threshold-derived bound regardless of zoom is exactly what
+    // made the Y axis look like it never responds to zooming in.
     // SpO2 is a percentage, so 100 is a hard ceiling regardless of the padding-to-5 rule.
-    val minY = minSpo2?.let { floorToMultipleOf5(minOf(it, thresholdConfig.spo2Red)) }
+    val minY = minSpo2?.let {
+        floorToMultipleOf5(if (zoomedIn) it else minOf(it, thresholdConfig.spo2Red))
+    }
     val maxY = maxSpo2?.let { ceilToMultipleOf5(it).coerceAtMost(100) }
     // Same rounded bounds passed to the range provider, so the bands clamp to exactly what's
     // on screen — see ThresholdBands.kt for why that clamp is necessary.
@@ -928,6 +938,7 @@ private fun PulseChartContent(
     scrollState: VicoScrollState,
     onRangeSelected: (ClosedRange<Instant>) -> Unit,
     timeAxisItemPlacer: HorizontalAxis.ItemPlacer,
+    zoomedIn: Boolean,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
     LaunchedEffect(readings) {
@@ -950,9 +961,14 @@ private fun PulseChartContent(
     // readings that never dip toward pulseLowRed) sits entirely above/below a threshold band,
     // which collapses that band to zero height once clamped to the visible window (see
     // ThresholdBands.kt's clampToVisible) — i.e. the low bands silently never render just
-    // because this user's pulse happens to stay comfortably inside the normal range.
-    val minY = minPulse?.let { floorToMultipleOf5(minOf(it, thresholdConfig.pulseLowRed)) }
-    val maxY = maxPulse?.let { ceilToMultipleOf5(maxOf(it, thresholdConfig.pulseHighRed)) }
+    // because this user's pulse happens to stay comfortably inside the normal range. Only applied
+    // at the default (not zoomed-in) view — see the matching comment in Spo2ChartContent for why.
+    val minY = minPulse?.let {
+        floorToMultipleOf5(if (zoomedIn) it else minOf(it, thresholdConfig.pulseLowRed))
+    }
+    val maxY = maxPulse?.let {
+        ceilToMultipleOf5(if (zoomedIn) it else maxOf(it, thresholdConfig.pulseHighRed))
+    }
     val bands = rememberPulseThresholdBands(thresholdConfig, visibleMinY = minY?.toDouble(), visibleMaxY = maxY?.toDouble())
     val rangeProvider = remember(minY, maxY) { fixedYRange(minY, maxY) }
     val yAxisItemPlacer = rememberYAxisItemPlacer(minY, maxY)
