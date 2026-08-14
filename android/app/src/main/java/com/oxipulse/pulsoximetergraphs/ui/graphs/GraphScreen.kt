@@ -284,7 +284,21 @@ private fun StatsRow(label: String, min: Int?, max: Int?, avg: Double?, unit: St
 private fun rememberTimeAxisFormatter(readings: List<ReadingEntity>): CartesianValueFormatter =
     remember(readings) {
         CartesianValueFormatter { _, value, _ ->
-            val reading = readings.getOrNull(value.toInt()) ?: return@CartesianValueFormatter ""
+            // Vico's contract forbids ever returning a blank string here — it throws if we do
+            // (see the crash this guards against). That's harder to guarantee than it looks:
+            // CartesianChartModelProducer.runTransaction (below) commits a new, possibly
+            // shorter series *asynchronously*, while this formatter is rebuilt *synchronously*
+            // on the very same recomposition that changed `readings`. So right after picking a
+            // new range, the axis can still be laid out against the previous (longer) committed
+            // model for a frame or two while this formatter already reflects the new (shorter)
+            // list — i.e. the index the axis asks for can legitimately be out of bounds for a
+            // moment, through no misuse of the API. Clamping instead of bailing out means that
+            // transient mismatch just reuses the nearest edge reading's label for a frame
+            // instead of crashing the app; a plain "" fallback for the truly-empty case would
+            // itself be blank (and .isBlank() also rejects whitespace-only strings), so that
+            // case gets a real placeholder instead.
+            if (readings.isEmpty()) return@CartesianValueFormatter "–"
+            val reading = readings[value.toInt().coerceIn(readings.indices)]
             val instant = Instant.ofEpochSecond(reading.timestampEpochSec)
             DateTimeFormatter.ofPattern("HH:mm").format(instant.atZone(ZoneId.systemDefault()))
         }
