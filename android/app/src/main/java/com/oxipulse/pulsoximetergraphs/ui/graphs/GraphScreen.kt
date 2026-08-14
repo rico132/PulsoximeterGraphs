@@ -32,6 +32,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
@@ -173,11 +174,24 @@ fun GraphScreen(
     ) { padding ->
         // Shared between both charts so panning/zooming one moves the other in lockstep —
         // Vico syncs charts by having them read the same VicoScrollState/VicoZoomState
-        // instance. Created once here (not read from at this level, just passed down by
-        // reference), so this doesn't cause GraphScreen itself to recompose on every pan/zoom
-        // frame — only the CartesianChartHosts that actually read the state do.
-        val sharedZoomState = rememberVicoZoomState(initialZoom = Zoom.Content, minZoom = Zoom.Content)
-        val sharedScrollState = rememberVicoScrollState()
+        // instance. Created once per selected range (not read from at this level, just passed
+        // down by reference), so this doesn't cause GraphScreen itself to recompose on every
+        // pan/zoom frame — only the CartesianChartHosts that actually read the state do.
+        //
+        // Re-created (via `key(selectedRange)`) whenever the picked range changes, rather than
+        // remembered forever: readings are plotted by index (see rememberTimeAxisFormatter), so
+        // a scroll/zoom position computed against one range's index space is meaningless once
+        // the range changes — e.g. narrowing to a shorter span shrinks the reading count, and a
+        // stale scroll offset from the larger range then points past the end of the new,
+        // shorter list. The axis label formatter returns "" for an out-of-range index, and Vico
+        // treats a blank axis label as a fatal error, crashing the app. Keying on selectedRange
+        // (rather than on the readings/plottedReadings list itself) avoids resetting the user's
+        // pan/zoom on every incidental data refresh — e.g. new rows streaming in during a BLE
+        // sync — while still resetting it whenever the index space actually changes shape.
+        val (sharedZoomState, sharedScrollState) = key(selectedRange) {
+            rememberVicoZoomState(initialZoom = Zoom.Content, minZoom = Zoom.Content) to
+                rememberVicoScrollState()
+        }
         // Capped and decimated once so both charts plot the exact same x-indices (required for
         // the shared scroll/zoom state above to actually line them up) — see decimateKeepingExtremes.
         val plottedReadings = remember(readings) { decimateKeepingExtremes(readings) }
