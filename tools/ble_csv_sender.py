@@ -21,10 +21,15 @@ Setup (once):
 Usage:
     source .venv/bin/activate
     python3 tools/ble_csv_sender.py path/to/export.csv
+    python3 tools/ble_csv_sender.py path/to/first.csv path/to/second.csv path/to/third.csv
 
 Then open the app and tap the Bluetooth sync icon in the top bar. It scans, connects,
-pulls the file, and this script exits on its own once the app confirms the import
+pulls the file(s), and this script exits on its own once the app confirms the import
 (CLEAR_BUFFER) — Ctrl+C also stops it cleanly at any point.
+
+Multiple files are sent as one transfer using the multi-file extension documented in
+PROTOCOL.md (a small header naming each file's length, invisible to the ESP32, which never
+sends it) — the app imports each file separately and reports one combined row count.
 
 Speed:
 - The defaults (--chunk-size 180, --chunk-delay 0.01) are a conservative middle ground.
@@ -93,6 +98,10 @@ OPCODE_ENTER_OTA_MODE = 0x06
 
 DATA_TERMINATOR = bytes([0x00])
 
+# Multi-file extension (this script + the app only — see PROTOCOL.md). Never sent by the ESP32,
+# which always transfers exactly one implicit file the legacy way.
+MULTI_FILE_MAGIC = 0x02
+
 
 def load_csv_bytes(csv_path: Path) -> bytes:
     """Reads the CSV and normalizes line endings to CRLF per PROTOCOL.md. The protocol
@@ -108,14 +117,28 @@ def load_csv_bytes(csv_path: Path) -> bytes:
     return ("\r\n".join(lines) + "\r\n").encode("ascii")
 
 
+def build_payload(csv_paths: list[Path]) -> bytes:
+    """Loads every file and frames them per PROTOCOL.md's multi-file extension: a
+    `[magic][fileCount][fileLength:u32 LE]*fileCount` header followed by the files'
+    concatenated bytes. Used even for a single file, so the app's progress display (which
+    needs the total byte count up front to show a percentage) always has it available —
+    the header is a few bytes, negligible next to any real CSV."""
+    files = [load_csv_bytes(p) for p in csv_paths]
+    header = bytes([MULTI_FILE_MAGIC, len(files)]) + b"".join(
+        struct.pack("<I", len(f)) for f in files
+    )
+    return header + b"".join(files)
+
+
 class PulsoxRelay:
     """Emulates just enough of the ESP32's GATT server (PROTOCOL.md) to satisfy the
     app's BleGattClient sync sequence for one file."""
 
-    def __init__(self, csv_bytes: bytes, chunk_size: int, chunk_delay: float):
+    def __init__(self, csv_bytes: bytes, chunk_size: int, chunk_delay: float, file_count: int):
         self.csv_bytes = csv_bytes
         self.chunk_size = chunk_size
         self.chunk_delay = chunk_delay
+        self.file_count = file_count
         self.server: Optional[BlessServer] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.done: Optional[asyncio.Event] = None
@@ -136,7 +159,11 @@ class PulsoxRelay:
             return
         opcode = value[0]
         if opcode == OPCODE_REQUEST_DATA:
-            log.info("REQUEST_DATA received — sending %d bytes of CSV", len(self.csv_bytes))
+            log.info(
+                "REQUEST_DATA received — sending %d bytes across %d file(s)",
+                len(self.csv_bytes),
+                self.file_count,
+            )
             assert self.loop is not None
             self.loop.create_task(self.send_csv())
         elif opcode == OPCODE_SET_TIME:
@@ -280,7 +307,14 @@ def main():
         description="Push a CSV file into the Pulsoximeter Graphs app over BLE by "
         "impersonating the PulsoxRelay ESP32 peripheral."
     )
-    parser.add_argument("csv_path", type=Path, help="CSV file to send (DATE,TIME,SPO2,PULSE format)")
+    parser.add_argument(
+        "csv_paths",
+        type=Path,
+        nargs="+",
+        metavar="csv_path",
+        help="CSV file(s) to send (DATE,TIME,SPO2,PULSE format). Multiple files are sent as "
+        "one transfer; the app imports each separately and reports one combined row count.",
+    )
     parser.add_argument(
         "--chunk-size",
         type=int,
@@ -303,11 +337,21 @@ def main():
     )
     args = parser.parse_args()
 
-    if not args.csv_path.is_file():
-        parser.error(f"{args.csv_path} not found")
+    for path in args.csv_paths:
+        if not path.is_file():
+            parser.error(f"{path} not found")
+    # fileCount is a single byte in the multi-file header (see PROTOCOL.md) — this is far above
+    # any real use of this tool, just a defensive bound so a typo'd glob doesn't silently truncate.
+    if len(args.csv_paths) > 255:
+        parser.error(f"too many files ({len(args.csv_paths)}) — the multi-file header caps this at 255")
 
-    csv_bytes = load_csv_bytes(args.csv_path)
-    relay = PulsoxRelay(csv_bytes, chunk_size=args.chunk_size, chunk_delay=args.chunk_delay)
+    csv_bytes = build_payload(args.csv_paths)
+    relay = PulsoxRelay(
+        csv_bytes,
+        chunk_size=args.chunk_size,
+        chunk_delay=args.chunk_delay,
+        file_count=len(args.csv_paths),
+    )
     try:
         succeeded = asyncio.run(relay.run(args.adapter))
     except KeyboardInterrupt:

@@ -57,6 +57,24 @@ ESP32 = peripheral/server. Phone = central/client. Advertised device name: `Puls
 - End-of-transfer marker: one final notification containing **exactly one `0x00` byte**
   (CSV text can never contain a `0x00` byte, so this is unambiguous).
 
+### Multi-file extension (testing tool only — not part of the ESP32 contract)
+
+`tools/ble_csv_sender.py` can send several CSV files in one transfer (for testing bulk imports).
+This is layered on top of the Data characteristic's byte stream, invisible to the ESP32 firmware,
+which never needs to change: if the very first byte of the reassembled blob equals `0x02`
+(`BleConstants.MULTI_FILE_MAGIC`), what follows is a small header —
+
+```
+[0]:      0x02                     magic
+[1]:      fileCount (u8)
+[2..):    fileCount × u32 LE        each file's byte length, in order
+```
+
+— followed by the concatenated raw bytes of each file, then the same single `0x00` terminator as
+always. Any real single-file transfer (from the ESP32, or the script run in its default legacy
+path) always starts with a printable CSV header byte, never `0x02`, so this is fully backward
+compatible and the common case needs no header at all.
+
 ### Recommended sync sequence (phone side)
 
 1. Connect, discover services, request MTU 503.

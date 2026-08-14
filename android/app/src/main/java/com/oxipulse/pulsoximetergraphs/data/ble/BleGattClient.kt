@@ -61,11 +61,32 @@ class BleGattClient(
         data object Scanning : SyncState
         data object Connecting : SyncState
         data object RequestingData : SyncState
-        data class ReceivingData(val bytesReceived: Int) : SyncState
+
+        /**
+         * [totalBytes]/[fileIndex]/[fileCount] are only known once a multi-file header has been
+         * parsed (see [MultiFileMeta]) — null for a legacy single-file transfer (real ESP32, or
+         * the sender script's single-file path), where the total size is never declared upfront.
+         */
+        data class ReceivingData(
+            val bytesReceived: Int,
+            val totalBytes: Int? = null,
+            val fileIndex: Int? = null,
+            val fileCount: Int? = null,
+        ) : SyncState
+
         data object Inserting : SyncState
         data object ClearingBuffer : SyncState
         data class Success(val rowsInserted: Int, val rowsSkipped: Int) : SyncState
         data class Failed(val message: String) : SyncState
+    }
+
+    /**
+     * Parsed multi-file header (see [BleConstants.MULTI_FILE_MAGIC] / PROTOCOL.md) — the byte
+     * length of each file in the transfer, in order, plus how many header bytes precede the
+     * actual file bytes in [receiveBuffer].
+     */
+    private data class MultiFileMeta(val fileLengths: List<Int>, val headerLength: Int) {
+        val totalBytes: Int = fileLengths.sum()
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -93,6 +114,19 @@ class BleGattClient(
     private var lastSnapshotMs = 0L
     private var timeoutJob: Job? = null
 
+    // Multi-file transfer tracking (see MultiFileMeta / BleConstants.MULTI_FILE_MAGIC). Both null
+    // means "not yet determined" -- resolved to one or the other as soon as the first byte (or,
+    // for the header case, the first few bytes) of a transfer arrives.
+    private var multiFileMeta: MultiFileMeta? = null
+    private var legacyMode = false
+
+    /**
+     * Set by [cancelSync]. Checked before committing anything to the database so a cancelled
+     * sync never saves partial data -- and in [onConnectionStateChange] so the disconnect that
+     * cancelling itself triggers doesn't get misreported as a connection failure.
+     */
+    private var cancelled = false
+
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
         (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
     }
@@ -114,6 +148,9 @@ class BleGattClient(
         lastProgressEmitMs = 0L
         chunkArrivalLogCount = 0
         lastChunkArrivalMs = 0L
+        multiFileMeta = null
+        legacyMode = false
+        cancelled = false
         _syncState.value = SyncState.Scanning
         armTimeout()
 
@@ -203,7 +240,12 @@ class BleGattClient(
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 log("Disconnected (status $status)")
-                if (_syncState.value !is SyncState.Success && _syncState.value !is SyncState.Failed) {
+                // Cancelling calls disconnect() itself, so the resulting STATE_DISCONNECTED here
+                // must not get reinterpreted as an unexpected failure on top of the cancel.
+                if (!cancelled &&
+                    _syncState.value !is SyncState.Success &&
+                    _syncState.value !is SyncState.Failed
+                ) {
                     fail("Device disconnected before sync completed")
                 }
                 closeGatt()
@@ -329,6 +371,7 @@ class BleGattClient(
             log("Chunk #$chunkArrivalLogCount: ${value.size} bytes, +${gap}ms since previous chunk")
         }
         receiveBuffer.write(value)
+        if (multiFileMeta == null && !legacyMode) tryParseMultiFileHeader()
         // Two known-slow and known-fast runs of the *same* file showed wildly different overall
         // throughput (7.9 KB/s vs 32.4 KB/s) despite identical negotiated MTU/PHY -- but the
         // per-chunk log above only samples the first 20 chunks, so it can't tell a transfer that's
@@ -358,21 +401,85 @@ class BleGattClient(
         // captures every byte immediately, only the UI-visible progress is coalesced.
         if (now - lastProgressEmitMs >= PROGRESS_EMIT_INTERVAL_MS) {
             lastProgressEmitMs = now
-            _syncState.value = SyncState.ReceivingData(receiveBuffer.size())
+            _syncState.value = receivingDataState()
         }
     }
 
     private var lastProgressEmitMs = 0L
+
+    /**
+     * Attempts to parse a multi-file header (see [MultiFileMeta] / [BleConstants.MULTI_FILE_MAGIC])
+     * from the start of [receiveBuffer]. Determines [legacyMode] immediately from the very first
+     * byte alone (no need to wait for more data), but the header itself — `fileCount`, then
+     * `4 * fileCount` bytes of per-file lengths — may legitimately arrive split across more than
+     * one notification if the sender's chunk size is unusually small, so this just waits for
+     * more bytes (leaving both [multiFileMeta] and [legacyMode] unset) until enough are buffered.
+     */
+    private fun tryParseMultiFileHeader() {
+        val buffered = receiveBuffer.size()
+        if (buffered < 1) return
+        val bytes = receiveBuffer.toByteArray()
+        if (bytes[0] != BleConstants.MULTI_FILE_MAGIC) {
+            legacyMode = true
+            return
+        }
+        if (buffered < 2) return
+        val fileCount = bytes[1].toInt() and 0xFF
+        val headerLength = 2 + 4 * fileCount
+        if (buffered < headerLength) return
+        val fileLengths = (0 until fileCount).map { i ->
+            val offset = 2 + i * 4
+            ByteBuffer.wrap(bytes, offset, 4).order(ByteOrder.LITTLE_ENDIAN).int
+        }
+        multiFileMeta = MultiFileMeta(fileLengths, headerLength)
+        log("Multi-file header parsed: $fileCount file(s), ${fileLengths.sum()} total bytes")
+    }
+
+    /** Current [SyncState.ReceivingData], with multi-file progress once [multiFileMeta] is known. */
+    private fun receivingDataState(): SyncState.ReceivingData {
+        val meta = multiFileMeta ?: return SyncState.ReceivingData(receiveBuffer.size())
+        val dataBytesReceived = (receiveBuffer.size() - meta.headerLength).coerceAtLeast(0)
+        var cumulative = 0
+        var fileIndex = meta.fileLengths.size
+        for ((i, length) in meta.fileLengths.withIndex()) {
+            cumulative += length
+            if (dataBytesReceived < cumulative) {
+                fileIndex = i + 1
+                break
+            }
+        }
+        return SyncState.ReceivingData(
+            bytesReceived = dataBytesReceived,
+            totalBytes = meta.totalBytes,
+            fileIndex = fileIndex,
+            fileCount = meta.fileLengths.size,
+        )
+    }
 
     private fun onTransferComplete() {
         val elapsedMs = SystemClock.elapsedRealtime() - receiveStartMs
         val bytes = receiveBuffer.size()
         val kbPerSec = if (elapsedMs > 0) bytes / elapsedMs.toDouble() else 0.0
         log("Transfer complete: $bytes bytes in ${elapsedMs}ms (${"%.1f".format(kbPerSec)} KB/s)")
+        if (cancelled) return // Sync was cancelled after the terminator but before this callback ran.
         _syncState.value = SyncState.Inserting
-        val csvText = receiveBuffer.toString(Charsets.US_ASCII.name())
+        val meta = multiFileMeta
+        val allBytes = receiveBuffer.toByteArray()
+        // One CSV text segment per file — a legacy (non-multi-file) transfer is just the whole
+        // buffer as a single segment, same as before this feature existed.
+        val csvSegments = if (meta != null) {
+            var offset = meta.headerLength
+            meta.fileLengths.map { length ->
+                val text = String(allBytes, offset, length, Charsets.US_ASCII)
+                offset += length
+                text
+            }
+        } else {
+            listOf(String(allBytes, Charsets.US_ASCII))
+        }
         scope.launch {
-            val result = readingsRepository.importCsv(csvText)
+            val results = csvSegments.map { readingsRepository.importCsv(it) }
+            if (cancelled) return@launch // Cancelled while the (off-thread) parse+insert ran.
             // Only after the local insert has succeeded do we tell the ESP32 it can discard
             // its buffered copy — this ordering is what makes the protocol crash-safe.
             val gatt = bluetoothGatt
@@ -382,8 +489,34 @@ class BleGattClient(
             }
             _syncState.value = SyncState.ClearingBuffer
             writeClearBuffer(gatt)
-            log("Sync succeeded: ${result.readings.size} rows inserted, ${result.skippedRowCount} skipped")
-            _syncState.value = SyncState.Success(result.readings.size, result.skippedRowCount)
+            val rowsInserted = results.sumOf { it.readings.size }
+            val rowsSkipped = results.sumOf { it.skippedRowCount }
+            log("Sync succeeded: $rowsInserted rows inserted, $rowsSkipped skipped across ${csvSegments.size} file(s)")
+            _syncState.value = SyncState.Success(rowsInserted, rowsSkipped)
+        }
+    }
+
+    /**
+     * Aborts an in-progress sync and disconnects, WITHOUT saving anything: only effective before
+     * the local database insert has begun (Scanning/Connecting/RequestingData/ReceivingData) —
+     * once the transfer has already completed and insertion is under way (Inserting/
+     * ClearingBuffer), this is a no-op, since by then there's normally nothing left to
+     * meaningfully cancel (the insert itself is a single fast batch write; see PROTOCOL.md's
+     * crash-safety ordering). The UI is expected to hide/disable its Cancel affordance in those
+     * states for the same reason.
+     */
+    fun cancelSync() {
+        when (_syncState.value) {
+            is SyncState.Scanning, is SyncState.Connecting,
+            is SyncState.RequestingData, is SyncState.ReceivingData,
+            -> {
+                log("Sync cancelled by user")
+                cancelled = true
+                cancelTimeout()
+                _syncState.value = SyncState.Idle
+                disconnect()
+            }
+            else -> Unit
         }
     }
 
