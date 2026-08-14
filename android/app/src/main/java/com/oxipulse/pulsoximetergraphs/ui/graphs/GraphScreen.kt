@@ -29,7 +29,9 @@ import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material.icons.filled.ZoomOut
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -41,6 +43,7 @@ import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -72,9 +75,12 @@ import com.oxipulse.pulsoximetergraphs.di.AppContainer
 import com.oxipulse.pulsoximetergraphs.ui.rangepicker.DateTimeRangePickerDialog
 import com.oxipulse.pulsoximetergraphs.ui.theme.extendedColors
 import com.patrykandpatrick.vico.compose.cartesian.CartesianChartHost
+import com.patrykandpatrick.vico.compose.cartesian.CartesianDrawingContext
+import com.patrykandpatrick.vico.compose.cartesian.CartesianMeasuringContext
 import com.patrykandpatrick.vico.compose.cartesian.VicoScrollState
 import com.patrykandpatrick.vico.compose.cartesian.VicoZoomState
 import com.patrykandpatrick.vico.compose.cartesian.Zoom
+import com.patrykandpatrick.vico.compose.cartesian.axis.Axis
 import com.patrykandpatrick.vico.compose.cartesian.axis.HorizontalAxis
 import com.patrykandpatrick.vico.compose.cartesian.axis.VerticalAxis
 import com.patrykandpatrick.vico.compose.cartesian.axis.rememberAxisLabelComponent
@@ -90,6 +96,7 @@ import com.patrykandpatrick.vico.compose.cartesian.rememberCartesianChart
 import com.patrykandpatrick.vico.compose.cartesian.rememberVicoScrollState
 import com.patrykandpatrick.vico.compose.cartesian.rememberVicoZoomState
 import com.patrykandpatrick.vico.compose.common.Fill
+import com.patrykandpatrick.vico.compose.common.Position
 import com.patrykandpatrick.vico.compose.common.ProvideVicoTheme
 import com.patrykandpatrick.vico.compose.m3.common.rememberM3VicoTheme
 import java.time.Instant
@@ -97,6 +104,7 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlin.math.floor
 import kotlin.math.log10
+import kotlin.math.max
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
@@ -181,16 +189,18 @@ fun GraphScreen(
         )
     }
 
+    // The dialog (below) is now the only place sync progress shows — the toolbar icon stays a
+    // plain, static Bluetooth glyph regardless of sync state, and the top nav's old zoom-out
+    // button has moved to the top of the charts card (see ChartsCard) alongside a new zoom-in.
+    if (isSyncing(syncState)) {
+        BleSyncDialog(syncState = syncState, onCancel = viewModel::cancelSync)
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Pulsoximeter Graphs") },
                 actions = {
-                    if (canZoomOut) {
-                        IconButton(onClick = { viewModel.zoomOut() }) {
-                            Icon(Icons.Filled.ZoomOut, contentDescription = "Zoom out")
-                        }
-                    }
                     IconButton(onClick = { showRangePicker = true }) {
                         Icon(Icons.Filled.DateRange, contentDescription = "Select date range")
                     }
@@ -198,11 +208,7 @@ fun GraphScreen(
                         Icon(Icons.Filled.FileUpload, contentDescription = "Import CSV")
                     }
                     IconButton(onClick = { viewModel.startBleSync() }) {
-                        if (isSyncing(syncState)) {
-                            BleSyncSpinner()
-                        } else {
-                            Icon(Icons.Filled.Bluetooth, contentDescription = "Sync via BLE")
-                        }
+                        Icon(Icons.Filled.Bluetooth, contentDescription = "Sync via BLE")
                     }
                     // Icon shows the mode a tap switches TO, not the current one.
                     IconButton(onClick = onToggleTheme) {
@@ -248,28 +254,19 @@ fun GraphScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            syncStatusText(syncState)?.let { SyncStatusRow(it) }
             RangeSummary(selectedRange)
             StatsPanel(stats)
-            SpO2ChartCard(
+            ChartsCard(
                 readings = plottedReadings,
                 thresholdConfig = thresholdConfig,
-                minSpo2 = stats.minSpo2,
-                maxSpo2 = stats.maxSpo2,
+                stats = stats,
                 zoomState = sharedZoomState,
                 scrollState = sharedScrollState,
                 onRangeSelected = viewModel::setRange,
                 timeAxisItemPlacer = timeAxisItemPlacer,
-            )
-            PulseChartCard(
-                readings = plottedReadings,
-                thresholdConfig = thresholdConfig,
-                minPulse = stats.minPulse,
-                maxPulse = stats.maxPulse,
-                zoomState = sharedZoomState,
-                scrollState = sharedScrollState,
-                onRangeSelected = viewModel::setRange,
-                timeAxisItemPlacer = timeAxisItemPlacer,
+                canZoomOut = canZoomOut,
+                onZoomIn = viewModel::zoomIn,
+                onZoomOut = viewModel::zoomOut,
             )
         }
     }
@@ -284,43 +281,100 @@ private fun isSyncing(state: BleGattClient.SyncState): Boolean = when (state) {
 }
 
 /**
- * Human-readable label for whichever step of PROTOCOL.md's sync sequence is currently in
- * flight, or null once it's back to Idle/Success/Failed (those are surfaced via the snackbar
- * instead — see the LaunchedEffect(syncState) above). [BleGattClient.SyncState.ReceivingData]
- * carries a live byte count straight from the Data characteristic's notifications, so this
- * updates continuously while the transfer is running rather than sitting on one static label —
- * mirrors the per-chunk progress the sending side (tools/ble_csv_sender.py) prints.
+ * Whether [BleGattClient.cancelSync] would actually do anything right now — mirrors its own
+ * guard exactly, so the dialog's Cancel button only ever appears enabled when a tap on it is
+ * guaranteed to abort without saving. Once past ReceivingData (Inserting/ClearingBuffer), the
+ * transfer is already complete and insertion is a single fast batch write, so there's normally
+ * nothing left to meaningfully cancel — see cancelSync's own doc for why.
  */
-private fun syncStatusText(state: BleGattClient.SyncState): String? = when (state) {
+private fun isCancelable(state: BleGattClient.SyncState): Boolean = when (state) {
+    BleGattClient.SyncState.Scanning,
+    BleGattClient.SyncState.Connecting,
+    BleGattClient.SyncState.RequestingData,
+    is BleGattClient.SyncState.ReceivingData,
+    -> true
+    else -> false
+}
+
+/**
+ * Human-readable label for whichever step of PROTOCOL.md's sync sequence is currently in
+ * flight. [BleGattClient.SyncState.ReceivingData] carries a live byte count straight from the
+ * Data characteristic's notifications, so this updates continuously while the transfer is
+ * running rather than sitting on one static label — mirrors the per-chunk progress the sending
+ * side (tools/ble_csv_sender.py) prints. Only called while [isSyncing] is true (see
+ * [BleSyncDialog]); Idle/Success/Failed are surfaced via the snackbar instead (the
+ * LaunchedEffect(syncState) in [GraphScreen]).
+ */
+private fun syncStatusText(state: BleGattClient.SyncState): String = when (state) {
     BleGattClient.SyncState.Scanning -> "Scanning for PulsoxRelay…"
     BleGattClient.SyncState.Connecting -> "Connecting…"
     BleGattClient.SyncState.RequestingData -> "Requesting data…"
-    is BleGattClient.SyncState.ReceivingData -> "Receiving data… (${state.bytesReceived} bytes)"
+    is BleGattClient.SyncState.ReceivingData -> receivingDataText(state)
     BleGattClient.SyncState.Inserting -> "Saving to database…"
     BleGattClient.SyncState.ClearingBuffer -> "Finishing up…"
     BleGattClient.SyncState.Idle,
     is BleGattClient.SyncState.Success,
     is BleGattClient.SyncState.Failed,
-    -> null
+    -> ""
 }
 
-@Composable
-private fun SyncStatusRow(status: String) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        BleSyncSpinner()
-        Text(status, style = MaterialTheme.typography.bodyMedium)
+/**
+ * The total byte count (and hence a percentage) is only known once the sender's multi-file
+ * header has been parsed (see BleGattClient.MultiFileMeta) — legacy single-file transfers (the
+ * real ESP32, or the sender script's single-file path) never declare a total upfront, so this
+ * falls back to a plain running byte count for those.
+ */
+private fun receivingDataText(state: BleGattClient.SyncState.ReceivingData): String {
+    val filePrefix = if (state.fileCount != null && state.fileCount > 1) {
+        "File ${state.fileIndex}/${state.fileCount} — "
+    } else {
+        ""
+    }
+    val total = state.totalBytes
+    return if (total != null && total > 0) {
+        val percent = (state.bytesReceived * 100 / total).coerceIn(0, 100)
+        "${filePrefix}Receiving data… $percent%"
+    } else {
+        "${filePrefix}Receiving data… (${state.bytesReceived} bytes)"
     }
 }
 
 /**
- * A small rotating ring, sized to exactly match the 24dp icon it stands in for in the top app
- * bar's Bluetooth button. Material's default [androidx.compose.material3.CircularProgressIndicator]
- * ships at its own much larger default track/size and only had `height` constrained here (not
- * `width`), so it rendered oversized and lopsided next to the other icon buttons instead of
- * reading as "this icon is now busy."
+ * A modal dialog over the whole graphs screen showing live sync progress, with a Cancel button
+ * that aborts without saving (see [BleGattClient.cancelSync]) — replaces the old inline status
+ * row above the charts and the toolbar's spinning Bluetooth icon; that icon is now a plain,
+ * static glyph regardless of sync state, since this dialog is the only place progress shows.
+ * [GraphScreen] only composes this while [isSyncing] is true, so it disappears the instant the
+ * sync finishes or is cancelled — the final result (success/failure) is surfaced via a snackbar
+ * instead, from the same syncState the dialog was just showing.
+ */
+@Composable
+private fun BleSyncDialog(syncState: BleGattClient.SyncState, onCancel: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Syncing via Bluetooth") },
+        text = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                BleSyncSpinner()
+                Text(syncStatusText(syncState), style = MaterialTheme.typography.bodyMedium)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onCancel, enabled = isCancelable(syncState)) {
+                Text("Cancel")
+            }
+        },
+    )
+}
+
+/**
+ * A small rotating ring shown in [BleSyncDialog]. Material's default
+ * [androidx.compose.material3.CircularProgressIndicator] ships at its own much larger default
+ * track/size and only had `height` constrained here (not `width`), so it rendered oversized and
+ * lopsided next to the dialog's text instead of reading as a compact "still working" spinner.
  */
 @Composable
 private fun BleSyncSpinner(modifier: Modifier = Modifier) {
@@ -491,15 +545,84 @@ private fun niceYAxisStep(minY: Int, maxY: Int): Double {
 }
 
 /**
- * Y-axis item placer using [niceYAxisStep], or Vico's own default when there's no data for the
- * selected range (matches [fixedYRange]'s null-range fallback to auto-scaling).
+ * A [VerticalAxis.ItemPlacer] that always labels exactly [minY] and [maxY] (the actual bounds of
+ * the fixed range — see [fixedYRange]), plus intermediate values at [niceYAxisStep]'s step in
+ * between. [VerticalAxis.ItemPlacer.step] looked like the right built-in tool for this, but its
+ * overlap guard (`StepVerticalAxisItemPlacer`'s `minStep`, derived from measured label height vs.
+ * available axis height) can silently widen a requested step past what was asked for — confirmed
+ * by reading Vico 3.2.3's actual source: passing an explicit step still let minStep round it up to
+ * a *larger* one when the height/label-height math decided there wasn't room, which is exactly
+ * how a first attempt at this fix still left minY/maxY unlabeled on a tight range. That's
+ * backwards from what's wanted here: this app deliberately shows a tight, non-zero-based Y range
+ * and wants it labeled finely with both ends always visible, not defended against overlap by a
+ * heuristic tuned for zero-based axes. Bypassing Vico's step machinery entirely and supplying a
+ * fixed, precomputed label list guarantees both.
+ */
+private class FixedStepVerticalAxisItemPlacer(minY: Int, maxY: Int) : VerticalAxis.ItemPlacer {
+    private val labelValues: List<Double> = buildList {
+        val step = niceYAxisStep(minY, maxY)
+        var value = minY.toDouble()
+        while (value < maxY) {
+            add(value)
+            value += step
+        }
+        add(maxY.toDouble())
+    }
+
+    override fun getLabelValues(
+        context: CartesianDrawingContext,
+        axisHeight: Float,
+        maxLabelHeight: Float,
+        position: Axis.Position.Vertical,
+    ): List<Double> = labelValues
+
+    override fun getWidthMeasurementLabelValues(
+        context: CartesianMeasuringContext,
+        axisHeight: Float,
+        maxLabelHeight: Float,
+        position: Axis.Position.Vertical,
+    ): List<Double> = labelValues
+
+    override fun getHeightMeasurementLabelValues(
+        context: CartesianMeasuringContext,
+        position: Axis.Position.Vertical,
+    ): List<Double> = labelValues
+
+    // Geometry formulas below match StepVerticalAxisItemPlacer's own (for shiftTopLines = true,
+    // the interface's default we don't override) — generic margin math independent of step size,
+    // not part of the overlap-widening behavior this class exists to bypass.
+    override fun getTopLayerMargin(
+        context: CartesianMeasuringContext,
+        verticalLabelPosition: Position.Vertical,
+        maxLabelHeight: Float,
+        maxLineThickness: Float,
+    ): Float = when (verticalLabelPosition) {
+        Position.Vertical.Top -> maxLabelHeight + maxLineThickness / 2f
+        Position.Vertical.Center -> (max(maxLabelHeight, maxLineThickness) + maxLineThickness) / 2f
+        Position.Vertical.Bottom -> maxLineThickness
+    }
+
+    override fun getBottomLayerMargin(
+        context: CartesianMeasuringContext,
+        verticalLabelPosition: Position.Vertical,
+        maxLabelHeight: Float,
+        maxLineThickness: Float,
+    ): Float = when (verticalLabelPosition) {
+        Position.Vertical.Top -> maxLineThickness
+        Position.Vertical.Center -> (max(maxLabelHeight, maxLineThickness) + maxLineThickness) / 2f
+        Position.Vertical.Bottom -> maxLabelHeight + maxLineThickness / 2f
+    }
+}
+
+/**
+ * Y-axis item placer using [FixedStepVerticalAxisItemPlacer], or Vico's own default when there's
+ * no data for the selected range (matches [fixedYRange]'s null-range fallback to auto-scaling).
  */
 @Composable
 private fun rememberYAxisItemPlacer(minY: Int?, maxY: Int?): VerticalAxis.ItemPlacer =
     remember(minY, maxY) {
         if (minY != null && maxY != null) {
-            val step = niceYAxisStep(minY, maxY)
-            VerticalAxis.ItemPlacer.step(step = { step })
+            FixedStepVerticalAxisItemPlacer(minY, maxY)
         } else {
             VerticalAxis.ItemPlacer.step()
         }
@@ -651,18 +774,66 @@ private fun DragToZoomOverlay(
 private val CHART_LINE_STROKE = LineCartesianLayer.LineStroke.Continuous(thickness = 1.2.dp)
 
 /**
- * SpO2 and Pulse are two separate cards, each with its own chart, scale, and threshold bands —
- * NOT one dual-axis chart. The thresholds for the two metrics visually overlap in places (e.g. a
- * pulse-high-orange band and an spo2-red band can land at the same on-screen height once each is
- * mapped onto its own axis), which reads as one metric's danger zone bleeding into the other's
- * when both are drawn on a shared plot — splitting them back into independent charts removes
- * that ambiguity even though the two share the horizontal (time) axis conceptually. `zoomState`/
- * `scrollState` are still shared between both cards purely because pinch/drag zoom is disabled on
- * both (see the comment on `sharedZoomState` in [GraphScreen]) — there's no live pan/zoom to keep
- * in sync, just a single state instance CartesianChartHost requires per chart.
+ * One shared card housing both the SpO2 and Pulse charts (stacked, each still its own
+ * [CartesianChartHost] with its own scale and threshold bands — NOT one dual-axis chart: the
+ * thresholds for the two metrics visually overlap in places, e.g. a pulse-high-orange band and an
+ * spo2-red band can land at the same on-screen height once each is mapped onto its own axis,
+ * which reads as one metric's danger zone bleeding into the other's when both are drawn on a
+ * shared plot). A top row carries the zoom in/out controls — moved here from the top app bar so
+ * they sit next to what they actually act on. `zoomState`/`scrollState` are shared between both
+ * charts purely because pinch/drag zoom is disabled on both (see the comment on `sharedZoomState`
+ * in [GraphScreen]) — there's no live pan/zoom to keep in sync, just a single state instance
+ * CartesianChartHost requires per chart.
  */
 @Composable
-private fun SpO2ChartCard(
+private fun ChartsCard(
+    readings: List<ReadingEntity>,
+    thresholdConfig: ThresholdConfig,
+    stats: ReadingStats,
+    zoomState: VicoZoomState,
+    scrollState: VicoScrollState,
+    onRangeSelected: (ClosedRange<Instant>) -> Unit,
+    timeAxisItemPlacer: HorizontalAxis.ItemPlacer,
+    canZoomOut: Boolean,
+    onZoomIn: () -> Unit,
+    onZoomOut: () -> Unit,
+) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                IconButton(onClick = onZoomIn) {
+                    Icon(Icons.Filled.ZoomIn, contentDescription = "Zoom in")
+                }
+                IconButton(onClick = onZoomOut, enabled = canZoomOut) {
+                    Icon(Icons.Filled.ZoomOut, contentDescription = "Zoom out")
+                }
+            }
+            Spo2ChartContent(
+                readings = readings,
+                thresholdConfig = thresholdConfig,
+                minSpo2 = stats.minSpo2,
+                maxSpo2 = stats.maxSpo2,
+                zoomState = zoomState,
+                scrollState = scrollState,
+                onRangeSelected = onRangeSelected,
+                timeAxisItemPlacer = timeAxisItemPlacer,
+            )
+            PulseChartContent(
+                readings = readings,
+                thresholdConfig = thresholdConfig,
+                minPulse = stats.minPulse,
+                maxPulse = stats.maxPulse,
+                zoomState = zoomState,
+                scrollState = scrollState,
+                onRangeSelected = onRangeSelected,
+                timeAxisItemPlacer = timeAxisItemPlacer,
+            )
+        }
+    }
+}
+
+@Composable
+private fun Spo2ChartContent(
     readings: List<ReadingEntity>,
     thresholdConfig: ThresholdConfig,
     minSpo2: Int?,
@@ -708,47 +879,45 @@ private fun SpO2ChartCard(
     )
     val labelFontSize = MaterialTheme.typography.labelSmall.fontSize
 
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text("SpO2 (%)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            ProvideVicoTheme(rememberM3VicoTheme()) {
-                DragToZoomOverlay(
-                    readings = readings,
-                    onRangeSelected = onRangeSelected,
-                    modifier = Modifier.fillMaxWidth().height(220.dp),
-                ) {
-                    CartesianChartHost(
-                        chart = rememberCartesianChart(
-                            rememberLineCartesianLayer(
-                                lineProvider = LineCartesianLayer.LineProvider.series(spo2Line),
-                                rangeProvider = rangeProvider,
-                            ),
-                            startAxis = VerticalAxis.rememberStart(
-                                line = rememberAxisLineComponent(fill = Fill(spo2Color)),
-                                label = rememberAxisLabelComponent(
-                                    style = TextStyle(color = spo2Color, fontSize = labelFontSize),
-                                ),
-                                itemPlacer = yAxisItemPlacer,
-                            ),
-                            bottomAxis = HorizontalAxis.rememberBottom(
-                                valueFormatter = timeAxisFormatter,
-                                itemPlacer = timeAxisItemPlacer,
-                            ),
-                            decorations = bands,
+    Column {
+        Text("SpO2 (%)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        ProvideVicoTheme(rememberM3VicoTheme()) {
+            DragToZoomOverlay(
+                readings = readings,
+                onRangeSelected = onRangeSelected,
+                modifier = Modifier.fillMaxWidth().height(220.dp),
+            ) {
+                CartesianChartHost(
+                    chart = rememberCartesianChart(
+                        rememberLineCartesianLayer(
+                            lineProvider = LineCartesianLayer.LineProvider.series(spo2Line),
+                            rangeProvider = rangeProvider,
                         ),
-                        modelProducer = modelProducer,
-                        scrollState = scrollState,
-                        zoomState = zoomState,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                }
+                        startAxis = VerticalAxis.rememberStart(
+                            line = rememberAxisLineComponent(fill = Fill(spo2Color)),
+                            label = rememberAxisLabelComponent(
+                                style = TextStyle(color = spo2Color, fontSize = labelFontSize),
+                            ),
+                            itemPlacer = yAxisItemPlacer,
+                        ),
+                        bottomAxis = HorizontalAxis.rememberBottom(
+                            valueFormatter = timeAxisFormatter,
+                            itemPlacer = timeAxisItemPlacer,
+                        ),
+                        decorations = bands,
+                    ),
+                    modelProducer = modelProducer,
+                    scrollState = scrollState,
+                    zoomState = zoomState,
+                    modifier = Modifier.fillMaxSize(),
+                )
             }
         }
     }
 }
 
 @Composable
-private fun PulseChartCard(
+private fun PulseChartContent(
     readings: List<ReadingEntity>,
     thresholdConfig: ThresholdConfig,
     minPulse: Int?,
@@ -791,40 +960,38 @@ private fun PulseChartCard(
     )
     val labelFontSize = MaterialTheme.typography.labelSmall.fontSize
 
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text("Pulse (bpm)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            ProvideVicoTheme(rememberM3VicoTheme()) {
-                DragToZoomOverlay(
-                    readings = readings,
-                    onRangeSelected = onRangeSelected,
-                    modifier = Modifier.fillMaxWidth().height(220.dp),
-                ) {
-                    CartesianChartHost(
-                        chart = rememberCartesianChart(
-                            rememberLineCartesianLayer(
-                                lineProvider = LineCartesianLayer.LineProvider.series(pulseLine),
-                                rangeProvider = rangeProvider,
-                            ),
-                            startAxis = VerticalAxis.rememberStart(
-                                line = rememberAxisLineComponent(fill = Fill(pulseColor)),
-                                label = rememberAxisLabelComponent(
-                                    style = TextStyle(color = pulseColor, fontSize = labelFontSize),
-                                ),
-                                itemPlacer = yAxisItemPlacer,
-                            ),
-                            bottomAxis = HorizontalAxis.rememberBottom(
-                                valueFormatter = timeAxisFormatter,
-                                itemPlacer = timeAxisItemPlacer,
-                            ),
-                            decorations = bands,
+    Column {
+        Text("Pulse (bpm)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        ProvideVicoTheme(rememberM3VicoTheme()) {
+            DragToZoomOverlay(
+                readings = readings,
+                onRangeSelected = onRangeSelected,
+                modifier = Modifier.fillMaxWidth().height(220.dp),
+            ) {
+                CartesianChartHost(
+                    chart = rememberCartesianChart(
+                        rememberLineCartesianLayer(
+                            lineProvider = LineCartesianLayer.LineProvider.series(pulseLine),
+                            rangeProvider = rangeProvider,
                         ),
-                        modelProducer = modelProducer,
-                        scrollState = scrollState,
-                        zoomState = zoomState,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                }
+                        startAxis = VerticalAxis.rememberStart(
+                            line = rememberAxisLineComponent(fill = Fill(pulseColor)),
+                            label = rememberAxisLabelComponent(
+                                style = TextStyle(color = pulseColor, fontSize = labelFontSize),
+                            ),
+                            itemPlacer = yAxisItemPlacer,
+                        ),
+                        bottomAxis = HorizontalAxis.rememberBottom(
+                            valueFormatter = timeAxisFormatter,
+                            itemPlacer = timeAxisItemPlacer,
+                        ),
+                        decorations = bands,
+                    ),
+                    modelProducer = modelProducer,
+                    scrollState = scrollState,
+                    zoomState = zoomState,
+                    modifier = Modifier.fillMaxSize(),
+                )
             }
         }
     }
