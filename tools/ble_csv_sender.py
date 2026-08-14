@@ -26,6 +26,13 @@ Then open the app and tap the Bluetooth sync icon in the top bar. It scans, conn
 pulls the file, and this script exits on its own once the app confirms the import
 (CLEAR_BUFFER) — Ctrl+C also stops it cleanly at any point.
 
+Speed:
+- The defaults (--chunk-size 180, --chunk-delay 0.01) are a conservative middle ground.
+  If a transfer feels slow, --chunk-size can go as high as ~240 (just under the 244-byte
+  payload the app's requested 247-byte MTU allows) and --chunk-delay can go lower, even to
+  0 — push both up/down together and re-run; if rows come out missing or corrupted in the
+  app afterward, that combination was too aggressive for your adapter, so back off.
+
 Troubleshooting:
 - "Could not locate bluetooth adapter" / D-Bus permission errors: make sure
   `bluetooth.service` is running (`systemctl status bluetooth`) and your user can
@@ -45,6 +52,7 @@ import asyncio
 import logging
 import struct
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -150,6 +158,7 @@ class PulsoxRelay:
         data_char = self.server.get_characteristic(DATA_CHARACTERISTIC_UUID)
         total = len(self.csv_bytes)
         sent = 0
+        last_print = 0.0
         for offset in range(0, total, self.chunk_size):
             # Checked before every chunk (not just left to the background watch_connection()
             # poll) so a mid-transfer disconnect stops the send loop immediately instead of
@@ -162,17 +171,20 @@ class PulsoxRelay:
             data_char.value = bytearray(chunk)
             self.server.update_value(SERVICE_UUID, DATA_CHARACTERISTIC_UUID)
             sent += len(chunk)
-            # A transient \r-overwritten line rather than one log.info per chunk — at a 20-100
-            # byte chunk size a multi-KB file is thousands of chunks, and logging each on its
-            # own line would drown out the stage-change messages around it that actually matter
-            # (SET_TIME/REQUEST_DATA/CLEAR_BUFFER). Mirrors the app's own live byte counter (see
-            # GraphScreen.kt's SyncStatusRow) so both sides show matching progress side by side.
-            percent = sent * 100 // total if total else 100
-            print(f"\r  sending... {percent:3d}% ({sent}/{total} bytes)", end="", flush=True)
-            # BlueZ's D-Bus notify path has no backpressure of its own — pacing chunks
-            # avoids outrunning the link and dropping one, which the app would silently
-            # read as gappy CSV.
-            await asyncio.sleep(self.chunk_delay)
+            # Re-printed at most 10x/second rather than once per chunk — at a small
+            # --chunk-size/--chunk-delay a multi-KB file is still hundreds of chunks/second,
+            # and a print+flush syscall on every single one is real, avoidable overhead on the
+            # one loop we actually want to run as fast as the link allows.
+            now = time.monotonic()
+            if now - last_print >= 0.1 or sent >= total:
+                percent = sent * 100 // total if total else 100
+                print(f"\r  sending... {percent:3d}% ({sent}/{total} bytes)", end="", flush=True)
+                last_print = now
+            # BlueZ's D-Bus notify path has no backpressure of its own — pacing chunks avoids
+            # outrunning the link and dropping one, which the app would silently read as gappy
+            # CSV. See the module docstring's "Speed" section for how far this can be pushed.
+            if self.chunk_delay > 0:
+                await asyncio.sleep(self.chunk_delay)
         print()  # end the progress line before the next log.info
         data_char.value = bytearray(DATA_TERMINATOR)
         self.server.update_value(SERVICE_UUID, DATA_CHARACTERISTIC_UUID)
@@ -269,15 +281,17 @@ def main():
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=100,
-        help="Bytes per BLE notification (default: 100 — comfortably under the app's "
-        "requested 247-byte MTU; lower it if the app reports dropped/corrupt rows)",
+        default=180,
+        help="Bytes per BLE notification (default: 180 — under the ~244-byte payload the "
+        "app's requested 247-byte MTU allows; raise it for speed, up to ~240, or lower it "
+        "if the app reports dropped/corrupt rows)",
     )
     parser.add_argument(
         "--chunk-delay",
         type=float,
-        default=0.02,
-        help="Seconds to wait between notifications (default: 0.02)",
+        default=0.01,
+        help="Seconds to wait between notifications (default: 0.01; can go as low as 0 for "
+        "max speed — see the module docstring's 'Speed' section)",
     )
     parser.add_argument(
         "--adapter",
