@@ -345,13 +345,15 @@ private fun receivingDataText(state: BleGattClient.SyncState.ReceivingData): Str
  * row above the charts and the toolbar's spinning Bluetooth icon; that icon is now a plain,
  * static glyph regardless of sync state, since this dialog is the only place progress shows.
  * [GraphScreen] only composes this while [isSyncing] is true, so it disappears the instant the
- * sync finishes or is cancelled — the final result (success/failure) is surfaced via a snackbar
- * instead, from the same syncState the dialog was just showing.
+ * sync finishes, fails, or is cancelled — the final result (success/failure) is surfaced via a
+ * snackbar instead, from the same syncState the dialog was just showing. `onDismissRequest` is
+ * deliberately a no-op: tapping outside the dialog or pressing back must NOT cancel a sync that's
+ * actually in flight (easy to trigger by accident) — the Cancel button is the only manual way out.
  */
 @Composable
 private fun BleSyncDialog(syncState: BleGattClient.SyncState, onCancel: () -> Unit) {
     AlertDialog(
-        onDismissRequest = onCancel,
+        onDismissRequest = {},
         title = { Text("Syncing via Bluetooth") },
         text = {
             Row(
