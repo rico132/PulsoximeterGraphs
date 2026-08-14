@@ -43,7 +43,10 @@ import kotlinx.coroutines.launch
  *
  * This ordering is what makes the protocol crash-safe (see PROTOCOL.md): if step 6 never
  * completes, the ESP32 still has the data next time. A [SYNC_TIMEOUT_MS] watchdog guarantees
- * that a mid-transfer disconnect can't wedge the UI in a "syncing" state forever.
+ * that a stalled connection can't wedge the UI in a "syncing" state forever — it's an
+ * *inactivity* timeout, re-armed by [armTimeout] on every write ack and every Data chunk
+ * received (not a single fixed deadline for the whole sync), since a large CSV can legitimately
+ * take longer than [SYNC_TIMEOUT_MS] to transfer in full as long as bytes keep arriving.
  */
 class BleGattClient(
     private val context: Context,
@@ -181,6 +184,7 @@ class BleGattClient(
                 fail("Required characteristics not found")
                 return
             }
+            armTimeout()
             gatt.requestMtu(BleConstants.REQUESTED_MTU)
         }
 
@@ -188,11 +192,13 @@ class BleGattClient(
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             // Whether or not the negotiation succeeded, proceed with whatever MTU we have —
             // the protocol must also work correctly at the default, un-negotiated MTU of 23.
+            armTimeout()
             enableDataNotifications(gatt)
         }
 
         @SuppressLint("MissingPermission")
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            armTimeout()
             writeSetTime(gatt)
         }
 
@@ -206,6 +212,7 @@ class BleGattClient(
                 fail("Write to ${characteristic.uuid} failed (status $status)")
                 return
             }
+            armTimeout()
             when (lastControlWrite) {
                 ControlWrite.SET_TIME -> writeRequestData(gatt)
                 ControlWrite.REQUEST_DATA -> _syncState.value = SyncState.ReceivingData(0)
@@ -233,6 +240,10 @@ class BleGattClient(
     }
 
     private fun onDataChunk(value: ByteArray) {
+        // Every chunk received is forward progress, so the watchdog resets here too — a large
+        // CSV sent in many small notifications must not time out purely because the transfer as
+        // a whole runs past SYNC_TIMEOUT_MS, only if it actually stalls.
+        armTimeout()
         if (value.size == 1 && value[0] == BleConstants.DATA_TERMINATOR[0]) {
             onTransferComplete()
             return

@@ -108,6 +108,13 @@ class PulsoxRelay:
         self.server: Optional[BlessServer] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.done: Optional[asyncio.Event] = None
+        # Set by watch_connection() (or send_csv() itself) the moment the phone drops the
+        # connection before confirming CLEAR_BUFFER — most often because it hit its own
+        # sync-timeout watchdog while waiting on us. Without this, a mid-transfer disconnect
+        # went unnoticed: send_csv() kept blasting notifications with nothing subscribed to
+        # receive them, and run() would then wait on `done` forever.
+        self.failed: Optional[asyncio.Event] = None
+        self.failure_reason: Optional[str] = None
 
     def read_request(self, characteristic: BlessGATTCharacteristic, **kwargs) -> bytearray:
         return characteristic.value
@@ -139,11 +146,18 @@ class PulsoxRelay:
             log.warning("Unknown opcode 0x%02x", opcode)
 
     async def send_csv(self):
-        assert self.server is not None
+        assert self.server is not None and self.failed is not None
         data_char = self.server.get_characteristic(DATA_CHARACTERISTIC_UUID)
         total = len(self.csv_bytes)
         sent = 0
         for offset in range(0, total, self.chunk_size):
+            # Checked before every chunk (not just left to the background watch_connection()
+            # poll) so a mid-transfer disconnect stops the send loop immediately instead of
+            # blasting the rest of the file's notifications at nobody.
+            if not await self.server.is_connected():
+                print()
+                self._fail(f"Phone disconnected mid-transfer, at {sent}/{total} bytes sent")
+                return
             chunk = self.csv_bytes[offset : offset + self.chunk_size]
             data_char.value = bytearray(chunk)
             self.server.update_value(SERVICE_UUID, DATA_CHARACTERISTIC_UUID)
@@ -164,9 +178,41 @@ class PulsoxRelay:
         self.server.update_value(SERVICE_UUID, DATA_CHARACTERISTIC_UUID)
         log.info("Transfer complete, sent terminator. Waiting for the app's CLEAR_BUFFER...")
 
-    async def run(self, adapter: Optional[str]):
+    async def watch_connection(self):
+        """Runs for the whole session as a backstop alongside the inline check in send_csv():
+        catches a disconnect that happens *between* chunks (e.g. while send_csv is asleep during
+        chunk_delay, or after the terminator while we're waiting on CLEAR_BUFFER) instead of
+        only at the top of the loop. `is_connected()` reflects whether the phone still has an
+        active notify subscription on the Data characteristic, which BlueZ tears down as soon as
+        the underlying connection drops."""
+        assert self.done is not None and self.failed is not None
+        was_connected = False
+        while not self.done.is_set() and not self.failed.is_set():
+            connected = await self.server.is_connected()
+            if connected:
+                was_connected = True
+            elif was_connected:
+                self._fail("Phone disconnected before confirming the import (CLEAR_BUFFER never arrived)")
+                return
+            await asyncio.sleep(1.0)
+
+    def _fail(self, reason: str):
+        assert self.failed is not None
+        if self.failed.is_set():
+            return
+        self.failure_reason = reason
+        log.error(
+            "%s — it likely hit its own sync timeout waiting on us. Try a larger "
+            "--chunk-size / smaller --chunk-delay, or check for other apps holding a BLE "
+            "connection to this script.",
+            reason,
+        )
+        self.failed.set()
+
+    async def run(self, adapter: Optional[str]) -> bool:
         self.loop = asyncio.get_running_loop()
         self.done = asyncio.Event()
+        self.failed = asyncio.Event()
 
         kwargs = {"adapter": adapter} if adapter else {}
         server = BlessServer(name=DEVICE_NAME, loop=self.loop, **kwargs)
@@ -198,9 +244,17 @@ class PulsoxRelay:
             SERVICE_UUID,
         )
 
+        watchdog = self.loop.create_task(self.watch_connection())
         try:
-            await self.done.wait()
+            done_task = self.loop.create_task(self.done.wait())
+            failed_task = self.loop.create_task(self.failed.wait())
+            await asyncio.wait({done_task, failed_task}, return_when=asyncio.FIRST_COMPLETED)
+            for task in (done_task, failed_task):
+                if not task.done():
+                    task.cancel()
+            return not self.failed.is_set()
         finally:
+            watchdog.cancel()
             await asyncio.sleep(0.5)  # let the app's disconnect settle before tearing down
             await server.stop()
             log.info("Server stopped.")
@@ -238,9 +292,11 @@ def main():
     csv_bytes = load_csv_bytes(args.csv_path)
     relay = PulsoxRelay(csv_bytes, chunk_size=args.chunk_size, chunk_delay=args.chunk_delay)
     try:
-        asyncio.run(relay.run(args.adapter))
+        succeeded = asyncio.run(relay.run(args.adapter))
     except KeyboardInterrupt:
-        pass
+        return
+    if not succeeded:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
