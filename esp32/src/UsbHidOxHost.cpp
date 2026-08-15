@@ -17,12 +17,17 @@ constexpr uint8_t kHidReportTypeOutput = 0x02;  // wValue high byte
 UsbHidOxHost::UsbHidOxHost() = default;
 
 void UsbHidOxHost::begin() {
+#if defined(HAS_USB_HOST_VBUS_SWITCH)
   // Enable the board's MIC2005A VBUS power switch before/alongside bringing
   // up the USB host stack, so the PO-400 is actually powered over the same
   // cable that carries data — without this the host port would carry HID
-  // traffic but never charge the device.
+  // traffic but never charge the device. Only meaningful on boards that
+  // actually have this switch (e.g. the ESP32-S3-USB-OTG); on a plain
+  // DevKitC-1 build, VBUS is instead supplied externally (e.g. via a USB Y
+  // power/data splitter cable) and this GPIO has no wiring behind it.
   pinMode(Config::kUsbHostVbusEnableGpio, OUTPUT);
   digitalWrite(Config::kUsbHostVbusEnableGpio, HIGH);
+#endif
 
   reportQueue_ = xQueueCreate(16, sizeof(ReportMessage));
   outTransferDoneSignal_ = xSemaphoreCreateBinary();
