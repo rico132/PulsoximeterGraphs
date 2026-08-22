@@ -28,6 +28,8 @@ import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -68,6 +70,7 @@ import com.oxipulse.pulsoximetergraphs.data.db.ReadingStats
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.di.AppContainer
 import com.oxipulse.pulsoximetergraphs.ui.rangepicker.DateTimeRangePickerDialog
+import com.oxipulse.pulsoximetergraphs.ui.rangepicker.PredefinedTimeSpan
 import com.oxipulse.pulsoximetergraphs.ui.theme.extendedColors
 import com.patrykandpatrick.vico.compose.cartesian.CartesianChartHost
 import com.patrykandpatrick.vico.compose.cartesian.CartesianDrawingContext
@@ -127,6 +130,7 @@ fun GraphScreen(
     val canZoomOut by viewModel.canZoomOut.collectAsState()
 
     var showRangePicker by remember { mutableStateOf(false) }
+    var showRangeMenu by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
 
     // Surface BLE sync completion/failure as a snackbar, then reset state so re-tapping the
@@ -175,8 +179,33 @@ fun GraphScreen(
                     IconButton(onClick = { viewModel.zoomOut() }, enabled = canZoomOut) {
                         Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = "Undo zoom")
                     }
-                    IconButton(onClick = { showRangePicker = true }) {
-                        Icon(Icons.Filled.DateRange, contentDescription = "Select date range")
+                    // A quick-select menu of PredefinedTimeSpan entries, plus a "Custom range…"
+                    // entry that falls through to the existing full DateTimeRangePickerDialog —
+                    // the same "Select date range" icon now offers both instead of the dialog
+                    // being the only way in.
+                    Box {
+                        IconButton(onClick = { showRangeMenu = true }) {
+                            Icon(Icons.Filled.DateRange, contentDescription = "Select date range")
+                        }
+                        DropdownMenu(expanded = showRangeMenu, onDismissRequest = { showRangeMenu = false }) {
+                            for (span in PredefinedTimeSpan.entries) {
+                                DropdownMenuItem(
+                                    text = { Text(span.label) },
+                                    onClick = {
+                                        showRangeMenu = false
+                                        viewModel.setRange(span.toRange())
+                                    },
+                                )
+                            }
+                            HorizontalDivider()
+                            DropdownMenuItem(
+                                text = { Text("Custom range…") },
+                                onClick = {
+                                    showRangeMenu = false
+                                    showRangePicker = true
+                                },
+                            )
+                        }
                     }
                     IconButton(onClick = { viewModel.startBleSync() }) {
                         Icon(Icons.Filled.Bluetooth, contentDescription = "Sync via BLE")
