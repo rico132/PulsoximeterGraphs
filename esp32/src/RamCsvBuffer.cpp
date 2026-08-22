@@ -6,7 +6,8 @@
 
 #include <Arduino.h>
 #include <esp_heap_caps.h>
-#include <esp_rom_sys.h>
+
+#include "RomPrintfLock.h"
 
 namespace {
 // How many of the very first rows received from the PO-400 (live-stream or
@@ -85,7 +86,7 @@ bool RamCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
     // formatCsvRow()'s snprintf() output, so it's already a valid
     // null-terminated C string (including its own trailing "\r\n"); no
     // separate Serial.write() needed.
-    esp_rom_printf("CsvBuffer: row %u: %s", rowCount_, row);
+    LOCKED_ROM_PRINTF("CsvBuffer: row %u: %s", rowCount_, row);
   }
   return true;
 }

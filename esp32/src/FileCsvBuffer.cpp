@@ -5,9 +5,9 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
-#include <esp_rom_sys.h>
 
 #include "Config.h"
+#include "RomPrintfLock.h"
 
 namespace {
 // How many of the very first rows received from the PO-400 (live-stream or
@@ -116,7 +116,7 @@ bool FileCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
     // decode finishes, on usbTask. `row` is formatCsvRow()'s snprintf()
     // output, so it's already a valid null-terminated C string (including
     // its own trailing "\r\n").
-    esp_rom_printf("CsvBuffer: row %u: %s", rowCount_, row);
+    LOCKED_ROM_PRINTF("CsvBuffer: row %u: %s", rowCount_, row);
   }
   return true;
 }

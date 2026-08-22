@@ -312,9 +312,8 @@ DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
 
 #include <ctime>
 
-#include <esp_rom_sys.h>
-
 #include "Config.h"
+#include "RomPrintfLock.h"
 
 namespace {
 
@@ -404,7 +403,7 @@ void logHex(const char *label, const uint8_t *buf, size_t len,
                     " %02X", buf[i]);
   }
   if (useRom) {
-    esp_rom_printf("%s\n", line);
+    LOCKED_ROM_PRINTF("%s\n", line);
   } else {
     Serial.println(line);
   }
@@ -446,7 +445,7 @@ void logDecodeFailure(const char *context, const uint8_t *packet,
                       uint32_t packetIndex, uint8_t checksumEnd,
                       uint8_t seqLsbIdx, uint8_t seqMsbIdx,
                       uint32_t droppedReportCount) {
-  esp_rom_printf("StoredRecordDownloader: %s — packet #%u failed (%s):\n",
+  LOCKED_ROM_PRINTF("StoredRecordDownloader: %s — packet #%u failed (%s):\n",
                 context, packetIndex, decodeResultName(result));
   logHex("  offending packet", packet, packetLen, /*useRom=*/true);
   uint8_t sum = 0;
@@ -455,12 +454,12 @@ void logDecodeFailure(const char *context, const uint8_t *packet,
   }
   const uint16_t gotSeq = static_cast<uint16_t>(
       packet[seqLsbIdx] + (packet[seqMsbIdx] << 7));
-  esp_rom_printf(
+  LOCKED_ROM_PRINTF(
       "StoredRecordDownloader:   computed checksum 0x%02X vs packet's byte "
       "0x%02X; packet's sequence field = %u (expected %u).\n",
       sum & 0x7f, packet[checksumEnd], gotSeq, packetIndex);
   if (droppedReportCount > 0) {
-    esp_rom_printf(
+    LOCKED_ROM_PRINTF(
         "StoredRecordDownloader:   %u report(s) were dropped (USB queue "
         "full) this session — this failure is very likely just a dropped "
         "report, not a real protocol mismatch.\n",
@@ -490,7 +489,7 @@ public:
     // down, whose UART write path can block indefinitely if its TX ring
     // buffer fills and the draining interrupt is ever starved — is the
     // actual blocking point instead.
-    esp_rom_printf("RR#%lu\n", reportsRead_ + 1);
+    LOCKED_ROM_PRINTF("RR#%lu\n", reportsRead_ + 1);
     const unsigned long startMs = millis();
     const bool ok = host_.readReport(report, 64, /*timeoutMs=*/3000);
     const unsigned long elapsedMs = millis() - startMs;
@@ -509,7 +508,7 @@ public:
     // is confirmed inside host_.readReport()/xQueueReceive itself; if it
     // reliably appears even on the run that stalls, the block is downstream
     // of this line — i.e. the Serial.printf() call just below.
-    esp_rom_printf("RR#%lu returned ok=%d after %lums\n", reportsRead_ + 1,
+    LOCKED_ROM_PRINTF("RR#%lu returned ok=%d after %lums\n", reportsRead_ + 1,
                   ok ? 1 : 0, elapsedMs);
     reportsRead_++;
     // Every read is normally near-instant while the device is actively
@@ -524,7 +523,7 @@ public:
     // loop, so they're exactly as capable of hitting a starved UART TX
     // interrupt and blocking usbTask forever.
     if (elapsedMs >= 500) {
-      esp_rom_printf(
+      LOCKED_ROM_PRINTF(
           "StoredRecordDownloader: datum stream read #%lu took %lums (%s).\n",
           reportsRead_, elapsedMs, ok ? "succeeded" : "TIMED OUT");
     }
@@ -684,7 +683,7 @@ bool StoredRecordDownloader::downloadOneAutoRecord(
   auto logProgress = [recordIndex](const char *measurement) {
     return [recordIndex, measurement](uint32_t packetsRead,
                                       uint32_t remaining) {
-      esp_rom_printf("StoredRecordDownloader: Auto record #%u %s decode — "
+      LOCKED_ROM_PRINTF("StoredRecordDownloader: Auto record #%u %s decode — "
                     "%u packets read, %u datums remaining...\n",
                     recordIndex, measurement, packetsRead, remaining);
     };
@@ -752,7 +751,7 @@ bool StoredRecordDownloader::downloadOneManualRecord(
   // why: same hot per-packet loop, same UART-starvation risk.
   auto logProgress = [](const char *measurement) {
     return [measurement](uint32_t packetsRead, uint32_t remaining) {
-      esp_rom_printf("StoredRecordDownloader: Manual record %s decode — "
+      LOCKED_ROM_PRINTF("StoredRecordDownloader: Manual record %s decode — "
                     "%u packets read, %u datums remaining...\n",
                     measurement, packetsRead, remaining);
     };

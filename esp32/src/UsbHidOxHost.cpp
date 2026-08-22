@@ -2,10 +2,10 @@
 
 #include <cstring>
 
-#include <esp_rom_sys.h>
 #include <esp_task_wdt.h>
 
 #include "Config.h"
+#include "RomPrintfLock.h"
 
 namespace {
 // Control transfer buffer layout: 8-byte setup packet followed by up to
@@ -324,8 +324,13 @@ void UsbHidOxHost::inTransferCallback(usb_transfer_t *transfer) {
       // callback runs on usbHostLib's own task context (not an ISR — see
       // usb_host_client_handle_events()'s documented callback contract),
       // so esp_rom_printf here is safe; drops should be rare enough not to
-      // flood the log. Remove once the timing is confirmed either way.
-      esp_rom_printf(
+      // flood the log. Goes through LOCKED_ROM_PRINTF, not esp_rom_printf
+      // directly — this runs on core 0, StoredRecordDownloader's RR#
+      // heartbeat runs on core 1, and real hardware confirmed their
+      // unsynchronized esp_rom_printf output interleaving byte-for-byte
+      // into a garbled mess without it (see RomPrintfLock.h). Remove once
+      // the drop timing is confirmed either way.
+      LOCKED_ROM_PRINTF(
           "UsbHidOxHost: DROPPED report (queue full) — %lu dropped so far "
           "this session.\n",
           static_cast<unsigned long>(self->droppedReportCount_));
