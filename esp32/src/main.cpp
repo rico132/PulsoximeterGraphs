@@ -152,8 +152,9 @@ void setup() {
   // Pinned to core 1 (Arduino's own loop()/setup() core), deliberately
   // apart from UsbHidOxHost's "usbHostLib" task (core 0, see its own
   // comment) — that task's tight, higher-priority USB event-poll loop
-  // could otherwise starve this one on a long decode if the scheduler
-  // happened to land both on the same core.
+  // starves this one's xQueueReceive() of scheduler time during a burst
+  // (confirmed, not just theoretical — see its comment) whenever the two
+  // land on the same core, dropping reports out of the queue in between.
   xTaskCreatePinnedToCore(usbTask, "usbTask", 8192, nullptr,
                          tskIDLE_PRIORITY + 1, nullptr, 1);
 

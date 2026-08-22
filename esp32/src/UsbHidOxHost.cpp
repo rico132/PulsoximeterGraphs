@@ -63,23 +63,32 @@ void UsbHidOxHost::begin() {
     return;
   }
 
-  // Pinned to core 1 — the SAME core as usbTask (see main.cpp) — not
-  // separated as an earlier fix here had it. That split was meant to stop
-  // this loop's tight, higher-priority poll cycle from starving usbTask,
-  // but real-device retests showed splitting them made no difference to a
-  // reproducible stall inside usbTask's xQueueReceive() wait for the next
-  // report (confirmed, via an esp_rom_printf heartbeat immune to any
-  // Serial/UART issue, to be stuck inside that call itself — a call that's
-  // supposed to be hard-bounded at 3s by FreeRTOS). Since separating cores
-  // didn't help, this instead tests the opposite theory: reportQueue_'s
-  // producer (this task's transfer-completion callback, via
-  // usb_host_client_handle_events() below) and consumer (usbTask's
-  // xQueueReceive) were a cross-core relationship, which can occasionally
-  // hit rarer synchronization edge cases on ESP32's SMP FreeRTOS port than
-  // a same-core one would. Priority stays higher than usbTask's so this
-  // loop still gets scheduled promptly when it has work.
+  // Pinned to core 0 — separate from usbTask (core 1, see main.cpp) — once
+  // again, after a same-core experiment here (see git history) turned out
+  // to be chasing the wrong bug: a task watchdog abort that reproduced at
+  // a fixed point in a decode regardless of core placement, eventually
+  // traced to FileCsvBuffer reopening its LittleFS file on every single
+  // appended row (see FileCsvBuffer.cpp's appendRow() comment) — nothing
+  // to do with which core this task ran on.
+  //
+  // With that resolved, same-core placement's real cost showed up
+  // elsewhere: usb_host_client_handle_events() (called below, at higher
+  // priority than usbTask) drains its *entire* backlog of pending transfer
+  // completions in one call — confirmed at the compiled usb_host library's
+  // disassembly level, there is no per-call cap — invoking
+  // inTransferCallback() synchronously and back-to-back for every one of
+  // them before ever returning. FreeRTOS will not schedule a lower-priority
+  // ready task on the same core while a higher-priority one stays runnable,
+  // so a burst large enough to keep this call busy draining starved
+  // usbTask's xQueueReceive() long enough for reportQueue_ (128 deep) to
+  // fill and start dropping reports on real hardware — surfacing as
+  // "N report(s) were dropped (USB queue full)" checksum/sequence
+  // failures partway through a download. Separate cores let both run
+  // genuinely concurrently instead of competing for the same scheduler
+  // slot. Priority stays higher than usbTask's so this loop still gets
+  // scheduled promptly on its own core when it has work.
   xTaskCreatePinnedToCore(&UsbHidOxHost::usbHostTaskTrampoline, "usbHostLib",
-                         8192, this, tskIDLE_PRIORITY + 2, nullptr, 1);
+                         8192, this, tskIDLE_PRIORITY + 2, nullptr, 0);
 }
 
 void UsbHidOxHost::usbHostTaskTrampoline(void *arg) {
