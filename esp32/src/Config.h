@@ -18,13 +18,30 @@ constexpr uint16_t kUsbVendorId = 0x28E9;
 constexpr uint16_t kUsbProductId = 0x028A;
 constexpr size_t kHidReportSize = 64; // unnumbered, both directions
 
-// Live-stream start/stop/keepalive OUTPUT reports (first 3 bytes; rest is
-// zero-padded to kHidReportSize). Confirmed from pulseoxdl's exchange.h.
-constexpr uint8_t kCmdStartAmplitudes[3] = {0x9B, 0x00, 0x1B};
-constexpr uint8_t kCmdStartMeasurements[3] = {0x9B, 0x01, 0x1C};
-constexpr uint8_t kCmdKeepalive[2] = {0x9A, 0x1A};
-constexpr uint8_t kCmdStopLive[3] = {0x9B, 0x7F, 0x1A};
-constexpr uint32_t kKeepaliveIntervalMs = 5000;
+// Initial per-attach handshake, sent once before any stored-record exchange
+// below. Mirrors the manufacturer software's own sequence, per pulseoxdl's
+// exchange.h: "the sequence of exchanges that manufacturer's software does
+// with the device every time on initial communication." The PO-400
+// otherwise defaults to spontaneously streaming its own live-reading reports
+// over the same interrupt endpoint used for these command/response
+// exchanges — STOP_SENDING_DATA is what silences that, which is what
+// actually makes STORED_PRESENT/GET_RECORD_METADATA_* below reliable instead
+// of racing unsolicited live packets (see StoredRecordDownloader.cpp).
+constexpr uint8_t kCmdStopSendingData[18] = {
+    0x7D, 0x81, 0xA7, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+    0x7D, 0x81, 0xA2, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
+// Unidentified in pulseoxdl's own comments ("could be whether PI-capable,
+// etc.") but sent unconditionally by the manufacturer software with no
+// documented side effect — kept for parity since we can't verify their
+// necessity against real hardware ourselves.
+constexpr uint8_t kCmdHandshakeUnknown0[2] = {0x82, 0x02};
+constexpr uint8_t kCmdHandshakeUnknown1[2] = {0x80, 0x00};
+// SYNCHRONIZE_DEVICE_DATE_AND_TIME's opcode byte; bytes 1-6 (%y%m%d%H%M%S)
+// and the checksum are filled in at send time from ClockSync, only when a
+// trustworthy time is available — see StoredRecordDownloader.cpp.
+constexpr uint8_t kCmdSyncTimeOpcode = 0x83;
+constexpr uint8_t kCmdUserName[3] = {0x8E, 0x03, 0x11};
+constexpr uint8_t kCmdModelName[2] = {0x81, 0x01};
 
 // Stored-record (Auto/Manual) exchange commands, from pulseoxdl's exchange.h.
 constexpr uint8_t kCmdStoredPresent[2] = {0x9F, 0x1F};

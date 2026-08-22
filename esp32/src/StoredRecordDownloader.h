@@ -146,16 +146,20 @@ DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
 
 #include <Preferences.h>
 
+#include "ClockSync.h"
 #include "ICsvBuffer.h"
 #include "UsbHidOxHost.h"
 
 // Orchestrates the full "download stored records, convert to CSV, maybe
 // delete" flow described in the plan's "Stored-record download + test mode"
-// section. Runs on UsbHidOxHost's USB task after STORED_PRESENT indicates
-// there is something to fetch, before falling through to live streaming.
+// section. Runs on UsbHidOxHost's USB task on every PO-400 attach — this is
+// now the only thing the USB task does per attach (there is no live-stream
+// mode to fall through to; the device's own interrupt endpoint is entirely
+// dedicated to this exchange while attached).
 class StoredRecordDownloader {
 public:
-  StoredRecordDownloader(UsbHidOxHost &usbHost, ICsvBuffer &csvBuffer);
+  StoredRecordDownloader(UsbHidOxHost &usbHost, ICsvBuffer &csvBuffer,
+                         ClockSync &clockSync);
 
   // Loads the persisted test-mode flag from NVS (default ON — see
   // Config::kDefaultTestMode) and reads it back for the BLE server's
@@ -164,14 +168,15 @@ public:
   bool testModeEnabled() const;
   void setTestMode(bool enabled); // persists to NVS immediately
 
-  // Sends STORED_PRESENT and, if any record(s) are present, downloads and
-  // decodes every one of them (Auto or Manual, per the device's reported
-  // mode), appending decoded rows to csvBuffer, then deletes each record
-  // from the device unless testModeEnabled() is true. Safe to call whether
-  // or not any records are actually present (STORED_PRESENT reports that).
-  // Returns false only on a transport-level failure talking to the device
-  // (e.g. it was unplugged mid-download); a false return means the caller
-  // should not proceed to start live streaming this session.
+  // Performs the initial per-attach handshake (see Config::kCmdStopSendingData's
+  // comment for why this is required), then sends STORED_PRESENT and, if any
+  // record(s) are present, downloads and decodes every one of them (Auto or
+  // Manual, per the device's reported mode), appending decoded rows to
+  // csvBuffer, then deletes each record from the device unless
+  // testModeEnabled() is true. Safe to call whether or not any records are
+  // actually present (STORED_PRESENT reports that). Returns false only on a
+  // transport-level failure talking to the device (e.g. it was unplugged
+  // mid-download).
   bool downloadAndMaybeDelete();
 
 private:
@@ -182,6 +187,13 @@ private:
   bool sendExchange(const uint8_t *writeData, size_t writeLen,
                     uint8_t writeChecksumLen, uint8_t *readBuf,
                     size_t readLen, uint8_t readChecksumLen);
+  // STOP_SENDING_DATA / two unidentified status queries / an opportunistic
+  // clock sync (only when clockSync_.hasBeenSet()) / USER_NAME / MODEL_NAME
+  // — see Config::kCmdStopSendingData's comment. Returns false if any of the
+  // non-optional steps fails; a failed clock sync alone is logged but not
+  // fatal, since pulseoxdl's own comment calls that step "probably not
+  // strictly necessary."
+  bool performInitialHandshake();
   // Sends a datum-download request command (no response read here — the
   // response is the stream of datums-command HID reports consumed by
   // StoredRecordDecode::decodeAuto/decodeManual instead).
@@ -198,6 +210,7 @@ private:
 
   UsbHidOxHost &usbHost_;
   ICsvBuffer &csvBuffer_;
+  ClockSync &clockSync_;
   Preferences preferences_;
   bool testModeEnabled_ = true;
 };

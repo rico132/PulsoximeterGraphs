@@ -14,8 +14,11 @@ Row format: `YYYY-MM-DD, HH:MM:SS, <spo2>, <pulse>\r\n`
 - Comma-space separators.
 - CRLF line endings (parsers on both sides must also tolerate bare `\n`).
 - One row per second of measurement.
-- No timezone information is carried — both sides treat timestamps as local time of
-  whichever phone last sent `SET_TIME` (see below). This is a known limitation.
+- No timezone information is carried. Every row comes from a downloaded stored record, so
+  its date/time is the PO-400's own onboard clock at recording time, not the phone's — the
+  firmware only opportunistically pushes the phone's `SET_TIME` (see below) onto the
+  device's clock during its initial per-attach handshake, when available. This is a known
+  limitation.
 
 Example (from the source device, confirmed against the user's sample):
 
@@ -110,19 +113,25 @@ Confirmed by reading the GPLv3 reference project `pulseoxdl` (Contec CMS50E fami
 USB VID:PID `28E9:028A`. 64-byte HID reports both directions, unnumbered (no report-ID
 prefix byte on the real USB wire).
 
-**Live streaming**:
-- Start: OUTPUT reports `0x9B 0x00 0x1B` then `0x9B 0x01 0x1C` (64 bytes, zero-padded).
-  Confirm an `0xEB`-prefixed ack INPUT report.
-- Keepalive: OUTPUT report `0x9A 0x1A` roughly every 5 seconds, or the device stops streaming.
-- Stop: OUTPUT report `0x9B 0x7F 0x1A`.
-- Each INPUT report packs concatenated sub-commands (never crossing a report boundary),
-  each starting with sync byte `0xEB`:
-  - Waveform (`buf[1]==0x00`), 6 bytes — discarded, but must be walked to keep the scanner
-    in sync.
-  - Measurement (`buf[1]==0x01`), 8 bytes — `pr = (buf[2]&0x02) ? buf[3]+0x80 : buf[3]`;
-    `spo2 = buf[4]` (`0x7F` = finger-out, skip); checksum = sum of preceding bytes & 0x7F,
-    must equal the last byte (mismatch → resync by advancing 1 byte, not `length`).
-  - Loop ends normally on hitting non-`0xEB` padding.
+**Initial per-attach handshake** (sent once, before any stored-record exchange below):
+mirrors the manufacturer software's own sequence, per pulseoxdl's `exchange.h` comment
+("the sequence of exchanges that manufacturer's software does with the device every time
+on initial communication"). The PO-400 otherwise defaults to spontaneously streaming its
+own live-reading reports over the same interrupt endpoint used for the request/response
+exchanges below — `STOP_SENDING_DATA` silences that, which is what actually makes
+`STORED_PRESENT`/`GET_RECORD_METADATA_*` reliable instead of racing unsolicited live
+packets.
+- `STOP_SENDING_DATA`: write the fixed 18-byte command
+  `7D 81 A7 80 80 80 80 80 80 7D 81 A2 80 80 80 80 80 80`.
+- Two unidentified status queries: write `0x82, 0x02`, then `0x80, 0x00`. Sent
+  unconditionally by the manufacturer software with no documented side effect.
+- `SYNCHRONIZE_DEVICE_DATE_AND_TIME` (opcode `0x83`, followed by `%y%m%d%H%M%S`, 2
+  unclear-but-always-zero bytes, and a checksum): only sent when the firmware already has
+  a trustworthy time (i.e. the phone has sent `SET_TIME` at least once) — writing a bogus
+  time to the device's onboard clock would be worse than skipping this step, and
+  pulseoxdl's own comment calls it "probably not strictly necessary."
+- `USER_NAME` (`0x8e, 0x03, 0x11`) and `MODEL_NAME` (`0x81, 0x01`): read-only identity
+  queries, response content not otherwise used.
 
 **Stored records** (Auto/Manual mode, device's own onboard memory):
 - `STORED_PRESENT`: write `0x9f, 0x1f` → response indicates presence + Auto-vs-Manual mode.

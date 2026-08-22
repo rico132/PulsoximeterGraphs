@@ -26,9 +26,11 @@ namespace StoredRecordDecode {
 
 namespace {
 
-// Sum of buf[0..end-1] masked to 7 bits, compared to buf[end]. Same
-// wraparound-then-mask reasoning as OxProtocolParser::checksumOk() — see
-// that file's comment for why accumulating in a uint8_t is intentional.
+// Sum of buf[0..end-1] masked to 7 bits, compared to buf[end]. Accumulating
+// in a uint8_t is intentional: the device's own checksum is defined as a
+// running sum truncated to 7 bits, and letting the intermediate sum wrap at
+// 8 bits before the final `& 0x7f` mask reproduces that truncation exactly
+// (matches pulseoxdl.c's own `unsigned char sum` accumulator).
 bool checksumOk(const uint8_t *buf, uint8_t end) {
   uint8_t sum = 0;
   for (uint8_t i = 0; i < end; i++) {
@@ -290,6 +292,8 @@ DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
 
 #ifdef ARDUINO
 
+#include <ctime>
+
 #include "Config.h"
 
 namespace {
@@ -353,8 +357,9 @@ private:
 } // namespace
 
 StoredRecordDownloader::StoredRecordDownloader(UsbHidOxHost &usbHost,
-                                               ICsvBuffer &csvBuffer)
-    : usbHost_(usbHost), csvBuffer_(csvBuffer) {}
+                                               ICsvBuffer &csvBuffer,
+                                               ClockSync &clockSync)
+    : usbHost_(usbHost), csvBuffer_(csvBuffer), clockSync_(clockSync) {}
 
 void StoredRecordDownloader::begin() {
   preferences_.begin(Config::kPrefsNamespace, /*readOnly=*/false);
@@ -539,7 +544,83 @@ bool StoredRecordDownloader::downloadOneManualRecord(
   return true;
 }
 
+bool StoredRecordDownloader::performInitialHandshake() {
+  Serial.println(
+      "StoredRecordDownloader: initial handshake — stopping the device's "
+      "default data stream...");
+  if (!sendExchange(Config::kCmdStopSendingData,
+                    sizeof(Config::kCmdStopSendingData),
+                    /*writeChecksumLen=*/0, nullptr, 0,
+                    /*readChecksumLen=*/2)) {
+    Serial.println(
+        "StoredRecordDownloader: STOP_SENDING_DATA failed.");
+    return false;
+  }
+  if (!sendExchange(Config::kCmdHandshakeUnknown0,
+                    sizeof(Config::kCmdHandshakeUnknown0),
+                    /*writeChecksumLen=*/0, nullptr, 0,
+                    /*readChecksumLen=*/8) ||
+      !sendExchange(Config::kCmdHandshakeUnknown1,
+                    sizeof(Config::kCmdHandshakeUnknown1),
+                    /*writeChecksumLen=*/0, nullptr, 0,
+                    /*readChecksumLen=*/2)) {
+    Serial.println(
+        "StoredRecordDownloader: handshake status query failed.");
+    return false;
+  }
+
+  if (clockSync_.hasBeenSet()) {
+    // SYNCHRONIZE_DEVICE_DATE_AND_TIME: opcode byte + %y%m%d%H%M%S + 2
+    // unclear-but-always-zero bytes + checksum. Only sent when we actually
+    // have a trustworthy time (the phone may not have connected/sent
+    // SET_TIME yet by the time the cable is plugged in) — pulseoxdl's own
+    // comment calls this step "probably not strictly necessary," and writing
+    // a bogus time to the device's onboard clock would be worse than
+    // skipping it.
+    const time_t t = static_cast<time_t>(clockSync_.now());
+    struct tm tmVal;
+    gmtime_r(&t, &tmVal);
+    uint8_t syncTime[10] = {0};
+    syncTime[0] = Config::kCmdSyncTimeOpcode;
+    syncTime[1] = static_cast<uint8_t>(tmVal.tm_year - 100);
+    syncTime[2] = static_cast<uint8_t>(tmVal.tm_mon + 1);
+    syncTime[3] = static_cast<uint8_t>(tmVal.tm_mday);
+    syncTime[4] = static_cast<uint8_t>(tmVal.tm_hour);
+    syncTime[5] = static_cast<uint8_t>(tmVal.tm_min);
+    syncTime[6] = static_cast<uint8_t>(tmVal.tm_sec);
+    if (!sendExchange(syncTime, sizeof(syncTime), sizeof(syncTime), nullptr,
+                      0, /*readChecksumLen=*/3)) {
+      Serial.println(
+          "StoredRecordDownloader: device clock sync failed (continuing "
+          "anyway).");
+    }
+  } else {
+    Serial.println(
+        "StoredRecordDownloader: skipping device clock sync — phone "
+        "hasn't sent SET_TIME yet.");
+  }
+
+  if (!sendExchange(Config::kCmdUserName, sizeof(Config::kCmdUserName),
+                    /*writeChecksumLen=*/0, nullptr, 0,
+                    /*readChecksumLen=*/10) ||
+      !sendExchange(Config::kCmdModelName, sizeof(Config::kCmdModelName),
+                    /*writeChecksumLen=*/0, nullptr, 0,
+                    /*readChecksumLen=*/10)) {
+    Serial.println(
+        "StoredRecordDownloader: device identity query failed.");
+    return false;
+  }
+  return true;
+}
+
 bool StoredRecordDownloader::downloadAndMaybeDelete() {
+  if (!performInitialHandshake()) {
+    Serial.println(
+        "StoredRecordDownloader: initial handshake failed; device may "
+        "have been unplugged.");
+    return false;
+  }
+
   Serial.println(
       "StoredRecordDownloader: checking PO-400 for stored records...");
   uint8_t presentResp[8] = {0};

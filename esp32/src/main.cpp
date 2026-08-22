@@ -3,10 +3,14 @@
 // setup() constructs everything and starts two FreeRTOS tasks: the BLE send
 // task (started inside BleGattServer::begin(), dedicated to the REQUEST_DATA
 // dump so it never blocks the NimBLE write callback) and the USB task below
-// (owns the PO-400 lifecycle: on attach, download+maybe-delete any stored
-// records, then run the live-stream loop for as long as the device stays
-// attached). loop() stays idle except for pumping OtaManager's WiFi-idle
-// timeout and a tiny serial debug command for provisioning the OTA password.
+// (owns the PO-400 lifecycle: on every attach, download+maybe-delete any
+// stored records — that's the only thing the PO-400's USB link is used for;
+// there is no live-measurement mode, since the device's single interrupt
+// endpoint is used either for that command/response exchange or for
+// unsolicited live streaming, never both at once — see
+// StoredRecordDownloader's initial-handshake comment). loop() stays idle
+// except for pumping OtaManager's WiFi-idle timeout and a tiny serial debug
+// command for provisioning the OTA password.
 //
 // IMPORTANT: hardware-in-the-loop validation still required. This firmware
 // has not been run against a physical PO-400 or ESP32-S3-USB-OTG board in
@@ -21,7 +25,6 @@
 #include "FileCsvBuffer.h"
 #include "ICsvBuffer.h"
 #include "OtaManager.h"
-#include "OxProtocolParser.h"
 #include "RamCsvBuffer.h"
 #include "StoredRecordDownloader.h"
 #include "UsbHidOxHost.h"
@@ -42,114 +45,27 @@ BleGattServer *g_bleGattServer = nullptr;
 
 SemaphoreHandle_t g_usbAttachSignal = nullptr;
 
-// Bridges OxProtocolParser's decoded live measurements into the CSV buffer,
-// gated on ClockSync per the plan's "Timestamp gating" note: don't append
-// any row until the phone has sent SET_TIME at least once, since a
-// placeholder epoch would silently produce misleading data.
-class LiveMeasurementListener : public OxProtocolParserListener {
-public:
-  void onMeasurement(const OxMeasurement &measurement) override {
-    if (!g_clockSync.hasBeenSet()) {
-      // Logged once per attach (not once per measurement) so a phone that
-      // hasn't sent SET_TIME yet doesn't flood the console at the live
-      // stream's report rate.
-      if (!warnedNoClock_) {
-        warnedNoClock_ = true;
-        Serial.println(
-            "LiveMeasurementListener: dropping measurements — phone hasn't "
-            "sent SET_TIME yet.");
-      }
-      return;
-    }
-    warnedNoClock_ = false;
-
-    g_csvBuffer->appendRow(g_clockSync.now(), measurement.spo2,
-                          measurement.pulseRate);
-
-    // Throttled heartbeat so you can see live data is flowing without
-    // flooding the console at the device's native report rate.
-    const unsigned long nowMs = millis();
-    if (nowMs - lastLogMs_ >= kLogIntervalMs) {
-      lastLogMs_ = nowMs;
-      Serial.printf("Live: SpO2=%u%% pulse=%u bpm\n", measurement.spo2,
-                   measurement.pulseRate);
-    }
-  }
-
-private:
-  static constexpr unsigned long kLogIntervalMs = 2000;
-  unsigned long lastLogMs_ = 0;
-  bool warnedNoClock_ = false;
-};
-
-LiveMeasurementListener g_liveListener;
-OxProtocolParser g_liveParser(g_liveListener);
-
-void runLiveStreamLoop() {
-  Serial.println("UsbTask: starting live-stream loop.");
-  g_usbHost.writeReport(Config::kCmdStartAmplitudes,
-                       sizeof(Config::kCmdStartAmplitudes));
-  g_usbHost.writeReport(Config::kCmdStartMeasurements,
-                       sizeof(Config::kCmdStartMeasurements));
-
-  uint8_t report[Config::kHidReportSize];
-  // Confirm the device's 0xEB-prefixed ack per the plan; if it doesn't show
-  // up promptly we still fall through to the read loop below rather than
-  // give up entirely, since a missed ack read is not itself fatal.
-  if (g_usbHost.readReport(report, sizeof(report), 1000)) {
-    if (report[0] != 0xEB) {
-      Serial.println(
-          "UsbTask: warning — expected 0xEB-prefixed ack after live-stream "
-          "start commands, got something else.");
-    }
-  }
-
-  unsigned long lastKeepaliveMs = millis();
-  unsigned long lastDiagMs = millis();
-  while (g_usbHost.isAttached()) {
-    if (g_usbHost.readReport(report, sizeof(report), 200)) {
-      g_liveParser.parseReport(report, sizeof(report));
-    }
-    if (millis() - lastKeepaliveMs >= Config::kKeepaliveIntervalMs) {
-      g_usbHost.writeReport(Config::kCmdKeepalive,
-                           sizeof(Config::kCmdKeepalive));
-      lastKeepaliveMs = millis();
-    }
-    // Periodic link-health dump: if measurementCount stays at 0, or
-    // resyncCount keeps climbing, that points at a wiring/protocol problem
-    // even when no single log line above would have caught it.
-    if (millis() - lastDiagMs >= 10000) {
-      lastDiagMs = millis();
-      Serial.printf(
-          "UsbTask: link stats — measurements=%u fingerOut=%u "
-          "waveform=%u resync=%u\n",
-          g_liveParser.measurementCount(), g_liveParser.fingerOutCount(),
-          g_liveParser.waveformCount(), g_liveParser.resyncCount());
-    }
-  }
-
-  g_usbHost.writeReport(Config::kCmdStopLive, sizeof(Config::kCmdStopLive));
-  Serial.println("UsbTask: live-stream loop ended (device detached).");
-}
-
 void usbTask(void * /*param*/) {
   for (;;) {
     if (xSemaphoreTake(g_usbAttachSignal, portMAX_DELAY) == pdTRUE) {
       Serial.println("UsbTask: PO-400 attached.");
 
-      // Stored-record download (Auto/Manual), before live streaming — feeds
-      // the same ICsvBuffer, per the plan's "Stored-record download" section.
+      // Stored-record download (Auto/Manual) is the only thing this task
+      // does per attach — feeds the same ICsvBuffer, per the plan's
+      // "Stored-record download" section. Whatever the outcome, this task
+      // then just waits for the next attach signal (see onDetach() below for
+      // the actual "unplugged" log line — there's no wait-for-detach loop
+      // here since there's nothing left to do while the device stays
+      // attached).
       if (!g_storedRecordDownloader->downloadAndMaybeDelete()) {
         Serial.println(
             "UsbTask: stored-record download failed or device detached "
-            "during it; skipping live stream this session.");
-        continue;
+            "during it.");
+      } else {
+        Serial.println(
+            "UsbTask: stored-record download complete; nothing more to do "
+            "until the device is unplugged.");
       }
-
-      if (g_usbHost.isAttached()) {
-        runLiveStreamLoop();
-      }
-      Serial.println("UsbTask: PO-400 detached.");
     }
   }
 }
@@ -193,8 +109,8 @@ void setup() {
         "FATAL: neither RAM nor LittleFS CSV buffer could be initialized.");
   }
 
-  static StoredRecordDownloader storedRecordDownloader(g_usbHost,
-                                                       *g_csvBuffer);
+  static StoredRecordDownloader storedRecordDownloader(g_usbHost, *g_csvBuffer,
+                                                       g_clockSync);
   g_storedRecordDownloader = &storedRecordDownloader;
   g_storedRecordDownloader->begin();
 
@@ -210,6 +126,7 @@ void setup() {
              nullptr);
 
   g_usbHost.onAttach([]() { xSemaphoreGive(g_usbAttachSignal); });
+  g_usbHost.onDetach([]() { Serial.println("UsbTask: PO-400 detached."); });
   g_usbHost.begin();
 
   Serial.println("PulsoxRelay firmware ready.");
