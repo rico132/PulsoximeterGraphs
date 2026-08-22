@@ -92,23 +92,7 @@ uint32_t packetBudget(uint32_t datumCount) {
 // Every kProgressLogInterval packets, tell `onProgress` (if any) how far
 // along a decode is — see ProgressSink's comment in the header for why this
 // indirection exists instead of calling Serial directly here.
-//
-// TEMPORARY DIAGNOSTIC (back to 1, not 20): fixing RamCsvBuffer/
-// FileCsvBuffer's first-10-rows debug echo (see those files' appendRow()
-// comments) did NOT stop the task watchdog abort from reproducing at the
-// same report count. Crucially, with that fix in place, no "CsvBuffer: row
-// N:" line (now esp_rom_printf, can't silently fail to show) ever appears
-// before the abort — proving appendDecodedRecord()/appendRow() is never
-// actually reached. The earlier per-packet run's "239 packets read, 37
-// datums remaining" was misread as "decode finishes here": onProgress
-// reports `remaining` as it stood *before* the current packet's own
-// decrements, so that only bounded how many datums packet 239 *could*
-// remove (up to 42) — it didn't prove `remaining` reached 0. It evidently
-// didn't. Back to 1 to find out, empirically, exactly which packet really
-// is last-completed and whether the loop is still making any progress at
-// all past where the previous run stopped looking. Revert to 20 once the
-// actual blocking statement is identified.
-constexpr uint32_t kProgressLogInterval = 1;
+constexpr uint32_t kProgressLogInterval = 20;
 
 } // namespace
 
@@ -198,21 +182,6 @@ DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
       if (low != 0xf) {
         store(low);
       }
-    }
-    // TEMPORARY DIAGNOSTIC: a second onProgress call, right as this packet's
-    // checksum/sequence/nibble work actually finishes — not just when it was
-    // obtained (the call above, before any of that runs). A task watchdog
-    // abort has now reproduced twice with the *same* packet (239) as the
-    // last one onProgress ever reports, which only proves that packet was
-    // obtained; it says nothing about whether checksumOk(), the sequence
-    // check, or this nibble loop for that exact packet ever completed. This
-    // call, sharing the same (packetsRead, remaining) pair, tells them
-    // apart: if it fires, packet N's own processing finished and whatever
-    // blocks is back inside PacketReassembler obtaining packet N+1; if the
-    // line above appears but this one never does, the block is inside this
-    // packet's own checksum/sequence/nibble work above.
-    if (onProgress && packetsRead % kProgressLogInterval == 0) {
-      onProgress(packetsRead, remaining);
     }
   }
   return DecodeResult::Ok;
@@ -683,35 +652,13 @@ void StoredRecordDownloader::appendDecodedRecord(
     int64_t startEpochSeconds, const std::vector<uint8_t> &spo2,
     const std::vector<uint8_t> &pr) {
   const size_t n = spo2.size() < pr.size() ? spo2.size() : pr.size();
-  // TEMPORARY DIAGNOSTIC: two hardware runs now show decodeAuto() finishing
-  // cleanly (the second onProgress checkpoint reporting 0 datums remaining)
-  // right before a task watchdog abort, with zero further output — not even
-  // RamCsvBuffer::appendRow()'s/FileCsvBuffer::appendRow()'s own first-row
-  // esp_rom_printf, which comes at the *end* of appendRow() after its real
-  // work (memcpy for RAM; LittleFS open+write+close for the fallback). This
-  // brackets the loop itself: an unconditional entry print (n is otherwise
-  // invisible — this record's whole pulse-rate/SpO2 datum count) plus one
-  // every 200 rows, all via esp_rom_printf so it can't itself stall the way
-  // Serial could. If this call is on FileCsvBuffer (no PSRAM), each
-  // appendRow() does a real LittleFS open/write/close — individually slow,
-  // and esp_task_wdt_reset() is never called from this loop at all (only
-  // from UsbHidOxHost::readReport()), so thousands of rows with brief
-  // flash-wait yields in between (matching every "CPU1: IDLE1" snapshot so
-  // far) could plausibly outrun the 30s watchdog with no single genuinely
-  // stuck call. Revert once the actual cause is confirmed.
-  esp_rom_printf(
+  Serial.printf(
       "StoredRecordDownloader: appending %u decoded row(s) to CsvBuffer...\n",
       static_cast<unsigned>(n));
   for (size_t i = 0; i < n; i++) {
     csvBuffer_.appendRow(startEpochSeconds + static_cast<int64_t>(i), spo2[i],
                         pr[i]);
-    if (i % 200 == 0) {
-      esp_rom_printf("StoredRecordDownloader:   appended row %u/%u...\n",
-                    static_cast<unsigned>(i), static_cast<unsigned>(n));
-    }
   }
-  esp_rom_printf("StoredRecordDownloader: finished appending %u row(s).\n",
-                static_cast<unsigned>(n));
 }
 
 bool StoredRecordDownloader::downloadOneAutoRecord(
