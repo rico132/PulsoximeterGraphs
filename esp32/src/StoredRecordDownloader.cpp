@@ -393,7 +393,8 @@ const char *decodeResultName(StoredRecordDecode::DecodeResult result) {
 void logDecodeFailure(const char *context, const uint8_t *packet,
                       uint8_t packetLen, StoredRecordDecode::DecodeResult result,
                       uint32_t packetIndex, uint8_t checksumEnd,
-                      uint8_t seqLsbIdx, uint8_t seqMsbIdx) {
+                      uint8_t seqLsbIdx, uint8_t seqMsbIdx,
+                      uint32_t droppedReportCount) {
   Serial.printf("StoredRecordDownloader: %s — packet #%u failed (%s):\n",
                context, packetIndex, decodeResultName(result));
   logHex("  offending packet", packet, packetLen);
@@ -407,6 +408,13 @@ void logDecodeFailure(const char *context, const uint8_t *packet,
       "StoredRecordDownloader:   computed checksum 0x%02X vs packet's byte "
       "0x%02X; packet's sequence field = %u (expected %u).\n",
       sum & 0x7f, packet[checksumEnd], gotSeq, packetIndex);
+  if (droppedReportCount > 0) {
+    Serial.printf(
+        "StoredRecordDownloader:   %u report(s) were dropped (USB queue "
+        "full) this session — this failure is very likely just a dropped "
+        "report, not a real protocol mismatch.\n",
+        droppedReportCount);
+  }
 }
 
 // Adapts UsbHidOxHost's blocking readReport() to the pure decode namespace's
@@ -563,18 +571,19 @@ bool StoredRecordDownloader::downloadOneAutoRecord(
                     recordIndex, measurement, packetsRead, remaining);
     };
   };
-  auto logFailure = [recordIndex](const char *measurement) {
-    return [recordIndex, measurement](const uint8_t *packet,
-                                      uint8_t packetLen,
-                                      StoredRecordDecode::DecodeResult result,
-                                      uint32_t packetIndex) {
+  auto logFailure = [this, recordIndex](const char *measurement) {
+    return [this, recordIndex, measurement](
+               const uint8_t *packet, uint8_t packetLen,
+               StoredRecordDecode::DecodeResult result,
+               uint32_t packetIndex) {
       char context[48];
       snprintf(context, sizeof(context), "Auto record #%u %s decode",
               recordIndex, measurement);
       logDecodeFailure(context, packet, packetLen, result, packetIndex,
                        StoredRecordDecode::kAutoDatumsEnd,
                        StoredRecordDecode::kAutoSeqLsbIdx,
-                       StoredRecordDecode::kAutoSeqMsbIdx);
+                       StoredRecordDecode::kAutoSeqMsbIdx,
+                       usbHost_.droppedReportCount());
     };
   };
 
@@ -628,17 +637,18 @@ bool StoredRecordDownloader::downloadOneManualRecord(
                     measurement, packetsRead, remaining);
     };
   };
-  auto logFailure = [](const char *measurement) {
-    return [measurement](const uint8_t *packet, uint8_t packetLen,
-                         StoredRecordDecode::DecodeResult result,
-                         uint32_t packetIndex) {
+  auto logFailure = [this](const char *measurement) {
+    return [this, measurement](const uint8_t *packet, uint8_t packetLen,
+                               StoredRecordDecode::DecodeResult result,
+                               uint32_t packetIndex) {
       char context[48];
       snprintf(context, sizeof(context), "Manual record %s decode",
               measurement);
       logDecodeFailure(context, packet, packetLen, result, packetIndex,
                        StoredRecordDecode::kManualDatumsEnd,
                        StoredRecordDecode::kManualSeqLsbIdx,
-                       StoredRecordDecode::kManualSeqMsbIdx);
+                       StoredRecordDecode::kManualSeqMsbIdx,
+                       usbHost_.droppedReportCount());
     };
   };
 

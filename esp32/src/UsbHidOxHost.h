@@ -57,6 +57,16 @@ public:
   // attached device. Returns false on timeout or if no device is attached.
   bool readReport(uint8_t *buf, size_t bufSize, uint32_t timeoutMs);
 
+  // How many completed IN reports inTransferCallback() had to discard
+  // because reportQueue_ was full (a burst arriving faster than the current
+  // consumer drains it — observed against real hardware right after a
+  // stored-record datum-download request, which appears to make the PO-400
+  // burst reports faster than the earlier command/response exchanges do).
+  // Non-zero here, seen right before a ChecksumError/SequenceError in
+  // StoredRecordDecode, is the direct confirmation that a decode "failure"
+  // was actually a dropped report, not a real protocol mismatch.
+  uint32_t droppedReportCount() const { return droppedReportCount_; }
+
   // Sends a 64-byte zero-padded OUTPUT report built from the first `length`
   // bytes of `data` (length must be <= 64). Uses the device's real
   // interrupt-OUT endpoint if it has one, otherwise falls back to a
@@ -109,6 +119,7 @@ private:
   usb_transfer_t *outTransfer_ = nullptr; // interrupt OUT or control, either way
 
   QueueHandle_t reportQueue_ = nullptr;
+  volatile uint32_t droppedReportCount_ = 0;
   SemaphoreHandle_t outTransferDoneSignal_ = nullptr;
   volatile bool lastOutTransferOk_ = false;
 

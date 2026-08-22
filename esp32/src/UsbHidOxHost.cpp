@@ -29,7 +29,16 @@ void UsbHidOxHost::begin() {
   digitalWrite(Config::kUsbHostVbusEnableGpio, HIGH);
 #endif
 
-  reportQueue_ = xQueueCreate(16, sizeof(ReportMessage));
+  // 16 was observed too shallow against real hardware: a stored-record
+  // datum-download request makes the PO-400 burst reports fast enough to
+  // overflow it before the consumer (checksum + nibble decode per packet)
+  // drains it, silently dropping one or more reports — which then surfaces
+  // as a baffling ChecksumError/SequenceError several packets later, not as
+  // an obvious queue-full symptom. 128 costs under 10KB of RAM (well within
+  // headroom; see the build's own RAM usage report) for a generous burst
+  // buffer instead of retuning this exactly to the PO-400's actual burst
+  // size, which isn't otherwise documented.
+  reportQueue_ = xQueueCreate(128, sizeof(ReportMessage));
   outTransferDoneSignal_ = xSemaphoreCreateBinary();
 
   usb_host_config_t hostConfig = {};
@@ -259,7 +268,13 @@ void UsbHidOxHost::inTransferCallback(usb_transfer_t *transfer) {
             : sizeof(msg.data);
     memcpy(msg.data, transfer->data_buffer, n);
     msg.length = n;
-    xQueueSend(self->reportQueue_, &msg, 0);
+    if (xQueueSend(self->reportQueue_, &msg, 0) != pdTRUE) {
+      // Queue full — a burst outran the consumer. Count it rather than
+      // silently discarding: see droppedReportCount()'s comment for why
+      // this matters (a dropped report otherwise surfaces as an unrelated-
+      // looking decode failure with no indication of the real cause).
+      self->droppedReportCount_++;
+    }
   }
   // Keep the IN endpoint continuously polled for as long as the device
   // stays attached (mirrors the ~60 reports/sec sustained IN streaming the
