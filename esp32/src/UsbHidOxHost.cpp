@@ -61,19 +61,23 @@ void UsbHidOxHost::begin() {
     return;
   }
 
-  // Pinned to core 0, deliberately separate from usbTask (core 1, see
-  // main.cpp) — this loop's 1ms poll cycle (see its own comment) runs at a
-  // higher priority than usbTask, and neither task is pinned by default,
-  // so the scheduler is free to land both on the same core. If it does,
-  // this tight higher-priority loop can starve usbTask for extended
-  // stretches on a long decode, observed against real hardware as a
-  // download that stalls long enough for the PO-400's own inactivity
-  // timeout to kick in and power it off mid-transfer — not a hardware
-  // fault, a same-core scheduling one. Pinning to separate cores makes
-  // that starvation structurally impossible regardless of how aggressively
-  // this loop polls.
+  // Pinned to core 1 — the SAME core as usbTask (see main.cpp) — not
+  // separated as an earlier fix here had it. That split was meant to stop
+  // this loop's tight, higher-priority poll cycle from starving usbTask,
+  // but real-device retests showed splitting them made no difference to a
+  // reproducible stall inside usbTask's xQueueReceive() wait for the next
+  // report (confirmed, via an esp_rom_printf heartbeat immune to any
+  // Serial/UART issue, to be stuck inside that call itself — a call that's
+  // supposed to be hard-bounded at 3s by FreeRTOS). Since separating cores
+  // didn't help, this instead tests the opposite theory: reportQueue_'s
+  // producer (this task's transfer-completion callback, via
+  // usb_host_client_handle_events() below) and consumer (usbTask's
+  // xQueueReceive) were a cross-core relationship, which can occasionally
+  // hit rarer synchronization edge cases on ESP32's SMP FreeRTOS port than
+  // a same-core one would. Priority stays higher than usbTask's so this
+  // loop still gets scheduled promptly when it has work.
   xTaskCreatePinnedToCore(&UsbHidOxHost::usbHostTaskTrampoline, "usbHostLib",
-                         8192, this, tskIDLE_PRIORITY + 2, nullptr, 0);
+                         8192, this, tskIDLE_PRIORITY + 2, nullptr, 1);
 }
 
 void UsbHidOxHost::usbHostTaskTrampoline(void *arg) {
