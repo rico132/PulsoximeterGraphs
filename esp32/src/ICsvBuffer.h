@@ -36,4 +36,15 @@ public:
   // and only once it has durably stored what it received — see PROTOCOL.md's
   // crash-safety note. Discards everything buffered so far.
   virtual void clear() = 0;
+
+  // Forces any buffered-but-not-yet-durable state out to its backing store.
+  // A no-op for RamCsvBuffer (nothing but the arena itself, always "durable"
+  // for as long as the device stays powered). FileCsvBuffer overrides this:
+  // it keeps its LittleFS file handle open across many appendRow() calls
+  // rather than reopening it every row (see FileCsvBuffer.h's appendFile_
+  // comment for why), syncing only periodically — callers that need every
+  // appended row to actually be visible to a fresh read (e.g. before a BLE
+  // dump) must call this first rather than assuming appendRow() alone
+  // guarantees it.
+  virtual void flush() {}
 };

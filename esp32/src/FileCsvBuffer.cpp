@@ -16,6 +16,12 @@ namespace {
 // dump, e.g. while chasing a link-health issue.
 constexpr uint32_t kDebugRowsToPrint = 10;
 
+// How often appendRow() syncs its kept-open file handle, in rows. Bounds
+// how much a mid-download crash could lose to unsynced writes without
+// paying flush()'s full metadata-commit cost (same underlying cost as
+// close(), see appendFile_'s own comment in the header) on every row.
+constexpr uint32_t kFlushEveryNRows = 200;
+
 // Duplicated from RamCsvBuffer.cpp rather than shared, deliberately: it's a
 // ~10-line formatter and the two buffers otherwise share nothing, so a
 // shared header would only add indirection for this one function.
@@ -77,16 +83,33 @@ bool FileCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
   char row[Config::kMaxCsvRowLength];
   const size_t len = formatCsvRow(epochSeconds, spo2, pulseRate, row,
                                   sizeof(row));
-  File f = LittleFS.open(kBufferPath, "a");
-  if (!f) {
-    return false;
+  // Kept open across calls rather than reopened every row — see
+  // appendFile_'s own comment in the header for the full reasoning. Real
+  // hardware confirmed the open+write+close-per-row version could not get
+  // through appending even half of one record's ~9800 rows before a task
+  // watchdog abort: this loop (StoredRecordDownloader::appendDecodedRecord())
+  // never feeds the watchdog itself, only UsbHidOxHost::readReport() does,
+  // so there was nothing bounding how long LittleFS's per-open/close cost
+  // (which grows with the file's own size) was allowed to run.
+  if (!appendFile_) {
+    appendFile_ = LittleFS.open(kBufferPath, "a");
+    if (!appendFile_) {
+      return false;
+    }
   }
-  const size_t written = f.write(reinterpret_cast<const uint8_t *>(row), len);
-  f.close();
+  const size_t written =
+      appendFile_.write(reinterpret_cast<const uint8_t *>(row), len);
   if (written != len) {
     return false;
   }
   rowCount_++;
+  // Periodic sync, not per-row — see kFlushEveryNRows' comment. flush()
+  // (called unconditionally once the whole download session ends, from
+  // StoredRecordDownloader's ScopedCsvFlush) is what actually guarantees
+  // every row is durable/visible; this just bounds the gap in between.
+  if (rowCount_ % kFlushEveryNRows == 0) {
+    appendFile_.flush();
+  }
   if (rowCount_ <= kDebugRowsToPrint) {
     // esp_rom_printf, not Serial — same reasoning as RamCsvBuffer::appendRow():
     // called back-to-back, once per datum, right after a stored-record
@@ -98,7 +121,21 @@ bool FileCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
   return true;
 }
 
+void FileCsvBuffer::flush() {
+  if (appendFile_) {
+    appendFile_.flush();
+  }
+}
+
 size_t FileCsvBuffer::sizeBytes() const {
+  // Defense in depth: a separately-opened read handle only sees what's
+  // actually been synced to LittleFS, not whatever's sitting in
+  // appendFile_'s own buffered-but-unflushed writes (see its header
+  // comment). Callers are expected to have already called flush() — this
+  // just avoids returning a stale (too-small) size if one hasn't.
+  if (appendFile_) {
+    appendFile_.flush();
+  }
   File f = LittleFS.open(kBufferPath, "r");
   if (!f) {
     return 0;
@@ -117,6 +154,10 @@ void FileCsvBuffer::forEachChunk(size_t chunkSize,
   if (chunkSize == 0) {
     return;
   }
+  // See sizeBytes()'s comment — same reasoning.
+  if (appendFile_) {
+    appendFile_.flush();
+  }
   File f = LittleFS.open(kBufferPath, "r");
   if (!f) {
     return;
@@ -134,6 +175,12 @@ void FileCsvBuffer::forEachChunk(size_t chunkSize,
 }
 
 void FileCsvBuffer::clear() {
+  // Close the kept-open append handle before removing the file out from
+  // under it — the next appendRow() call reopens it lazily, same as after
+  // construction.
+  if (appendFile_) {
+    appendFile_.close();
+  }
   LittleFS.remove(kBufferPath);
   File f = LittleFS.open(kBufferPath, "w");
   if (f) {

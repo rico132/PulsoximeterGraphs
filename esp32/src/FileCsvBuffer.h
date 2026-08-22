@@ -4,6 +4,8 @@
 // rather than refusing to buffer any data at all.
 #pragma once
 
+#include <LittleFS.h>
+
 #include "ICsvBuffer.h"
 
 class FileCsvBuffer : public ICsvBuffer {
@@ -24,8 +26,23 @@ public:
   bool isFull() const override;
   void forEachChunk(size_t chunkSize, const ChunkSink &sink) const override;
   void clear() override;
+  void flush() override;
 
 private:
   static constexpr const char *kBufferPath = "/csvbuf.dat";
   uint32_t rowCount_ = 0;
+  // Opened lazily on the first appendRow() call and kept open across every
+  // subsequent one, rather than reopened per row: LittleFS's open() has to
+  // re-traverse the file's whole block list to find the append position
+  // (cost grows with file size), and close() commits a directory metadata
+  // update that can trigger metadata-block compaction — both easily
+  // O(log file size) or worse. Paying that on every single datum of every
+  // record was, on real hardware, enough to blow past the 30s task
+  // watchdog partway through appending one record's ~9800 rows (see
+  // appendRow()'s own comment). mutable so the read-only accessors
+  // (sizeBytes(), forEachChunk()) can flush it first — defense in depth
+  // against being called before flush() explicitly is, since only
+  // flush()/close() actually make its buffered writes visible to a
+  // separately-opened read handle on the same path.
+  mutable File appendFile_;
 };

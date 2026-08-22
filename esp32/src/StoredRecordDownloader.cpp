@@ -361,6 +361,24 @@ private:
   volatile bool &flag_;
 };
 
+// Flushes `buffer` on every exit path from downloadAndMaybeDelete() —
+// success, a mid-loop failure, or an early return from the initial
+// handshake — so whatever was appended before returning is guaranteed
+// durable/visible to a later BLE dump. FileCsvBuffer only syncs its kept-
+// open LittleFS handle periodically during appendRow() (see its own
+// comment for why), so without this, rows appended after the last periodic
+// sync — including, worst case, an entire short record — would sit
+// unflushed until the *next* download session happened to cross another
+// kFlushEveryNRows boundary. A no-op for RamCsvBuffer.
+class ScopedCsvFlush {
+public:
+  explicit ScopedCsvFlush(ICsvBuffer &buffer) : buffer_(buffer) {}
+  ~ScopedCsvFlush() { buffer_.flush(); }
+
+private:
+  ICsvBuffer &buffer_;
+};
+
 // Proleptic-Gregorian civil-calendar-to-epoch-seconds conversion (Howard
 // Hinnant's days_from_civil algorithm), used instead of mktime()/localtime()
 // deliberately: those depend on the host's configured timezone/DST (as
@@ -949,6 +967,7 @@ bool StoredRecordDownloader::performInitialHandshake() {
 
 bool StoredRecordDownloader::downloadAndMaybeDelete() {
   ScopedFlag inProgress(downloadInProgress_);
+  ScopedCsvFlush csvFlush(csvBuffer_);
   if (!performInitialHandshake()) {
     Serial.println(
         "StoredRecordDownloader: initial handshake failed; device may "
