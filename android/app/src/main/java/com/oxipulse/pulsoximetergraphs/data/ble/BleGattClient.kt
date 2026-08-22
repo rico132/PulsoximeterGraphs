@@ -384,6 +384,17 @@ class BleGattClient(
     }
 
     private fun onDataChunk(value: ByteArray) {
+        // Ignore anything arriving once this transfer has already been fully handled (or hasn't
+        // actually been requested) — BleGattServer now deliberately resends its terminator a few
+        // times (see its own comment) since a single GATT notification has no delivery guarantee,
+        // so a stray extra one reaching the phone after the first is expected, not a bug. Without
+        // this guard it would re-run onTransferComplete() a second time: harmless at the DB level
+        // (ReadingDao inserts REPLACE-on-conflict, keyed by timestamp) but would re-parse the
+        // whole CSV, send a redundant second CLEAR_BUFFER, and re-emit a duplicate Success state
+        // (and the snackbar it triggers) for a transfer the user already saw complete.
+        val state = _syncState.value
+        if (state !is SyncState.RequestingData && state !is SyncState.ReceivingData) return
+
         // Every chunk received is forward progress, so the watchdog resets here too — a large
         // CSV sent in many small notifications must not time out purely because the transfer as
         // a whole runs past SYNC_TIMEOUT_MS, only if it actually stalls.

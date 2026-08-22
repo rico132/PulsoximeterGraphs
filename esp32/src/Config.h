@@ -88,6 +88,20 @@ enum ControlOpcode : uint8_t {
 // containing a single 0x00 byte (CSV text never contains 0x00).
 constexpr uint8_t kEndOfTransferByte = 0x00;
 
+// Real hardware logs showed the *last* notification of an otherwise fully-sent transfer
+// occasionally never reach the phone -- app-side inactivity timeout, not an ESP32-side error --
+// consistent with GATT notify()'s fundamental limitation: it reports whether the packet was
+// queued for transmission, never whether the peer actually received it, and a burst this large
+// ending abruptly is exactly where a queue-drain race is most likely to eat the very last packet
+// specifically. requestDataDump() now pauses briefly before sending the terminator (to let
+// whatever's still queued from the preceding burst actually drain first) and resends it
+// kTerminatorSendCount times rather than once: a duplicate is harmless (BleGattClient.kt's
+// onDataChunk ignores anything arriving once a transfer's already been fully handled) and this
+// directly covers the one packet a 30-second app-side timeout+retry would otherwise be the only
+// recourse for.
+constexpr int kTerminatorSendCount = 3;
+constexpr uint32_t kTerminatorSendDelayMs = 30;
+
 // MTU negotiation: request 503 (500-byte chunks; NimBLE's own ceiling is
 // BLE_ATT_MTU_MAX == 527, see ble_att.h), must also work at the default
 // un-negotiated 23. BLE MTU exchange settles on the *smaller* of what each

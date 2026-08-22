@@ -258,7 +258,13 @@ void BleGattServer::requestDataDump() {
 
   if (connected_) {
     const uint8_t terminator = Config::kEndOfTransferByte;
-    dataChar_->notify(&terminator, 1, connHandle_);
+    // Repeated, each after its own brief pause — see Config::kTerminatorSendCount's comment for
+    // why a single, immediate send of this specific packet has been the one to occasionally go
+    // missing on real hardware.
+    for (int i = 0; i < Config::kTerminatorSendCount && connected_; i++) {
+      vTaskDelay(pdMS_TO_TICKS(Config::kTerminatorSendDelayMs));
+      dataChar_->notify(&terminator, 1, connHandle_);
+    }
     Serial.printf(
         "BleGattServer: data dump finished, sent %u bytes.\n",
         static_cast<unsigned>(totalBytesSent));
