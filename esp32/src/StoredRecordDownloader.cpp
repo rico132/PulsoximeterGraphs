@@ -199,6 +199,21 @@ DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
         store(low);
       }
     }
+    // TEMPORARY DIAGNOSTIC: a second onProgress call, right as this packet's
+    // checksum/sequence/nibble work actually finishes — not just when it was
+    // obtained (the call above, before any of that runs). A task watchdog
+    // abort has now reproduced twice with the *same* packet (239) as the
+    // last one onProgress ever reports, which only proves that packet was
+    // obtained; it says nothing about whether checksumOk(), the sequence
+    // check, or this nibble loop for that exact packet ever completed. This
+    // call, sharing the same (packetsRead, remaining) pair, tells them
+    // apart: if it fires, packet N's own processing finished and whatever
+    // blocks is back inside PacketReassembler obtaining packet N+1; if the
+    // line above appears but this one never does, the block is inside this
+    // packet's own checksum/sequence/nibble work above.
+    if (onProgress && packetsRead % kProgressLogInterval == 0) {
+      onProgress(packetsRead, remaining);
+    }
   }
   return DecodeResult::Ok;
 }
