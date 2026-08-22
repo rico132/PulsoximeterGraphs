@@ -832,16 +832,31 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
     // failing loudly, since each individual record download can succeed on
     // its own terms and never trips a transport-level timeout.
     constexpr uint32_t kMaxAutoRecordsPerSession = 64;
-    StoredRecordDecode::AutoState autoState;
+
+    // Phase 1: enumerate every record's metadata first, back-to-back, with
+    // no datum request in between — mirrors pulseoxdl's own process_stored()
+    // (a metadata-only loop via set_record_metadata(), completed in full
+    // before any extract_datums() call) exactly. Interleaving a datum
+    // download between GET_RECORD_METADATA_AUTO calls — this loop's
+    // previous structure — was confirmed against real hardware to corrupt
+    // the very first record's datum stream (sequence numbers silently
+    // missing partway through) even though every metadata read itself
+    // decoded correctly; the device evidently keeps some internal
+    // enumeration cursor that a datum request disturbs mid-listing.
+    struct AutoRecordMeta {
+      uint8_t recordIndex;
+      int64_t startEpoch;
+      uint32_t datumCount;
+    };
+    std::vector<AutoRecordMeta> records;
     bool isLast = false;
-    uint32_t recordsDownloaded = 0;
     while (!isLast) {
-      if (recordsDownloaded >= kMaxAutoRecordsPerSession) {
+      if (records.size() >= kMaxAutoRecordsPerSession) {
         Serial.printf(
-            "StoredRecordDownloader: aborting — downloaded %u Auto "
+            "StoredRecordDownloader: aborting — enumerated %u Auto "
             "records without the device ever reporting 'last record'; "
             "likely a metadata-format mismatch.\n",
-            recordsDownloaded);
+            static_cast<unsigned>(records.size()));
         return false;
       }
       uint8_t meta[21] = {0};
@@ -871,14 +886,33 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
           civilToEpochSeconds(year, month, day, hour, minute, second);
 
       Serial.printf(
-          "StoredRecordDownloader: downloading Auto record #%u — "
-          "%04d-%02d-%02d %02d:%02d:%02d, %u datums...\n",
+          "StoredRecordDownloader: found Auto record #%u — "
+          "%04d-%02d-%02d %02d:%02d:%02d, %u datums.\n",
           recordIndex, year, month, day, hour, minute, second, datumCount);
-      if (!downloadOneAutoRecord(recordIndex, startEpoch, datumCount,
-                                 autoState)) {
+      records.push_back({recordIndex, startEpoch, datumCount});
+    }
+    Serial.printf(
+        "StoredRecordDownloader: %u Auto record(s) enumerated; downloading "
+        "each now.\n",
+        static_cast<unsigned>(records.size()));
+
+    // Phase 2: now that enumeration is complete, download each record's
+    // datums. autoState persists across records deliberately (see its
+    // comment) — this is the same "download session" pulseoxdl treats it
+    // as, just with metadata collection and downloading no longer
+    // interleaved.
+    StoredRecordDecode::AutoState autoState;
+    uint32_t recordsDownloaded = 0;
+    for (const AutoRecordMeta &record : records) {
+      Serial.printf(
+          "StoredRecordDownloader: downloading Auto record #%u (%u "
+          "datums)...\n",
+          record.recordIndex, record.datumCount);
+      if (!downloadOneAutoRecord(record.recordIndex, record.startEpoch,
+                                 record.datumCount, autoState)) {
         Serial.printf(
             "StoredRecordDownloader: failed downloading Auto record #%u.\n",
-            recordIndex);
+            record.recordIndex);
         return false;
       }
       recordsDownloaded++;

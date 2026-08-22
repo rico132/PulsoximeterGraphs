@@ -136,7 +136,15 @@ packets.
 **Stored records** (Auto/Manual mode, device's own onboard memory):
 - `STORED_PRESENT`: write `0x9f, 0x1f` → response indicates presence + Auto-vs-Manual mode.
 - `GET_RECORD_METADATA_AUTO`: `0x9c, 0x01, 0x1d`. `GET_RECORD_METADATA_MANUAL`: `0xa0, 0x00, 0x20`.
-  Gives start time (`%y%m%d%H%M%S`) and datum count (3×7-bit bytes, LSB order).
+  Gives start time (`%y%m%d%H%M%S`) and datum count (3×7-bit bytes, LSB order). For Auto mode
+  with multiple stored records, send this **repeatedly, back-to-back, for every record until
+  the response's "is last" byte is set — before requesting any record's datums**. Confirmed
+  against real hardware: interleaving a datum-download request between
+  `GET_RECORD_METADATA_AUTO` calls (i.e. enumerate-then-download one record at a time) corrupts
+  the very first record's datum stream, even though its own metadata decodes correctly — the
+  device evidently keeps an internal enumeration cursor that a datum request disturbs mid-
+  listing. Mirrors pulseoxdl's own `process_stored()`, which completes its whole
+  `set_record_metadata()` enumeration loop before any `extract_datums()` call.
 - Datum download + decode is bit-packed (2 datums/byte for Auto with carry-flag handling;
   delta-encoded nibbles for Manual with artifact/finger-out sentinels) — see
   `esp32/src/StoredRecordDownloader.cpp` for the ported implementation and the reference
