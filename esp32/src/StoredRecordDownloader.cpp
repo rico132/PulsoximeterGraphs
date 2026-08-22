@@ -320,6 +320,20 @@ int64_t civilToEpochSeconds(int year, int month, int day, int hour,
   return days * 86400LL + hour * 3600LL + minute * 60LL + second;
 }
 
+// Hex-dumps one HID report (or a command's meaningful prefix) to Serial, so
+// every exchange with the PO-400 is visible while chasing a protocol
+// mismatch — compare directly against a known-good capture (e.g. from
+// pulseoxdl itself, run with its DEBUG_WRITE/DEBUG build flags) byte for
+// byte.
+void logHex(const char *label, const uint8_t *buf, size_t len) {
+  Serial.printf("StoredRecordDownloader: %s (%u B):", label,
+               static_cast<unsigned>(len));
+  for (size_t i = 0; i < len; i++) {
+    Serial.printf(" %02X", buf[i]);
+  }
+  Serial.println();
+}
+
 // For logging a decode failure's specific reason (distinguishing "the device
 // stopped responding" from "the device kept responding but never converged,"
 // which points at a datumCount/geometry mismatch rather than a transport
@@ -390,20 +404,33 @@ bool StoredRecordDownloader::sendExchange(const uint8_t *writeData,
     }
     out[writeChecksumLen - 1] = sum & 0x7f;
   }
+  // writeLen (not sizeof(out)) — the rest is zero-padding, not interesting.
+  logHex("TX", out, writeLen);
   if (!usbHost_.writeReport(out, sizeof(out))) {
+    Serial.println(
+        "StoredRecordDownloader: TX failed (writeReport returned false) — "
+        "device likely detached or a USB OUT-transfer error.");
     return false;
   }
 
   uint8_t in[64] = {0};
   if (!usbHost_.readReport(in, sizeof(in), /*timeoutMs=*/3000)) {
+    Serial.println(
+        "StoredRecordDownloader: RX timed out after 3000ms waiting for a "
+        "response.");
     return false;
   }
+  logHex("RX", in, sizeof(in));
   if (readChecksumLen > 0) {
     uint8_t sum = 0;
     for (uint8_t i = 0; i + 1 < readChecksumLen; i++) {
       sum = static_cast<uint8_t>(sum + in[i]);
     }
     if ((sum & 0x7f) != in[readChecksumLen - 1]) {
+      Serial.printf(
+          "StoredRecordDownloader: RX checksum mismatch — computed 0x%02X, "
+          "device sent 0x%02X at byte %u.\n",
+          sum & 0x7f, in[readChecksumLen - 1], readChecksumLen - 1);
       return false;
     }
   }
@@ -425,7 +452,14 @@ bool StoredRecordDownloader::sendRequest(const uint8_t *writeData,
     }
     out[writeChecksumLen - 1] = sum & 0x7f;
   }
-  return usbHost_.writeReport(out, sizeof(out));
+  logHex("TX (request, no response read here)", out, writeLen);
+  if (!usbHost_.writeReport(out, sizeof(out))) {
+    Serial.println(
+        "StoredRecordDownloader: TX failed (writeReport returned false) — "
+        "device likely detached or a USB OUT-transfer error.");
+    return false;
+  }
+  return true;
 }
 
 void StoredRecordDownloader::appendDecodedRecord(
@@ -548,6 +582,7 @@ bool StoredRecordDownloader::performInitialHandshake() {
   Serial.println(
       "StoredRecordDownloader: initial handshake — stopping the device's "
       "default data stream...");
+  Serial.println("StoredRecordDownloader: >> STOP_SENDING_DATA");
   if (!sendExchange(Config::kCmdStopSendingData,
                     sizeof(Config::kCmdStopSendingData),
                     /*writeChecksumLen=*/0, nullptr, 0,
@@ -556,16 +591,22 @@ bool StoredRecordDownloader::performInitialHandshake() {
         "StoredRecordDownloader: STOP_SENDING_DATA failed.");
     return false;
   }
+  Serial.println("StoredRecordDownloader: >> handshake status query 1/2");
   if (!sendExchange(Config::kCmdHandshakeUnknown0,
                     sizeof(Config::kCmdHandshakeUnknown0),
                     /*writeChecksumLen=*/0, nullptr, 0,
-                    /*readChecksumLen=*/8) ||
-      !sendExchange(Config::kCmdHandshakeUnknown1,
+                    /*readChecksumLen=*/8)) {
+    Serial.println(
+        "StoredRecordDownloader: handshake status query 1/2 failed.");
+    return false;
+  }
+  Serial.println("StoredRecordDownloader: >> handshake status query 2/2");
+  if (!sendExchange(Config::kCmdHandshakeUnknown1,
                     sizeof(Config::kCmdHandshakeUnknown1),
                     /*writeChecksumLen=*/0, nullptr, 0,
                     /*readChecksumLen=*/2)) {
     Serial.println(
-        "StoredRecordDownloader: handshake status query failed.");
+        "StoredRecordDownloader: handshake status query 2/2 failed.");
     return false;
   }
 
@@ -588,6 +629,8 @@ bool StoredRecordDownloader::performInitialHandshake() {
     syncTime[4] = static_cast<uint8_t>(tmVal.tm_hour);
     syncTime[5] = static_cast<uint8_t>(tmVal.tm_min);
     syncTime[6] = static_cast<uint8_t>(tmVal.tm_sec);
+    Serial.println(
+        "StoredRecordDownloader: >> SYNCHRONIZE_DEVICE_DATE_AND_TIME");
     if (!sendExchange(syncTime, sizeof(syncTime), sizeof(syncTime), nullptr,
                       0, /*readChecksumLen=*/3)) {
       Serial.println(
@@ -600,16 +643,22 @@ bool StoredRecordDownloader::performInitialHandshake() {
         "hasn't sent SET_TIME yet.");
   }
 
+  Serial.println("StoredRecordDownloader: >> USER_NAME");
   if (!sendExchange(Config::kCmdUserName, sizeof(Config::kCmdUserName),
                     /*writeChecksumLen=*/0, nullptr, 0,
-                    /*readChecksumLen=*/10) ||
-      !sendExchange(Config::kCmdModelName, sizeof(Config::kCmdModelName),
-                    /*writeChecksumLen=*/0, nullptr, 0,
                     /*readChecksumLen=*/10)) {
-    Serial.println(
-        "StoredRecordDownloader: device identity query failed.");
+    Serial.println("StoredRecordDownloader: USER_NAME query failed.");
     return false;
   }
+  Serial.println("StoredRecordDownloader: >> MODEL_NAME");
+  if (!sendExchange(Config::kCmdModelName, sizeof(Config::kCmdModelName),
+                    /*writeChecksumLen=*/0, nullptr, 0,
+                    /*readChecksumLen=*/10)) {
+    Serial.println("StoredRecordDownloader: MODEL_NAME query failed.");
+    return false;
+  }
+  Serial.println(
+      "StoredRecordDownloader: initial handshake complete.");
   return true;
 }
 
@@ -623,6 +672,7 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
 
   Serial.println(
       "StoredRecordDownloader: checking PO-400 for stored records...");
+  Serial.println("StoredRecordDownloader: >> STORED_PRESENT");
   uint8_t presentResp[8] = {0};
   if (!sendExchange(Config::kCmdStoredPresent,
                     sizeof(Config::kCmdStoredPresent), /*writeChecksumLen=*/0,
@@ -665,6 +715,8 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
         return false;
       }
       uint8_t meta[21] = {0};
+      Serial.println(
+          "StoredRecordDownloader: >> GET_RECORD_METADATA_AUTO");
       if (!sendExchange(Config::kCmdGetRecordMetadataAuto,
                         sizeof(Config::kCmdGetRecordMetadataAuto),
                         /*writeChecksumLen=*/0, meta, sizeof(meta),
@@ -715,6 +767,7 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
     }
   } else {
     uint8_t meta[14] = {0};
+    Serial.println("StoredRecordDownloader: >> GET_RECORD_METADATA_MANUAL");
     if (!sendExchange(Config::kCmdGetRecordMetadataManual,
                       sizeof(Config::kCmdGetRecordMetadataManual),
                       /*writeChecksumLen=*/0, meta, sizeof(meta),
