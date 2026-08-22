@@ -312,6 +312,8 @@ DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
 
 #include <ctime>
 
+#include <esp_rom_sys.h>
+
 #include "Config.h"
 
 namespace {
@@ -435,6 +437,18 @@ class UsbHidReportSource : public StoredRecordDecode::HidReportSource {
 public:
   explicit UsbHidReportSource(UsbHidOxHost &host) : host_(host) {}
   bool readReport(uint8_t report[64]) override {
+    // esp_rom_printf, not Serial: a task watchdog panic during the last
+    // real-device test showed usbTask genuinely *blocked* (CPU 1 idle, not
+    // running) at the exact same stall point every run, with BLE fully
+    // ruled out as a factor. Serial's underlying UART write can itself
+    // block on a FreeRTOS primitive if its TX ring buffer fills and the
+    // draining interrupt stalls — which would look exactly like this: the
+    // task blocked on the *next* Serial call, not on anything in the
+    // decode logic. esp_rom_printf busy-waits directly on the UART
+    // hardware, bypassing that driver/ISR entirely, so if progress
+    // continues past the usual stall point once this is in place, that
+    // confirms Serial itself was the actual blocking point.
+    esp_rom_printf("RR#%lu\n", reportsRead_ + 1);
     const unsigned long startMs = millis();
     const bool ok = host_.readReport(report, 64, /*timeoutMs=*/3000);
     const unsigned long elapsedMs = millis() - startMs;
