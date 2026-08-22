@@ -6,6 +6,7 @@
 
 #include <Arduino.h>
 #include <esp_heap_caps.h>
+#include <esp_rom_sys.h>
 
 namespace {
 // How many of the very first rows received from the PO-400 (live-stream or
@@ -74,8 +75,17 @@ bool RamCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
   writeOffset_ += len;
   rowCount_++;
   if (rowCount_ <= kDebugRowsToPrint) {
-    Serial.printf("CsvBuffer: row %u: ", rowCount_);
-    Serial.write(reinterpret_cast<const uint8_t *>(row), len);
+    // esp_rom_printf, not Serial: appendRow() is called back-to-back, once
+    // per datum, right after a stored-record decode finishes — e.g. from
+    // StoredRecordDownloader::appendDecodedRecord()'s tight loop, on
+    // usbTask. Ten consecutive blocking Serial writes with no pacing in
+    // between is exactly the UART TX-ring-buffer-starvation hazard already
+    // chased down (and fixed) throughout StoredRecordDownloader.cpp — this
+    // call site just lived in a different file and was missed. `row` is
+    // formatCsvRow()'s snprintf() output, so it's already a valid
+    // null-terminated C string (including its own trailing "\r\n"); no
+    // separate Serial.write() needed.
+    esp_rom_printf("CsvBuffer: row %u: %s", rowCount_, row);
   }
   return true;
 }

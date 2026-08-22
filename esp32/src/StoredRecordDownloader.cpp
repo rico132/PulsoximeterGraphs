@@ -93,26 +93,16 @@ uint32_t packetBudget(uint32_t datumCount) {
 // along a decode is — see ProgressSink's comment in the header for why this
 // indirection exists instead of calling Serial directly here.
 //
-// TEMPORARY DIAGNOSTIC: 1, not 20. Real-hardware testing reproduced the
-// task watchdog abort again at the exact same report count (RR#224) even
-// after every Serial call reachable from the per-report/per-packet loop was
-// moved to esp_rom_printf — which rules out UART TX starvation (esp_rom_printf
-// busy-waits directly on the hardware and cannot block that way) and means
-// the earlier "RR#N returned" bracket around host_.readReport() wasn't fine
-// enough: it can only prove which *report* the last successful read was for,
-// not which *packet* (up to ~64/kAutoPacketLen ≈ 2.13 packets can be decoded
-// from staged bytes between two physical reads, all inside decodeAuto/
-// PacketReassembler — pure, native-tested code that can't itself carry a
-// Serial/esp_rom_printf call, see this file's header comment). Dropping this
-// to 1 makes onProgress fire every packet instead of every 20th, closing
-// that gap: whichever packet number is the last one logged before the next
-// abort pinpoints whether execution dies inside PacketReassembler (no log
-// for the packet after the last one shown) or inside decodeAuto's own
-// checksum/sequence/nibble work for a specific packet (that packet's own
-// progress line appears, but processing never returns from it). Revert to
-// 20 once the actual blocking statement is found — this is verbose by
-// design for one more diagnostic run, not a permanent setting.
-constexpr uint32_t kProgressLogInterval = 1;
+// Was dropped to 1 for one diagnostic run after a task watchdog abort kept
+// reproducing at the exact same report count even with every Serial call in
+// this file's own hot loop moved to esp_rom_printf. That per-packet
+// resolution is what pinned the real cause down to a call site outside this
+// file entirely: RamCsvBuffer::appendRow()/FileCsvBuffer::appendRow()'s
+// first-10-rows debug echo, called from appendDecodedRecord() right after
+// this exact decode finishes, was still using blocking Serial calls
+// back-to-back with no pacing — see those files' appendRow() comments. Back
+// to 20 now that that's fixed.
+constexpr uint32_t kProgressLogInterval = 20;
 
 } // namespace
 

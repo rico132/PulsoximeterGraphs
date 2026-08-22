@@ -5,6 +5,7 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <esp_rom_sys.h>
 
 #include "Config.h"
 
@@ -87,8 +88,12 @@ bool FileCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
   }
   rowCount_++;
   if (rowCount_ <= kDebugRowsToPrint) {
-    Serial.printf("CsvBuffer: row %u: ", rowCount_);
-    Serial.write(reinterpret_cast<const uint8_t *>(row), len);
+    // esp_rom_printf, not Serial — same reasoning as RamCsvBuffer::appendRow():
+    // called back-to-back, once per datum, right after a stored-record
+    // decode finishes, on usbTask. `row` is formatCsvRow()'s snprintf()
+    // output, so it's already a valid null-terminated C string (including
+    // its own trailing "\r\n").
+    esp_rom_printf("CsvBuffer: row %u: %s", rowCount_, row);
   }
   return true;
 }
