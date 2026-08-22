@@ -50,17 +50,43 @@ class LiveMeasurementListener : public OxProtocolParserListener {
 public:
   void onMeasurement(const OxMeasurement &measurement) override {
     if (!g_clockSync.hasBeenSet()) {
+      // Logged once per attach (not once per measurement) so a phone that
+      // hasn't sent SET_TIME yet doesn't flood the console at the live
+      // stream's report rate.
+      if (!warnedNoClock_) {
+        warnedNoClock_ = true;
+        Serial.println(
+            "LiveMeasurementListener: dropping measurements — phone hasn't "
+            "sent SET_TIME yet.");
+      }
       return;
     }
+    warnedNoClock_ = false;
+
     g_csvBuffer->appendRow(g_clockSync.now(), measurement.spo2,
                           measurement.pulseRate);
+
+    // Throttled heartbeat so you can see live data is flowing without
+    // flooding the console at the device's native report rate.
+    const unsigned long nowMs = millis();
+    if (nowMs - lastLogMs_ >= kLogIntervalMs) {
+      lastLogMs_ = nowMs;
+      Serial.printf("Live: SpO2=%u%% pulse=%u bpm\n", measurement.spo2,
+                   measurement.pulseRate);
+    }
   }
+
+private:
+  static constexpr unsigned long kLogIntervalMs = 2000;
+  unsigned long lastLogMs_ = 0;
+  bool warnedNoClock_ = false;
 };
 
 LiveMeasurementListener g_liveListener;
 OxProtocolParser g_liveParser(g_liveListener);
 
 void runLiveStreamLoop() {
+  Serial.println("UsbTask: starting live-stream loop.");
   g_usbHost.writeReport(Config::kCmdStartAmplitudes,
                        sizeof(Config::kCmdStartAmplitudes));
   g_usbHost.writeReport(Config::kCmdStartMeasurements,
@@ -79,6 +105,7 @@ void runLiveStreamLoop() {
   }
 
   unsigned long lastKeepaliveMs = millis();
+  unsigned long lastDiagMs = millis();
   while (g_usbHost.isAttached()) {
     if (g_usbHost.readReport(report, sizeof(report), 200)) {
       g_liveParser.parseReport(report, sizeof(report));
@@ -88,9 +115,21 @@ void runLiveStreamLoop() {
                            sizeof(Config::kCmdKeepalive));
       lastKeepaliveMs = millis();
     }
+    // Periodic link-health dump: if measurementCount stays at 0, or
+    // resyncCount keeps climbing, that points at a wiring/protocol problem
+    // even when no single log line above would have caught it.
+    if (millis() - lastDiagMs >= 10000) {
+      lastDiagMs = millis();
+      Serial.printf(
+          "UsbTask: link stats — measurements=%u fingerOut=%u "
+          "waveform=%u resync=%u\n",
+          g_liveParser.measurementCount(), g_liveParser.fingerOutCount(),
+          g_liveParser.waveformCount(), g_liveParser.resyncCount());
+    }
   }
 
   g_usbHost.writeReport(Config::kCmdStopLive, sizeof(Config::kCmdStopLive));
+  Serial.println("UsbTask: live-stream loop ended (device detached).");
 }
 
 void usbTask(void * /*param*/) {

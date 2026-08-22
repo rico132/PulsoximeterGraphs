@@ -159,10 +159,16 @@ void UsbHidOxHost::handleNewDevice(uint8_t address) {
       deviceDesc->idProduct != Config::kUsbProductId) {
     // Not the PO-400 — ignore (some other USB device on the same host port,
     // e.g. during the mandatory hardware spike's exploratory testing).
+    Serial.printf(
+        "UsbHidOxHost: ignoring USB device VID:PID %04X:%04X (not a "
+        "PO-400).\n",
+        deviceDesc->idVendor, deviceDesc->idProduct);
     usb_host_device_close(clientHandle_, devHdl);
     return;
   }
 
+  Serial.println(
+      "UsbHidOxHost: matching VID:PID device attached — enumerating...");
   deviceHandle_ = devHdl;
 
   if (!discoverHidEndpoints()) {
@@ -207,6 +213,7 @@ void UsbHidOxHost::handleDeviceGone(usb_device_handle_t deviceHandle) {
   if (deviceHandle != deviceHandle_) {
     return;
   }
+  Serial.println("UsbHidOxHost: PO-400 device-gone event received.");
   attached_ = false;
   if (detachCallback_) {
     detachCallback_();

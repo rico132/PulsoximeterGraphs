@@ -15,16 +15,21 @@ void BleGattServer::ServerCallbacks::onConnect(NimBLEServer * /*server*/,
                                                NimBLEConnInfo &connInfo) {
   owner_.connHandle_ = connInfo.getConnHandle();
   owner_.connected_ = true;
+  Serial.printf("BleGattServer: phone connected (handle=%u).\n",
+               connInfo.getConnHandle());
 }
 
 void BleGattServer::ServerCallbacks::onDisconnect(NimBLEServer * /*server*/,
                                                   NimBLEConnInfo & /*connInfo*/,
-                                                  int /*reason*/) {
+                                                  int reason) {
   // Per the plan: if the phone disconnects mid REQUEST_DATA dump, just stop
   // — since only CLEAR_BUFFER discards data, the next REQUEST_DATA naturally
   // resumes from the same unclaimed buffer, so no resend/ack bookkeeping is
   // needed here.
   owner_.connected_ = false;
+  Serial.printf(
+      "BleGattServer: phone disconnected (reason=%d) — advertising again.\n",
+      reason);
   NimBLEDevice::startAdvertising();
 }
 
@@ -75,6 +80,8 @@ void BleGattServer::begin() {
   requestDataSignal_ = xSemaphoreCreateBinary();
   xTaskCreate(&BleGattServer::dataSendTaskTrampoline, "bleDataSend",
              8192, this, tskIDLE_PRIORITY + 1, nullptr);
+
+  Serial.printf("BleGattServer: advertising as '%s'.\n", Config::kDeviceName);
 }
 
 void BleGattServer::dataSendTaskTrampoline(void *param) {
@@ -96,6 +103,7 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
   const uint8_t opcode = data[0];
   switch (opcode) {
   case Config::kOpRequestData:
+    Serial.println("BleGattServer: REQUEST_DATA received.");
     // Signal the dedicated send task rather than dumping here — this
     // callback runs on the NimBLE host task and must return quickly.
     xSemaphoreGive(requestDataSignal_);
@@ -103,6 +111,8 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
 
   case Config::kOpSetTime: {
     if (length < 9) {
+      Serial.println("BleGattServer: SET_TIME received but too short — "
+                     "ignoring.");
       break;
     }
     int64_t epochSeconds = 0;
@@ -110,16 +120,22 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
       epochSeconds |= static_cast<int64_t>(data[1 + i]) << (8 * i);
     }
     clockSync_.setTime(epochSeconds);
+    Serial.printf("BleGattServer: SET_TIME received, epoch=%lld.\n",
+                 static_cast<long long>(epochSeconds));
     break;
   }
 
   case Config::kOpClearBuffer:
     csvBuffer_.clear();
+    Serial.println("BleGattServer: CLEAR_BUFFER received — buffer wiped.");
     break;
 
   case Config::kOpSetTestMode:
     if (length >= 2) {
       storedRecordDownloader_.setTestMode(data[1] != 0);
+      Serial.printf("BleGattServer: SET_TEST_MODE received — test mode now "
+                   "%s.\n",
+                   data[1] != 0 ? "ON" : "OFF");
     }
     break;
 
@@ -142,15 +158,22 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
       break;
     }
     std::string pass(reinterpret_cast<const char *>(data + pos), passLen);
+    // Deliberately never log the password — only the SSID and its length.
+    Serial.printf("BleGattServer: SET_WIFI_CREDENTIALS received, ssid='%s' "
+                 "(password %u bytes).\n",
+                 ssid.c_str(), passLen);
     otaManager_.setWifiCredentials(ssid, pass);
     break;
   }
 
   case Config::kOpEnterOtaMode:
+    Serial.println("BleGattServer: ENTER_OTA_MODE received.");
     otaManager_.enterOtaMode();
     break;
 
   default:
+    Serial.printf("BleGattServer: unknown control opcode 0x%02X ignored.\n",
+                 opcode);
     break;
   }
 }
@@ -169,7 +192,14 @@ void BleGattServer::requestDataDump() {
     chunkSize = 20;
   }
 
-  csvBuffer_.forEachChunk(chunkSize, [this](const uint8_t *data, size_t len) {
+  Serial.printf(
+      "BleGattServer: starting data dump (mtu=%u, chunkSize=%u bytes).\n",
+      mtu, static_cast<unsigned>(chunkSize));
+
+  size_t totalBytesSent = 0;
+  csvBuffer_.forEachChunk(chunkSize, [this,
+                                     &totalBytesSent](const uint8_t *data,
+                                                      size_t len) {
     if (!connected_) {
       return; // Phone disconnected mid-dump: just stop (see onDisconnect).
     }
@@ -179,10 +209,17 @@ void BleGattServer::requestDataDump() {
       vTaskDelay(pdMS_TO_TICKS(10));
       attempts++;
     }
+    totalBytesSent += len;
   });
 
   if (connected_) {
     const uint8_t terminator = Config::kEndOfTransferByte;
     dataChar_->notify(&terminator, 1, connHandle_);
+    Serial.printf(
+        "BleGattServer: data dump finished, sent %u bytes.\n",
+        static_cast<unsigned>(totalBytesSent));
+  } else {
+    Serial.println(
+        "BleGattServer: data dump aborted — phone disconnected mid-dump.");
   }
 }
