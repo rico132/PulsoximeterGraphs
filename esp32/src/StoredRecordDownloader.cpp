@@ -98,7 +98,8 @@ constexpr uint32_t kProgressLogInterval = 20;
 
 DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
                         AutoState &state, std::vector<uint8_t> &out,
-                        const ProgressSink &onProgress) {
+                        const ProgressSink &onProgress,
+                        const FailureSink &onFailure) {
   out.clear();
   if (datumCount == 0) {
     return DecodeResult::Ok;
@@ -134,11 +135,19 @@ DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
       onProgress(packetsRead, remaining);
     }
     if (!checksumOk(packet, kAutoDatumsEnd)) {
+      if (onFailure) {
+        onFailure(packet, kAutoPacketLen, DecodeResult::ChecksumError,
+                 packetsRead - 1);
+      }
       return DecodeResult::ChecksumError;
     }
     const uint16_t gotSeq = static_cast<uint16_t>(
         packet[kAutoSeqLsbIdx] + (packet[kAutoSeqMsbIdx] << 7));
     if (expectedSeq != gotSeq) {
+      if (onFailure) {
+        onFailure(packet, kAutoPacketLen, DecodeResult::SequenceError,
+                 packetsRead - 1);
+      }
       return DecodeResult::SequenceError;
     }
     expectedSeq++;
@@ -181,7 +190,8 @@ DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
 DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
                           uint8_t artifactValue, ManualState &state,
                           std::vector<uint8_t> &out,
-                          const ProgressSink &onProgress) {
+                          const ProgressSink &onProgress,
+                          const FailureSink &onFailure) {
   out.clear();
   if (datumCount == 0) {
     return DecodeResult::Ok;
@@ -219,11 +229,19 @@ DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
       onProgress(packetsRead, remaining);
     }
     if (!checksumOk(packet, kManualDatumsEnd)) {
+      if (onFailure) {
+        onFailure(packet, kManualPacketLen, DecodeResult::ChecksumError,
+                 packetsRead - 1);
+      }
       return DecodeResult::ChecksumError;
     }
     const uint16_t gotSeq = static_cast<uint16_t>(
         packet[kManualSeqLsbIdx] + (packet[kManualSeqMsbIdx] << 7));
     if (expectedSeq != gotSeq) {
+      if (onFailure) {
+        onFailure(packet, kManualPacketLen, DecodeResult::SequenceError,
+                 packetsRead - 1);
+      }
       return DecodeResult::SequenceError;
     }
     expectedSeq++;
@@ -326,12 +344,23 @@ int64_t civilToEpochSeconds(int year, int month, int day, int hour,
 // pulseoxdl itself, run with its DEBUG_WRITE/DEBUG build flags) byte for
 // byte.
 void logHex(const char *label, const uint8_t *buf, size_t len) {
-  Serial.printf("StoredRecordDownloader: %s (%u B):", label,
-               static_cast<unsigned>(len));
-  for (size_t i = 0; i < len; i++) {
-    Serial.printf(" %02X", buf[i]);
+  // Builds the whole line and emits it with a single Serial call, rather
+  // than one Serial.printf() per byte as this originally did: at 115200
+  // baud, ~65 separate short writes for one 64-byte report is slow enough
+  // to risk falling behind the device's report rate and silently dropping
+  // reports out of UsbHidOxHost's non-blocking report queue — which would
+  // itself look like a checksum/sequence failure in the decoded data,
+  // indistinguishable from a real protocol mismatch without this fix.
+  char line[320];
+  int pos = snprintf(line, sizeof(line), "StoredRecordDownloader: %s (%u B):",
+                     label, static_cast<unsigned>(len));
+  for (size_t i = 0; i < len && pos > 0 &&
+                    static_cast<size_t>(pos) + 4 < sizeof(line);
+      i++) {
+    pos += snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos),
+                    " %02X", buf[i]);
   }
-  Serial.println();
+  Serial.println(line);
 }
 
 // For logging a decode failure's specific reason (distinguishing "the device
@@ -353,6 +382,31 @@ const char *decodeResultName(StoredRecordDecode::DecodeResult result) {
           "count never reached 0 — likely a metadata/geometry mismatch)";
   }
   return "Unknown";
+}
+
+// Prints the exact packet decodeAuto/decodeManual failed on, plus the
+// checksum/sequence math behind that verdict — the authoritative diagnostic
+// for a Checksum/SequenceError, since it's computed directly from the
+// packet decodeAuto/decodeManual actually saw rather than reconstructed
+// from a separate running hex dump of raw 64-byte reports (which a packet
+// can span more than one of, and which is easy to mangle in transit).
+void logDecodeFailure(const char *context, const uint8_t *packet,
+                      uint8_t packetLen, StoredRecordDecode::DecodeResult result,
+                      uint32_t packetIndex, uint8_t checksumEnd,
+                      uint8_t seqLsbIdx, uint8_t seqMsbIdx) {
+  Serial.printf("StoredRecordDownloader: %s — packet #%u failed (%s):\n",
+               context, packetIndex, decodeResultName(result));
+  logHex("  offending packet", packet, packetLen);
+  uint8_t sum = 0;
+  for (uint8_t i = 0; i < checksumEnd; i++) {
+    sum = static_cast<uint8_t>(sum + packet[i]);
+  }
+  const uint16_t gotSeq = static_cast<uint16_t>(
+      packet[seqLsbIdx] + (packet[seqMsbIdx] << 7));
+  Serial.printf(
+      "StoredRecordDownloader:   computed checksum 0x%02X vs packet's byte "
+      "0x%02X; packet's sequence field = %u (expected %u).\n",
+      sum & 0x7f, packet[checksumEnd], gotSeq, packetIndex);
 }
 
 // Adapts UsbHidOxHost's blocking readReport() to the pure decode namespace's
@@ -509,6 +563,20 @@ bool StoredRecordDownloader::downloadOneAutoRecord(
                     recordIndex, measurement, packetsRead, remaining);
     };
   };
+  auto logFailure = [recordIndex](const char *measurement) {
+    return [recordIndex, measurement](const uint8_t *packet,
+                                      uint8_t packetLen,
+                                      StoredRecordDecode::DecodeResult result,
+                                      uint32_t packetIndex) {
+      char context[48];
+      snprintf(context, sizeof(context), "Auto record #%u %s decode",
+              recordIndex, measurement);
+      logDecodeFailure(context, packet, packetLen, result, packetIndex,
+                       StoredRecordDecode::kAutoDatumsEnd,
+                       StoredRecordDecode::kAutoSeqLsbIdx,
+                       StoredRecordDecode::kAutoSeqMsbIdx);
+    };
+  };
 
   requestBuf[Config::kAutoRequestMeasurementIndex] = Config::kAutoMeasurementSpo2;
   if (!sendRequest(requestBuf, sizeof(requestBuf), sizeof(requestBuf))) {
@@ -516,7 +584,8 @@ bool StoredRecordDownloader::downloadOneAutoRecord(
   }
   std::vector<uint8_t> spo2;
   StoredRecordDecode::DecodeResult result = StoredRecordDecode::decodeAuto(
-      reportSource, datumCount, autoState, spo2, logProgress("SpO2"));
+      reportSource, datumCount, autoState, spo2, logProgress("SpO2"),
+      logFailure("SpO2"));
   if (result != StoredRecordDecode::DecodeResult::Ok) {
     Serial.printf("StoredRecordDownloader: Auto record #%u SpO2 decode "
                  "failed: %s.\n",
@@ -530,7 +599,8 @@ bool StoredRecordDownloader::downloadOneAutoRecord(
   }
   std::vector<uint8_t> pr;
   result = StoredRecordDecode::decodeAuto(reportSource, datumCount, autoState,
-                                          pr, logProgress("pulse-rate"));
+                                          pr, logProgress("pulse-rate"),
+                                          logFailure("pulse-rate"));
   if (result != StoredRecordDecode::DecodeResult::Ok) {
     Serial.printf("StoredRecordDownloader: Auto record #%u pulse-rate "
                  "decode failed: %s.\n",
@@ -558,6 +628,19 @@ bool StoredRecordDownloader::downloadOneManualRecord(
                     measurement, packetsRead, remaining);
     };
   };
+  auto logFailure = [](const char *measurement) {
+    return [measurement](const uint8_t *packet, uint8_t packetLen,
+                         StoredRecordDecode::DecodeResult result,
+                         uint32_t packetIndex) {
+      char context[48];
+      snprintf(context, sizeof(context), "Manual record %s decode",
+              measurement);
+      logDecodeFailure(context, packet, packetLen, result, packetIndex,
+                       StoredRecordDecode::kManualDatumsEnd,
+                       StoredRecordDecode::kManualSeqLsbIdx,
+                       StoredRecordDecode::kManualSeqMsbIdx);
+    };
+  };
 
   requestBuf[0] = Config::kManualMeasurementSpo2;
   if (!sendRequest(requestBuf, sizeof(requestBuf), sizeof(requestBuf))) {
@@ -566,7 +649,7 @@ bool StoredRecordDownloader::downloadOneManualRecord(
   std::vector<uint8_t> spo2;
   StoredRecordDecode::DecodeResult result = StoredRecordDecode::decodeManual(
       reportSource, datumCount, StoredRecordDecode::kArtifactSpo2,
-      manualState, spo2, logProgress("SpO2"));
+      manualState, spo2, logProgress("SpO2"), logFailure("SpO2"));
   if (result != StoredRecordDecode::DecodeResult::Ok) {
     Serial.printf(
         "StoredRecordDownloader: Manual record SpO2 decode failed: %s.\n",
@@ -585,7 +668,7 @@ bool StoredRecordDownloader::downloadOneManualRecord(
   std::vector<uint8_t> pr;
   result = StoredRecordDecode::decodeManual(
       reportSource, datumCount, StoredRecordDecode::kArtifactPr, manualState,
-      pr, logProgress("pulse-rate"));
+      pr, logProgress("pulse-rate"), logFailure("pulse-rate"));
   if (result != StoredRecordDecode::DecodeResult::Ok) {
     Serial.printf("StoredRecordDownloader: Manual record pulse-rate decode "
                  "failed: %s.\n",

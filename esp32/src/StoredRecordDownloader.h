@@ -114,6 +114,18 @@ enum class DecodeResult {
 using ProgressSink =
     std::function<void(uint32_t packetsRead, uint32_t remaining)>;
 
+// Called exactly once, right before decodeAuto/decodeManual returns
+// ChecksumError or SequenceError, with the exact offending packet's raw
+// bytes (packetLen of them) and the 0-based index (within this decode call)
+// of the packet that failed. This is the authoritative diagnostic — unlike
+// reconstructing failure context from a caller's own running hex dump of
+// raw 64-byte reports (error-prone: a packet can span a report boundary,
+// and a long multi-line dump is easy to mangle in transit, e.g. copy/paste
+// across a wrapped terminal).
+using FailureSink = std::function<void(const uint8_t *packet, uint8_t packetLen,
+                                       DecodeResult result,
+                                       uint32_t packetIndex)>;
+
 // Ported from process_nibbles_auto()/store_datum_auto() plus the
 // extract_datums() packet-reassembly loop specialized for Auto mode. `state`
 // must be reused (not reset) across the SpO2 and PR downloads of one Auto
@@ -128,7 +140,8 @@ using ProgressSink =
 // see the .cpp for why this can happen against real (vs. fixture) hardware.
 DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
                         AutoState &state, std::vector<uint8_t> &out,
-                        const ProgressSink &onProgress = nullptr);
+                        const ProgressSink &onProgress = nullptr,
+                        const FailureSink &onFailure = nullptr);
 
 // Ported from process_nibbles_manual()/store_datum_manual(), specialized for
 // Manual mode. `artifactValue` is kArtifactSpo2 or kArtifactPr depending on
@@ -138,7 +151,8 @@ DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
 DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
                           uint8_t artifactValue, ManualState &state,
                           std::vector<uint8_t> &out,
-                          const ProgressSink &onProgress = nullptr);
+                          const ProgressSink &onProgress = nullptr,
+                          const FailureSink &onFailure = nullptr);
 
 } // namespace StoredRecordDecode
 
