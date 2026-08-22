@@ -2,6 +2,7 @@
 
 #include <cstring>
 
+#include <esp_rom_sys.h>
 #include <esp_task_wdt.h>
 
 #include "Config.h"
@@ -313,6 +314,21 @@ void UsbHidOxHost::inTransferCallback(usb_transfer_t *transfer) {
       // this matters (a dropped report otherwise surfaces as an unrelated-
       // looking decode failure with no indication of the real cause).
       self->droppedReportCount_++;
+      // TEMPORARY DIAGNOSTIC: log each drop as it happens, not just the
+      // cumulative total at eventual decode-failure time. A checksum
+      // failure reproduced byte-for-byte identical across two separate
+      // hardware runs (including one after moving usbHostLib off usbTask's
+      // core) — that determinism is worth confirming actually lines up
+      // with a drop happening right around the corrupted packet, rather
+      // than assuming it from the nonzero session total alone. This
+      // callback runs on usbHostLib's own task context (not an ISR — see
+      // usb_host_client_handle_events()'s documented callback contract),
+      // so esp_rom_printf here is safe; drops should be rare enough not to
+      // flood the log. Remove once the timing is confirmed either way.
+      esp_rom_printf(
+          "UsbHidOxHost: DROPPED report (queue full) — %lu dropped so far "
+          "this session.\n",
+          static_cast<unsigned long>(self->droppedReportCount_));
     }
   }
   // Keep the IN endpoint continuously polled for as long as the device
