@@ -57,25 +57,33 @@ void usbTask(void * /*param*/) {
   // indefinite silence with no way to tell where.
   esp_task_wdt_add(nullptr);
   for (;;) {
-    if (xSemaphoreTake(g_usbAttachSignal, portMAX_DELAY) == pdTRUE) {
-      Serial.println("UsbTask: PO-400 attached.");
+    // Bounded wait + periodic reset, not portMAX_DELAY: once a download
+    // finishes, this task legitimately goes idle waiting for the next
+    // attach, and nothing resets the watchdog while idle — portMAX_DELAY
+    // would let that idle wait itself trip a panic ~20s after every
+    // successful (or failed) session, rebooting the device for no reason.
+    // Loops (resetting each time) until the semaphore is actually given.
+    while (xSemaphoreTake(g_usbAttachSignal, pdMS_TO_TICKS(1000)) != pdTRUE) {
+      esp_task_wdt_reset();
+    }
+    esp_task_wdt_reset();
+    Serial.println("UsbTask: PO-400 attached.");
 
-      // Stored-record download (Auto/Manual) is the only thing this task
-      // does per attach — feeds the same ICsvBuffer, per the plan's
-      // "Stored-record download" section. Whatever the outcome, this task
-      // then just waits for the next attach signal (see onDetach() below for
-      // the actual "unplugged" log line — there's no wait-for-detach loop
-      // here since there's nothing left to do while the device stays
-      // attached).
-      if (!g_storedRecordDownloader->downloadAndMaybeDelete()) {
-        Serial.println(
-            "UsbTask: stored-record download failed or device detached "
-            "during it.");
-      } else {
-        Serial.println(
-            "UsbTask: stored-record download complete; nothing more to do "
-            "until the device is unplugged.");
-      }
+    // Stored-record download (Auto/Manual) is the only thing this task
+    // does per attach — feeds the same ICsvBuffer, per the plan's
+    // "Stored-record download" section. Whatever the outcome, this task
+    // then just waits for the next attach signal (see onDetach() below for
+    // the actual "unplugged" log line — there's no wait-for-detach loop
+    // here since there's nothing left to do while the device stays
+    // attached).
+    if (!g_storedRecordDownloader->downloadAndMaybeDelete()) {
+      Serial.println(
+          "UsbTask: stored-record download failed or device detached "
+          "during it.");
+    } else {
+      Serial.println(
+          "UsbTask: stored-record download complete; nothing more to do "
+          "until the device is unplugged.");
     }
   }
 }
