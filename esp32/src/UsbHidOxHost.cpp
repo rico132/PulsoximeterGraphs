@@ -2,8 +2,6 @@
 
 #include <cstring>
 
-#include <esp_task_wdt.h>
-
 #include "Config.h"
 
 namespace {
@@ -370,18 +368,7 @@ bool UsbHidOxHost::readReport(uint8_t *buf, size_t bufSize,
     return false;
   }
   ReportMessage msg;
-  const bool got =
-      xQueueReceive(reportQueue_, &msg, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
-  // Every caller of readReport() runs on usbTask; this is the one point
-  // they all pass through, whether the wait succeeded or (validly, within
-  // its own bound) timed out — either way the task made forward progress,
-  // just as designed. Resetting here means a real, unbounded hang anywhere
-  // else in the download/decode call chain — not inside this bounded wait
-  // — is what trips the task watchdog registered in usbTask() (main.cpp),
-  // giving a panic backtrace at the exact point it's actually stuck,
-  // instead of silence with no way to tell where.
-  esp_task_wdt_reset();
-  if (!got) {
+  if (xQueueReceive(reportQueue_, &msg, pdMS_TO_TICKS(timeoutMs)) != pdTRUE) {
     return false;
   }
   const size_t n = msg.length < bufSize ? msg.length : bufSize;

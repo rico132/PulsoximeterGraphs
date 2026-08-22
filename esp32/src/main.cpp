@@ -18,7 +18,6 @@
 // mandatory USB spike and UsbHidOxHost.h's header comment.
 
 #include <Arduino.h>
-#include <esp_task_wdt.h>
 
 #include "BleGattServer.h"
 #include "ClockSync.h"
@@ -47,26 +46,10 @@ BleGattServer *g_bleGattServer = nullptr;
 SemaphoreHandle_t g_usbAttachSignal = nullptr;
 
 void usbTask(void * /*param*/) {
-  // Self-subscribes to the task watchdog initialized in setup(). Every
-  // UsbHidOxHost::readReport() call (the one point every download/decode
-  // exchange passes through) resets it, so a genuine, unbounded hang
-  // anywhere else in that call chain — observed against real hardware as
-  // a download that silently stops making any progress at all, with none
-  // of the code's own bounded-timeout paths ever firing — trips a panic
-  // with a full backtrace at the exact point it's stuck, instead of
-  // indefinite silence with no way to tell where.
-  esp_task_wdt_add(nullptr);
   for (;;) {
-    // Bounded wait + periodic reset, not portMAX_DELAY: once a download
-    // finishes, this task legitimately goes idle waiting for the next
-    // attach, and nothing resets the watchdog while idle — portMAX_DELAY
-    // would let that idle wait itself trip a panic ~20s after every
-    // successful (or failed) session, rebooting the device for no reason.
-    // Loops (resetting each time) until the semaphore is actually given.
-    while (xSemaphoreTake(g_usbAttachSignal, pdMS_TO_TICKS(1000)) != pdTRUE) {
-      esp_task_wdt_reset();
+    if (xSemaphoreTake(g_usbAttachSignal, portMAX_DELAY) != pdTRUE) {
+      continue;
     }
-    esp_task_wdt_reset();
     Serial.println("UsbTask: PO-400 attached.");
 
     // Stored-record download (Auto/Manual) is the only thing this task
@@ -114,15 +97,6 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("PulsoxRelay firmware starting.");
-
-  // 20s: comfortably longer than any single bounded wait in the download
-  // path (readReport()'s own 3s timeout, the loudest single wait) so
-  // normal operation — however slow a real transfer legitimately gets —
-  // never false-triggers this, while still firing far sooner than the
-  // several minutes a real hang has otherwise gone unnoticed for. See
-  // usbTask()'s and UsbHidOxHost::readReport()'s comments for how this
-  // gets subscribed to and reset.
-  esp_task_wdt_init(20, /*panic=*/true);
 
   if (g_ramCsvBuffer.begin()) {
     g_csvBuffer = &g_ramCsvBuffer;
