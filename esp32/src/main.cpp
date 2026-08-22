@@ -138,7 +138,17 @@ void setup() {
   static BleGattServer bleGattServer(*g_csvBuffer, g_clockSync,
                                      *g_storedRecordDownloader, g_otaManager);
   g_bleGattServer = &bleGattServer;
-  g_bleGattServer->begin();
+  // TEMPORARY DIAGNOSTIC — BLE disabled to isolate whether it's involved in
+  // the datum-stream stall (do not merge/ship like this): if the USB
+  // download completes cleanly through all records with BLE never even
+  // advertising, that rules BLE out entirely as a factor.
+  static constexpr bool kBleEnabledForDebug = false;
+  if (kBleEnabledForDebug) {
+    g_bleGattServer->begin();
+  } else {
+    Serial.println(
+        "main: BLE intentionally disabled for this diagnostic build.");
+  }
 
   g_usbAttachSignal = xSemaphoreCreateBinary();
   // Pinned to core 1 (Arduino's own loop()/setup() core), deliberately
