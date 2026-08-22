@@ -61,8 +61,19 @@ void UsbHidOxHost::begin() {
     return;
   }
 
-  xTaskCreate(&UsbHidOxHost::usbHostTaskTrampoline, "usbHostLib", 8192, this,
-             tskIDLE_PRIORITY + 2, nullptr);
+  // Pinned to core 0, deliberately separate from usbTask (core 1, see
+  // main.cpp) — this loop's 1ms poll cycle (see its own comment) runs at a
+  // higher priority than usbTask, and neither task is pinned by default,
+  // so the scheduler is free to land both on the same core. If it does,
+  // this tight higher-priority loop can starve usbTask for extended
+  // stretches on a long decode, observed against real hardware as a
+  // download that stalls long enough for the PO-400's own inactivity
+  // timeout to kick in and power it off mid-transfer — not a hardware
+  // fault, a same-core scheduling one. Pinning to separate cores makes
+  // that starvation structurally impossible regardless of how aggressively
+  // this loop polls.
+  xTaskCreatePinnedToCore(&UsbHidOxHost::usbHostTaskTrampoline, "usbHostLib",
+                         8192, this, tskIDLE_PRIORITY + 2, nullptr, 0);
 }
 
 void UsbHidOxHost::usbHostTaskTrampoline(void *arg) {

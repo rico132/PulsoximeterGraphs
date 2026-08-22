@@ -122,8 +122,13 @@ void setup() {
   g_bleGattServer->begin();
 
   g_usbAttachSignal = xSemaphoreCreateBinary();
-  xTaskCreate(usbTask, "usbTask", 8192, nullptr, tskIDLE_PRIORITY + 1,
-             nullptr);
+  // Pinned to core 1 (Arduino's own loop()/setup() core), deliberately
+  // apart from UsbHidOxHost's "usbHostLib" task (core 0, see its own
+  // comment) — that task's tight, higher-priority USB event-poll loop
+  // could otherwise starve this one on a long decode if the scheduler
+  // happened to land both on the same core.
+  xTaskCreatePinnedToCore(usbTask, "usbTask", 8192, nullptr,
+                         tskIDLE_PRIORITY + 1, nullptr, 1);
 
   g_usbHost.onAttach([]() { xSemaphoreGive(g_usbAttachSignal); });
   g_usbHost.onDetach([]() { Serial.println("UsbTask: PO-400 detached."); });
