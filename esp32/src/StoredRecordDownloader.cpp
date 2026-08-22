@@ -357,13 +357,24 @@ int64_t civilToEpochSeconds(int year, int month, int day, int hour,
 // mismatch — compare directly against a known-good capture (e.g. from
 // pulseoxdl itself, run with its DEBUG_WRITE/DEBUG build flags) byte for
 // byte.
-void logHex(const char *label, const uint8_t *buf, size_t len) {
-  // Builds the whole line and emits it with a single Serial call, rather
-  // than one Serial.printf() per byte as this originally did: at 115200
-  // baud, ~65 separate short writes for one 64-byte report is slow enough
-  // to risk falling behind the device's report rate and silently dropping
-  // reports out of UsbHidOxHost's non-blocking report queue — which would
-  // itself look like a checksum/sequence failure in the decoded data,
+//
+// useRom selects esp_rom_printf (busy-waits directly on the UART hardware)
+// instead of Serial.println() for the actual emit. Real-hardware testing
+// proved that Serial's write path can block usbTask indefinitely once a
+// download is far enough into its per-packet loop for the TX ring buffer to
+// fill faster than its draining interrupt keeps up — see the esp_rom_printf
+// heartbeat bracketing host_.readReport() below. Every call site inside that
+// hot per-report/per-packet loop (and the decode-failure dump it can lead
+// into) must pass true; call sites outside it — the handshake's TX/RX dumps,
+// which have a real USB round trip between each one — can stay on Serial.
+void logHex(const char *label, const uint8_t *buf, size_t len,
+           bool useRom = false) {
+  // Builds the whole line and emits it with a single call, rather than one
+  // Serial.printf() per byte as this originally did: at 115200 baud, ~65
+  // separate short writes for one 64-byte report is slow enough to risk
+  // falling behind the device's report rate and silently dropping reports
+  // out of UsbHidOxHost's non-blocking report queue — which would itself
+  // look like a checksum/sequence failure in the decoded data,
   // indistinguishable from a real protocol mismatch without this fix.
   char line[320];
   int pos = snprintf(line, sizeof(line), "StoredRecordDownloader: %s (%u B):",
@@ -374,7 +385,11 @@ void logHex(const char *label, const uint8_t *buf, size_t len) {
     pos += snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos),
                     " %02X", buf[i]);
   }
-  Serial.println(line);
+  if (useRom) {
+    esp_rom_printf("%s\n", line);
+  } else {
+    Serial.println(line);
+  }
 }
 
 // For logging a decode failure's specific reason (distinguishing "the device
@@ -404,26 +419,30 @@ const char *decodeResultName(StoredRecordDecode::DecodeResult result) {
 // packet decodeAuto/decodeManual actually saw rather than reconstructed
 // from a separate running hex dump of raw 64-byte reports (which a packet
 // can span more than one of, and which is easy to mangle in transit).
+// Runs from inside the same per-packet decode loop as onProgress (see
+// logHex's comment on useRom) — reached back-to-back with no USB round trip
+// in between, so every emit here goes through esp_rom_printf/logHex(...,
+// /*useRom=*/true) rather than Serial, for the same reason.
 void logDecodeFailure(const char *context, const uint8_t *packet,
                       uint8_t packetLen, StoredRecordDecode::DecodeResult result,
                       uint32_t packetIndex, uint8_t checksumEnd,
                       uint8_t seqLsbIdx, uint8_t seqMsbIdx,
                       uint32_t droppedReportCount) {
-  Serial.printf("StoredRecordDownloader: %s — packet #%u failed (%s):\n",
-               context, packetIndex, decodeResultName(result));
-  logHex("  offending packet", packet, packetLen);
+  esp_rom_printf("StoredRecordDownloader: %s — packet #%u failed (%s):\n",
+                context, packetIndex, decodeResultName(result));
+  logHex("  offending packet", packet, packetLen, /*useRom=*/true);
   uint8_t sum = 0;
   for (uint8_t i = 0; i < checksumEnd; i++) {
     sum = static_cast<uint8_t>(sum + packet[i]);
   }
   const uint16_t gotSeq = static_cast<uint16_t>(
       packet[seqLsbIdx] + (packet[seqMsbIdx] << 7));
-  Serial.printf(
+  esp_rom_printf(
       "StoredRecordDownloader:   computed checksum 0x%02X vs packet's byte "
       "0x%02X; packet's sequence field = %u (expected %u).\n",
       sum & 0x7f, packet[checksumEnd], gotSeq, packetIndex);
   if (droppedReportCount > 0) {
-    Serial.printf(
+    esp_rom_printf(
         "StoredRecordDownloader:   %u report(s) were dropped (USB queue "
         "full) this session — this failure is very likely just a dropped "
         "report, not a real protocol mismatch.\n",
@@ -481,8 +500,13 @@ public:
     // right at that point — logged regardless of the kMaxLogged cap below,
     // so a stall deep into a long record is still visible without having
     // to dump every single one of possibly thousands of reads to find it.
+    //
+    // esp_rom_printf, not Serial — same reasoning as the RR# heartbeat
+    // above. This line and the logHex() below it sit in the identical hot
+    // loop, so they're exactly as capable of hitting a starved UART TX
+    // interrupt and blocking usbTask forever.
     if (elapsedMs >= 500) {
-      Serial.printf(
+      esp_rom_printf(
           "StoredRecordDownloader: datum stream read #%lu took %lums (%s).\n",
           reportsRead_, elapsedMs, ok ? "succeeded" : "TIMED OUT");
     }
@@ -492,7 +516,7 @@ public:
     // from here without dumping thousands of lines for a full record.
     if (ok && loggedCount_ < kMaxLogged) {
       loggedCount_++;
-      logHex("datum stream RX", report, 64);
+      logHex("datum stream RX", report, 64, /*useRom=*/true);
     }
     return ok;
   }
@@ -626,10 +650,20 @@ bool StoredRecordDownloader::downloadOneAutoRecord(
         sizeof(Config::kCmdRequestAutoTemplate));
   requestBuf[Config::kAutoRequestRecordIndex] = recordIndex;
 
+  // esp_rom_printf, not Serial: this fires every kProgressLogInterval
+  // packets from inside decodeAuto's per-packet loop, back-to-back with no
+  // USB round trip to let a full UART TX ring buffer drain in between. A
+  // real-hardware task watchdog panic reproduced at a fixed, reproducible
+  // report count that lines up almost exactly with this callback firing
+  // (packetsRead crossing the next multiple of kProgressLogInterval) —
+  // esp_rom_printf busy-waits directly on the UART hardware instead of
+  // going through the driver's interrupt-fed TX buffer, so it can't block
+  // the same way. See UsbHidReportSource::readReport()'s comment for the
+  // full chain of reasoning that led here.
   auto logProgress = [recordIndex](const char *measurement) {
     return [recordIndex, measurement](uint32_t packetsRead,
                                       uint32_t remaining) {
-      Serial.printf("StoredRecordDownloader: Auto record #%u %s decode — "
+      esp_rom_printf("StoredRecordDownloader: Auto record #%u %s decode — "
                     "%u packets read, %u datums remaining...\n",
                     recordIndex, measurement, packetsRead, remaining);
     };
@@ -693,9 +727,11 @@ bool StoredRecordDownloader::downloadOneManualRecord(
   memcpy(requestBuf, Config::kCmdRequestManualTemplate,
         sizeof(Config::kCmdRequestManualTemplate));
 
+  // esp_rom_printf, not Serial — see the Auto-record logProgress above for
+  // why: same hot per-packet loop, same UART-starvation risk.
   auto logProgress = [](const char *measurement) {
     return [measurement](uint32_t packetsRead, uint32_t remaining) {
-      Serial.printf("StoredRecordDownloader: Manual record %s decode — "
+      esp_rom_printf("StoredRecordDownloader: Manual record %s decode — "
                     "%u packets read, %u datums remaining...\n",
                     measurement, packetsRead, remaining);
     };
