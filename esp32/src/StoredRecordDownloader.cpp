@@ -316,6 +316,18 @@ DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
 
 namespace {
 
+// Sets `flag` for the lifetime of the enclosing scope, regardless of which
+// of downloadAndMaybeDelete()'s several early returns is taken — simpler
+// than assigning downloadInProgress_ = false before every one of them.
+class ScopedFlag {
+public:
+  explicit ScopedFlag(volatile bool &flag) : flag_(flag) { flag_ = true; }
+  ~ScopedFlag() { flag_ = false; }
+
+private:
+  volatile bool &flag_;
+};
+
 // Proleptic-Gregorian civil-calendar-to-epoch-seconds conversion (Howard
 // Hinnant's days_from_civil algorithm), used instead of mktime()/localtime()
 // deliberately: those depend on the host's configured timezone/DST (as
@@ -793,6 +805,7 @@ bool StoredRecordDownloader::performInitialHandshake() {
 }
 
 bool StoredRecordDownloader::downloadAndMaybeDelete() {
+  ScopedFlag inProgress(downloadInProgress_);
   if (!performInitialHandshake()) {
     Serial.println(
         "StoredRecordDownloader: initial handshake failed; device may "

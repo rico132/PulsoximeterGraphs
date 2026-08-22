@@ -183,6 +183,45 @@ void BleGattServer::requestDataDump() {
     return;
   }
 
+  // If a USB stored-record download is still in progress, wait for it
+  // rather than immediately dumping whatever subset of records happens to
+  // be buffered so far — otherwise REQUEST_DATA only ever returns however
+  // much has been appended by the exact moment it was pressed, requiring
+  // one sync per record as each finishes downloading. Runs on this
+  // dedicated task (not the NimBLE write callback), so it's safe to block
+  // here; bounded generously since a full multi-record session can take a
+  // while, but not unboundedly in case something's genuinely stuck.
+  if (storedRecordDownloader_.downloadInProgress()) {
+    Serial.println(
+        "BleGattServer: REQUEST_DATA received while a USB download is in "
+        "progress — waiting for it to finish before dumping...");
+    constexpr uint32_t kMaxWaitMs = 5UL * 60UL * 1000UL; // 5 minutes
+    const unsigned long waitStartMs = millis();
+    unsigned long lastLogMs = waitStartMs;
+    while (storedRecordDownloader_.downloadInProgress() && connected_) {
+      if (millis() - waitStartMs >= kMaxWaitMs) {
+        Serial.println(
+            "BleGattServer: still waiting after 5 minutes — proceeding "
+            "with whatever is currently buffered instead of waiting "
+            "indefinitely.");
+        break;
+      }
+      if (millis() - lastLogMs >= 5000) {
+        lastLogMs = millis();
+        Serial.println(
+            "BleGattServer: ...still waiting for the USB download to "
+            "finish...");
+      }
+      vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (!connected_) {
+      Serial.println(
+          "BleGattServer: phone disconnected while waiting for the USB "
+          "download to finish — abandoning this dump.");
+      return;
+    }
+  }
+
   uint16_t mtu = server_->getPeerMTU(connHandle_);
   if (mtu == 0) {
     mtu = Config::kMinMtu;

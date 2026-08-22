@@ -182,6 +182,14 @@ public:
   bool testModeEnabled() const;
   void setTestMode(bool enabled); // persists to NVS immediately
 
+  // True for the whole duration of a downloadAndMaybeDelete() call. Lets
+  // BleGattServer's REQUEST_DATA handler wait for an in-flight USB download
+  // to finish before dumping, rather than sending whatever partial subset
+  // of records happens to be buffered at the exact moment the phone's sync
+  // button was pressed — which otherwise requires pressing sync once per
+  // record as each one finishes downloading and gets appended.
+  bool downloadInProgress() const { return downloadInProgress_; }
+
   // Performs the initial per-attach handshake (see Config::kCmdStopSendingData's
   // comment for why this is required), then sends STORED_PRESENT and, if any
   // record(s) are present, downloads and decodes every one of them (Auto or
@@ -242,6 +250,7 @@ private:
   ClockSync &clockSync_;
   Preferences preferences_;
   bool testModeEnabled_ = true;
+  volatile bool downloadInProgress_ = false;
 };
 
 #endif // ARDUINO
