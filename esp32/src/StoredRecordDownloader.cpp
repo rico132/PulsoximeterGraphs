@@ -394,7 +394,8 @@ bool StoredRecordDownloader::sendExchange(const uint8_t *writeData,
                                           size_t writeLen,
                                           uint8_t writeChecksumLen,
                                           uint8_t *readBuf, size_t readLen,
-                                          uint8_t readChecksumLen) {
+                                          uint8_t readChecksumLen,
+                                          uint8_t expectedFirstByte) {
   uint8_t out[64] = {0};
   memcpy(out, writeData, writeLen);
   if (writeChecksumLen > 0) {
@@ -421,6 +422,13 @@ bool StoredRecordDownloader::sendExchange(const uint8_t *writeData,
     return false;
   }
   logHex("RX", in, sizeof(in));
+  if (expectedFirstByte != 0 && in[0] != expectedFirstByte) {
+    Serial.printf(
+        "StoredRecordDownloader: RX unexpected command byte 0x%02X "
+        "(expected 0x%02X) — likely reading a stale/misaligned report.\n",
+        in[0], expectedFirstByte);
+    return false;
+  }
   if (readChecksumLen > 0) {
     uint8_t sum = 0;
     for (uint8_t i = 0; i + 1 < readChecksumLen; i++) {
@@ -578,7 +586,25 @@ bool StoredRecordDownloader::downloadOneManualRecord(
   return true;
 }
 
+void StoredRecordDownloader::drainStaleReports() {
+  uint8_t discard[64];
+  uint32_t drained = 0;
+  constexpr uint32_t kMaxDrain = 64; // safety cap, not an expected count
+  while (drained < kMaxDrain &&
+        usbHost_.readReport(discard, sizeof(discard), /*timeoutMs=*/50)) {
+    drained++;
+  }
+  if (drained > 0) {
+    Serial.printf(
+        "StoredRecordDownloader: drained %u stale report(s) queued before "
+        "the handshake started.\n",
+        drained);
+  }
+}
+
 bool StoredRecordDownloader::performInitialHandshake() {
+  drainStaleReports();
+
   Serial.println(
       "StoredRecordDownloader: initial handshake — stopping the device's "
       "default data stream...");
@@ -586,7 +612,7 @@ bool StoredRecordDownloader::performInitialHandshake() {
   if (!sendExchange(Config::kCmdStopSendingData,
                     sizeof(Config::kCmdStopSendingData),
                     /*writeChecksumLen=*/0, nullptr, 0,
-                    /*readChecksumLen=*/2)) {
+                    /*readChecksumLen=*/2, /*expectedFirstByte=*/0xF0)) {
     Serial.println(
         "StoredRecordDownloader: STOP_SENDING_DATA failed.");
     return false;
@@ -595,7 +621,7 @@ bool StoredRecordDownloader::performInitialHandshake() {
   if (!sendExchange(Config::kCmdHandshakeUnknown0,
                     sizeof(Config::kCmdHandshakeUnknown0),
                     /*writeChecksumLen=*/0, nullptr, 0,
-                    /*readChecksumLen=*/8)) {
+                    /*readChecksumLen=*/8, /*expectedFirstByte=*/0xF2)) {
     Serial.println(
         "StoredRecordDownloader: handshake status query 1/2 failed.");
     return false;
@@ -604,7 +630,7 @@ bool StoredRecordDownloader::performInitialHandshake() {
   if (!sendExchange(Config::kCmdHandshakeUnknown1,
                     sizeof(Config::kCmdHandshakeUnknown1),
                     /*writeChecksumLen=*/0, nullptr, 0,
-                    /*readChecksumLen=*/2)) {
+                    /*readChecksumLen=*/2, /*expectedFirstByte=*/0xF0)) {
     Serial.println(
         "StoredRecordDownloader: handshake status query 2/2 failed.");
     return false;
@@ -632,7 +658,7 @@ bool StoredRecordDownloader::performInitialHandshake() {
     Serial.println(
         "StoredRecordDownloader: >> SYNCHRONIZE_DEVICE_DATE_AND_TIME");
     if (!sendExchange(syncTime, sizeof(syncTime), sizeof(syncTime), nullptr,
-                      0, /*readChecksumLen=*/3)) {
+                      0, /*readChecksumLen=*/3, /*expectedFirstByte=*/0xF3)) {
       Serial.println(
           "StoredRecordDownloader: device clock sync failed (continuing "
           "anyway).");
@@ -646,14 +672,14 @@ bool StoredRecordDownloader::performInitialHandshake() {
   Serial.println("StoredRecordDownloader: >> USER_NAME");
   if (!sendExchange(Config::kCmdUserName, sizeof(Config::kCmdUserName),
                     /*writeChecksumLen=*/0, nullptr, 0,
-                    /*readChecksumLen=*/10)) {
+                    /*readChecksumLen=*/10, /*expectedFirstByte=*/0xFE)) {
     Serial.println("StoredRecordDownloader: USER_NAME query failed.");
     return false;
   }
   Serial.println("StoredRecordDownloader: >> MODEL_NAME");
   if (!sendExchange(Config::kCmdModelName, sizeof(Config::kCmdModelName),
                     /*writeChecksumLen=*/0, nullptr, 0,
-                    /*readChecksumLen=*/10)) {
+                    /*readChecksumLen=*/10, /*expectedFirstByte=*/0xF1)) {
     Serial.println("StoredRecordDownloader: MODEL_NAME query failed.");
     return false;
   }
@@ -677,7 +703,7 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
   if (!sendExchange(Config::kCmdStoredPresent,
                     sizeof(Config::kCmdStoredPresent), /*writeChecksumLen=*/0,
                     presentResp, sizeof(presentResp),
-                    /*readChecksumLen=*/8)) {
+                    /*readChecksumLen=*/8, /*expectedFirstByte=*/0xEF)) {
     Serial.println(
         "StoredRecordDownloader: failed to query stored-record presence.");
     return false;
@@ -720,7 +746,7 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
       if (!sendExchange(Config::kCmdGetRecordMetadataAuto,
                         sizeof(Config::kCmdGetRecordMetadataAuto),
                         /*writeChecksumLen=*/0, meta, sizeof(meta),
-                        /*readChecksumLen=*/21)) {
+                        /*readChecksumLen=*/21, /*expectedFirstByte=*/0xEC)) {
         Serial.println(
             "StoredRecordDownloader: failed to read Auto record metadata.");
         return false;
@@ -771,7 +797,7 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
     if (!sendExchange(Config::kCmdGetRecordMetadataManual,
                       sizeof(Config::kCmdGetRecordMetadataManual),
                       /*writeChecksumLen=*/0, meta, sizeof(meta),
-                      /*readChecksumLen=*/14)) {
+                      /*readChecksumLen=*/14, /*expectedFirstByte=*/0xD0)) {
       Serial.println(
           "StoredRecordDownloader: failed to read Manual record metadata.");
       return false;

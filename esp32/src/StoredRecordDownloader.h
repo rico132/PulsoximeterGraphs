@@ -184,9 +184,24 @@ private:
   // at writeChecksumLen-1 if writeChecksumLen>0) and reads back one 64-byte
   // response, validating its checksum (at readChecksumLen-1) if
   // readChecksumLen>0, then copying its first readLen bytes into readBuf.
+  // `expectedFirstByte`, if non-zero, is checked against the response's
+  // first byte before the checksum (mirrors pulseoxdl's own read_data():
+  // "if (in[0] != io.data[0]) exit_error(...)") — catches a
+  // desynced/misaligned read immediately and unambiguously, rather than as
+  // a confusing checksum mismatch one exchange later. 0 skips the check
+  // (no real response in this protocol starts with 0x00).
   bool sendExchange(const uint8_t *writeData, size_t writeLen,
                     uint8_t writeChecksumLen, uint8_t *readBuf,
-                    size_t readLen, uint8_t readChecksumLen);
+                    size_t readLen, uint8_t readChecksumLen,
+                    uint8_t expectedFirstByte = 0);
+  // Discards any report(s) already sitting in UsbHidOxHost's queue before
+  // the handshake below sends its first command. The PO-400 streams its own
+  // live data by default until STOP_SENDING_DATA takes effect, so even the
+  // brief task-switch after the attach callback fires can leave one or more
+  // stray reports queued ahead of anything we're about to request — left
+  // alone, every exchange in performInitialHandshake()/downloadAndMaybeDelete()
+  // would read back the *previous* command's response instead of its own.
+  void drainStaleReports();
   // STOP_SENDING_DATA / two unidentified status queries / an opportunistic
   // clock sync (only when clockSync_.hasBeenSet()) / USER_NAME / MODEL_NAME
   // — see Config::kCmdStopSendingData's comment. Returns false if any of the
