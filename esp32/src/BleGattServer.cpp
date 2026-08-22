@@ -127,6 +127,11 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
 
   case Config::kOpClearBuffer:
     csvBuffer_.clear();
+    // Also forget which records were already "committed" to the buffer —
+    // see StoredRecordDownloader::resetCommittedRecords()'s comment: their
+    // rows no longer exist to skip re-downloading now that the buffer
+    // itself is empty.
+    storedRecordDownloader_.resetCommittedRecords();
     Serial.println("BleGattServer: CLEAR_BUFFER received — buffer wiped.");
     break;
 

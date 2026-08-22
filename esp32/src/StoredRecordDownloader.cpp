@@ -567,6 +567,45 @@ void StoredRecordDownloader::setTestMode(bool enabled) {
   preferences_.putBool(Config::kPrefsKeyTestMode, enabled);
 }
 
+void StoredRecordDownloader::resetCommittedRecords() {
+  preferences_.remove(Config::kPrefsKeyCommittedAutoEpochs);
+  preferences_.remove(Config::kPrefsKeyCommittedManualEpoch);
+}
+
+// Auto records are keyed by recordIndex (a uint8_t, so up to 256 possible
+// values) mapping to the startEpoch that was committed for it — persisted
+// as one 256-entry int64_t blob rather than 256 separate NVS keys. 0 means
+// "nothing committed for this index yet" (an epoch of exactly 0 —
+// 1970-01-01 00:00:00 UTC — is not a real measurement this device would
+// ever report, so it's safe to treat as the sentinel).
+bool StoredRecordDownloader::isAutoRecordCommitted(uint8_t recordIndex,
+                                                   int64_t startEpoch) {
+  int64_t committed[256] = {0};
+  preferences_.getBytes(Config::kPrefsKeyCommittedAutoEpochs, committed,
+                        sizeof(committed));
+  return startEpoch != 0 && committed[recordIndex] == startEpoch;
+}
+
+void StoredRecordDownloader::markAutoRecordCommitted(uint8_t recordIndex,
+                                                     int64_t startEpoch) {
+  int64_t committed[256] = {0};
+  preferences_.getBytes(Config::kPrefsKeyCommittedAutoEpochs, committed,
+                        sizeof(committed));
+  committed[recordIndex] = startEpoch;
+  preferences_.putBytes(Config::kPrefsKeyCommittedAutoEpochs, committed,
+                        sizeof(committed));
+}
+
+bool StoredRecordDownloader::isManualRecordCommitted(int64_t startEpoch) {
+  return startEpoch != 0 &&
+        preferences_.getLong64(Config::kPrefsKeyCommittedManualEpoch, 0) ==
+            startEpoch;
+}
+
+void StoredRecordDownloader::markManualRecordCommitted(int64_t startEpoch) {
+  preferences_.putLong64(Config::kPrefsKeyCommittedManualEpoch, startEpoch);
+}
+
 bool StoredRecordDownloader::sendExchange(const uint8_t *writeData,
                                           size_t writeLen,
                                           uint8_t writeChecksumLen,
@@ -647,7 +686,7 @@ bool StoredRecordDownloader::sendRequest(const uint8_t *writeData,
   return true;
 }
 
-void StoredRecordDownloader::appendDecodedRecord(
+bool StoredRecordDownloader::appendDecodedRecord(
     int64_t startEpochSeconds, const std::vector<uint8_t> &spo2,
     const std::vector<uint8_t> &pr) {
   const size_t n = spo2.size() < pr.size() ? spo2.size() : pr.size();
@@ -655,14 +694,28 @@ void StoredRecordDownloader::appendDecodedRecord(
       "StoredRecordDownloader: appending %u decoded row(s) to CsvBuffer...\n",
       static_cast<unsigned>(n));
   for (size_t i = 0; i < n; i++) {
-    csvBuffer_.appendRow(startEpochSeconds + static_cast<int64_t>(i), spo2[i],
-                        pr[i]);
+    if (!csvBuffer_.appendRow(startEpochSeconds + static_cast<int64_t>(i),
+                              spo2[i], pr[i])) {
+      // Previously ignored entirely: appendRow() returning false (buffer
+      // full) was silently swallowed here, so hitting the cap partway
+      // through a download meant every row after that point — including,
+      // on real hardware, an entire day's measurement — vanished with
+      // absolutely no indication anywhere that anything had gone wrong.
+      Serial.printf(
+          "StoredRecordDownloader: CSV BUFFER FULL — only %u/%u row(s) of "
+          "this record were appended; the rest are being DROPPED. Clear "
+          "the buffer (phone app CLEAR_BUFFER) to make room, then "
+          "re-sync.\n",
+          static_cast<unsigned>(i), static_cast<unsigned>(n));
+      return false;
+    }
   }
+  return true;
 }
 
 bool StoredRecordDownloader::downloadOneAutoRecord(
     uint8_t recordIndex, int64_t startEpochSeconds, uint32_t datumCount,
-    StoredRecordDecode::AutoState &autoState) {
+    StoredRecordDecode::AutoState &autoState, bool alreadyCommitted) {
   UsbHidReportSource reportSource(usbHost_);
 
   uint8_t requestBuf[9];
@@ -734,13 +787,26 @@ bool StoredRecordDownloader::downloadOneAutoRecord(
     return false;
   }
 
-  appendDecodedRecord(startEpochSeconds, spo2, pr);
-  return true;
+  if (alreadyCommitted) {
+    // Decoded (unconditionally, above) purely to keep autoState's top/first
+    // fields in the exact same state they'd be in had this record's rows
+    // actually been re-appended — see AutoState's own comment on why that
+    // continuity matters for the *next* record's decode. Not re-appended:
+    // this record's rows already made it into the buffer on a prior
+    // attempt this device-pairing (see isAutoRecordCommitted()'s comment),
+    // and doing so again would just duplicate them.
+    Serial.printf(
+        "StoredRecordDownloader: Auto record #%u already downloaded this "
+        "device-pairing — not re-appending.\n",
+        recordIndex);
+    return true;
+  }
+  return appendDecodedRecord(startEpochSeconds, spo2, pr);
 }
 
 bool StoredRecordDownloader::downloadOneManualRecord(
     int64_t startEpochSeconds, uint32_t datumCount,
-    StoredRecordDecode::ManualState &manualState) {
+    StoredRecordDecode::ManualState &manualState, bool alreadyCommitted) {
   UsbHidReportSource reportSource(usbHost_);
 
   uint8_t requestBuf[5];
@@ -805,8 +871,15 @@ bool StoredRecordDownloader::downloadOneManualRecord(
     return false;
   }
 
-  appendDecodedRecord(startEpochSeconds, spo2, pr);
-  return true;
+  if (alreadyCommitted) {
+    // See downloadOneAutoRecord()'s identical branch for why this decodes
+    // unconditionally but skips the append.
+    Serial.println(
+        "StoredRecordDownloader: Manual record already downloaded this "
+        "device-pairing — not re-appending.");
+    return true;
+  }
+  return appendDecodedRecord(startEpochSeconds, spo2, pr);
 }
 
 void StoredRecordDownloader::drainStaleReports() {
@@ -1025,16 +1098,29 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
     StoredRecordDecode::AutoState autoState;
     uint32_t recordsDownloaded = 0;
     for (const AutoRecordMeta &record : records) {
+      // Still fully decoded even when already committed (see
+      // downloadOneAutoRecord()'s alreadyCommitted branch) — only the
+      // re-append is skipped — so autoState.top/first end this record in
+      // exactly the state the *next* record's decode expects, matching
+      // what would have happened had this record not been skipped at all.
+      const bool alreadyCommitted =
+          isAutoRecordCommitted(record.recordIndex, record.startEpoch);
       Serial.printf(
           "StoredRecordDownloader: downloading Auto record #%u (%u "
-          "datums)...\n",
-          record.recordIndex, record.datumCount);
+          "datums)%s...\n",
+          record.recordIndex, record.datumCount,
+          alreadyCommitted ? " [already downloaded this device-pairing]"
+                           : "");
       if (!downloadOneAutoRecord(record.recordIndex, record.startEpoch,
-                                 record.datumCount, autoState)) {
+                                 record.datumCount, autoState,
+                                 alreadyCommitted)) {
         Serial.printf(
             "StoredRecordDownloader: failed downloading Auto record #%u.\n",
             record.recordIndex);
         return false;
+      }
+      if (!alreadyCommitted) {
+        markAutoRecordCommitted(record.recordIndex, record.startEpoch);
       }
       recordsDownloaded++;
     }
@@ -1073,15 +1159,21 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
     const int64_t startEpoch =
         civilToEpochSeconds(year, month, day, hour, minute, second);
 
+    const bool alreadyCommitted = isManualRecordCommitted(startEpoch);
     Serial.printf(
         "StoredRecordDownloader: downloading Manual record — "
-        "%04d-%02d-%02d %02d:%02d:%02d, %u datums...\n",
-        year, month, day, hour, minute, second, datumCount);
+        "%04d-%02d-%02d %02d:%02d:%02d, %u datums%s...\n",
+        year, month, day, hour, minute, second, datumCount,
+        alreadyCommitted ? " [already downloaded this device-pairing]" : "");
     StoredRecordDecode::ManualState manualState;
-    if (!downloadOneManualRecord(startEpoch, datumCount, manualState)) {
+    if (!downloadOneManualRecord(startEpoch, datumCount, manualState,
+                                 alreadyCommitted)) {
       Serial.println(
           "StoredRecordDownloader: failed downloading Manual record.");
       return false;
+    }
+    if (!alreadyCommitted) {
+      markManualRecordCommitted(startEpoch);
     }
     Serial.println("StoredRecordDownloader: Manual record downloaded.");
 

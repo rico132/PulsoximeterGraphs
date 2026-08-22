@@ -10,13 +10,15 @@
 
 class RamCsvBuffer : public ICsvBuffer {
 public:
-  // Allocates a fixed kMaxBufferedBytes arena from PSRAM up front (rather
-  // than growing a heap container at runtime) so that a single successful
-  // construction guarantees appendRow() never fails from fragmentation later
-  // — only from the row-count cap, which is the one designed "full" case.
-  // Returns false from begin() if the PSRAM allocation itself fails (e.g.
-  // board variant without PSRAM); the caller should then fall back to
-  // FileCsvBuffer.
+  // Allocates a fixed arena from PSRAM up front (rather than growing a heap
+  // container at runtime) so that a single successful construction
+  // guarantees appendRow() never fails from fragmentation later — only from
+  // the capacity cap, which is the one designed "full" case. Sized
+  // dynamically from whatever PSRAM is actually free at the time (minus
+  // Config::kPsramArenaSafetyMarginBytes), not a fixed compile-time byte
+  // count — see begin()'s own comment. Returns false from begin() if the
+  // PSRAM allocation itself fails (e.g. board variant without PSRAM); the
+  // caller should then fall back to FileCsvBuffer.
   RamCsvBuffer();
   ~RamCsvBuffer() override;
 
@@ -26,7 +28,7 @@ public:
                 uint8_t pulseRate) override;
   uint32_t rowCount() const override { return rowCount_; }
   size_t sizeBytes() const override { return writeOffset_; }
-  bool isFull() const override { return rowCount_ >= Config::kMaxBufferedRows; }
+  bool isFull() const override;
   void forEachChunk(size_t chunkSize, const ChunkSink &sink) const override;
   void clear() override;
 

@@ -101,23 +101,31 @@ constexpr uint16_t kMinMtu = 23;
 // ---------------------------------------------------------------------------
 // Buffering — plan §"Buffering"
 // ---------------------------------------------------------------------------
-// ~30 bytes/CSV-row; hard cap at ~22h buffered (80,000 rows) before recording
-// stops until CLEAR_BUFFER. No FIFO rotation (simplest correct MVP behavior).
-//
-// Was 43,200 (~12h) — too low for a real multi-record PO-400 sync: a device
-// seen with 6 stored Auto records plus one still-recording totaled 51,367
-// datums (~1.57MB of rows), more than the *previous* 1.5MB littlefs
-// partition could hold at all, and past this cap partway through downloading
-// besides. 80,000 rows * kMaxCsvRowLength = 3.2MB, sized to fit inside the
-// ~3.87MB littlefs partition partitions_8MB.csv now gives FileCsvBuffer
-// (used on any board without PSRAM, which stores this in flash, not a fixed
-// RAM arena) with headroom left over for LittleFS's own metadata overhead.
-constexpr uint32_t kMaxBufferedRows = 80000;
+// No FIFO rotation (simplest correct MVP behavior): once full, recording
+// stops until CLEAR_BUFFER. Capacity itself is no longer a fixed row count —
+// a hardcoded cap (previously 80,000 rows / 3.2MB, tuned to leave headroom
+// under the ~3.87MB littlefs partition) silently discarded real, otherwise-
+// undownloaded measurement data once hit, even with hundreds of KB of
+// actually-free space still sitting unused on both the RAM and File buffers.
+// RamCsvBuffer and FileCsvBuffer each size themselves dynamically instead,
+// from however much space is actually free (PSRAM largest-free-block, or
+// the littlefs partition's free bytes) minus a safety margin — see their
+// own begin()/refreshRemainingCapacity() comments — so the true limit is
+// "how much room is actually left on this board," not a number tuned
+// against one previously-seen device's history.
 constexpr uint32_t kApproxBytesPerRow = 30; // typical row size, for the plan's back-of-envelope budget
 // Worst-case row: "YYYY-MM-DD, HH:MM:SS, 100, 255\r\n" == 32 bytes; round up
-// for headroom so the RAM/File buffer arena is sized safely, not just typically.
+// for headroom so a single row is never assumed to fit in less than this.
 constexpr uint32_t kMaxCsvRowLength = 40;
-constexpr uint32_t kMaxBufferedBytes = kMaxBufferedRows * kMaxCsvRowLength;
+// Reserved, not handed to RamCsvBuffer's PSRAM arena, so other subsystems
+// that might still allocate PSRAM later in setup() (NimBLE, WiFiManager,
+// OTA, ...) — all of which init *after* RamCsvBuffer::begin() in main.cpp —
+// aren't starved by this buffer having already claimed nearly all of it.
+constexpr size_t kPsramArenaSafetyMarginBytes = 512 * 1024;
+// Reserved, not handed to FileCsvBuffer's row budget, for LittleFS's own
+// metadata/wear-leveling overhead and any other files sharing the same
+// littlefs partition (WiFiManager config, OTA staging, ...).
+constexpr size_t kFilesystemFreeSpaceSafetyMarginBytes = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // USB host power switch (ESP32-S3-USB-OTG board's MIC2005A VBUS switch)
@@ -130,6 +138,22 @@ constexpr int kUsbHostVbusEnableGpio = 17; // IDEV_LIMIT_EN
 constexpr const char *kPrefsNamespace = "pulsoxrelay";
 constexpr const char *kPrefsKeyTestMode = "test_mode";
 constexpr bool kDefaultTestMode = true; // default ON — never destroy real data
+
+// Tracks which stored records have already been successfully appended to
+// the CSV buffer, keyed by (recordIndex, startEpoch) for Auto and by
+// startEpoch alone for Manual (only one Manual "slot" exists on the device
+// at a time) — see StoredRecordDownloader's isAutoRecordCommitted()/
+// isManualRecordCommitted() comments. Persisted (not just in-RAM) because a
+// mid-download failure or task-watchdog reboot forces the entire
+// enumerate+download loop to restart from scratch on the next attach;
+// without this, every such retry re-decodes AND re-appends every record
+// that had already succeeded, burning through the buffer's capacity with
+// duplicates of the same data instead of just picking up where it left off.
+// Reset (both keys) whenever the phone's CLEAR_BUFFER wipes the buffer
+// itself — see BleGattServer's handler — since a previously-committed
+// record's rows no longer exist to skip re-downloading.
+constexpr const char *kPrefsKeyCommittedAutoEpochs = "auto_committed";
+constexpr const char *kPrefsKeyCommittedManualEpoch = "manual_committed";
 
 // ---------------------------------------------------------------------------
 // OTA / WiFi

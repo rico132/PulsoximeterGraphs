@@ -45,4 +45,15 @@ private:
   // flush()/close() actually make its buffered writes visible to a
   // separately-opened read handle on the same path.
   mutable File appendFile_;
+  // How many more bytes can still be appended before the littlefs partition
+  // itself runs low on free space — computed once, from the filesystem's
+  // actual free space (LittleFS.totalBytes() - usedBytes(), minus
+  // Config::kFilesystemFreeSpaceSafetyMarginBytes), at begin()/clear() time
+  // via refreshRemainingCapacity(), then just decremented per append rather
+  // than requeried from LittleFS on every single row: usedBytes() walks the
+  // filesystem's own metadata, and appendRow() already learned the hard way
+  // (see its own comment) what paying a non-O(1) LittleFS cost on every
+  // single datum does to the task watchdog.
+  size_t remainingCapacityBytes_ = 0;
+  void refreshRemainingCapacity();
 };

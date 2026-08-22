@@ -15,14 +15,21 @@ public:
 
   // Formats and appends one CSV row: "YYYY-MM-DD, HH:MM:SS, <spo2>, <pulse>\r\n"
   // (PROTOCOL.md CSV format) for the given Unix epoch-second timestamp.
-  // Returns false (row dropped) if the buffer is already at kMaxBufferedRows —
-  // per the plan, the MVP behavior on hitting the cap is to simply stop
-  // accepting new rows until CLEAR_BUFFER, not FIFO rotation.
+  // Returns false (row dropped) if the buffer is already full — see
+  // isFull()'s comment for how that cap is actually determined. Per the
+  // plan, the MVP behavior on hitting it is to simply stop accepting new
+  // rows until CLEAR_BUFFER, not FIFO rotation. Callers MUST check this
+  // return value: silently ignoring it previously caused real measurement
+  // data to be dropped with zero indication anywhere that it had happened.
   virtual bool appendRow(int64_t epochSeconds, uint8_t spo2,
                          uint8_t pulseRate) = 0;
 
   virtual uint32_t rowCount() const = 0;
   virtual size_t sizeBytes() const = 0;
+  // Sized dynamically from whatever space is actually free at begin() time
+  // (PSRAM largest-free-block for RamCsvBuffer, littlefs free bytes for
+  // FileCsvBuffer), minus a safety margin — not a fixed row-count constant.
+  // See each implementation's begin()/refreshRemainingCapacity() comment.
   virtual bool isFull() const = 0;
 
   // Streams all currently-buffered bytes to `sink` in pieces of at most

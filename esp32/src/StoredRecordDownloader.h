@@ -190,6 +190,13 @@ public:
   // record as each one finishes downloading and gets appended.
   bool downloadInProgress() const { return downloadInProgress_; }
 
+  // Clears the persisted "already downloaded this device-pairing" ledger
+  // (see isAutoRecordCommitted()'s comment) — call whenever the CSV buffer
+  // itself is wiped (BleGattServer's CLEAR_BUFFER handler), since a record
+  // this ledger remembers as committed no longer actually has its rows in
+  // the buffer to skip re-downloading.
+  void resetCommittedRecords();
+
   // Performs the initial per-attach handshake (see Config::kCmdStopSendingData's
   // comment for why this is required), then sends STORED_PRESENT and, if any
   // record(s) are present, downloads and decodes every one of them (Auto or
@@ -238,12 +245,30 @@ private:
                   uint8_t writeChecksumLen);
   bool downloadOneAutoRecord(uint8_t recordIndex, int64_t startEpochSeconds,
                              uint32_t datumCount,
-                             StoredRecordDecode::AutoState &autoState);
+                             StoredRecordDecode::AutoState &autoState,
+                             bool alreadyCommitted);
   bool downloadOneManualRecord(int64_t startEpochSeconds, uint32_t datumCount,
-                               StoredRecordDecode::ManualState &manualState);
-  void appendDecodedRecord(int64_t startEpochSeconds,
-                           const std::vector<uint8_t> &spo2,
-                           const std::vector<uint8_t> &pr);
+                               StoredRecordDecode::ManualState &manualState,
+                               bool alreadyCommitted);
+  // Returns false (and logs loudly) if the CSV buffer filled up partway
+  // through — see the .cpp for why appendRow()'s return value being ignored
+  // here previously caused silent, invisible data loss.
+  bool appendDecodedRecord(int64_t startEpochSeconds,
+                          const std::vector<uint8_t> &spo2,
+                          const std::vector<uint8_t> &pr);
+
+  // Both check+mark pairs persist to NVS (via preferences_) — see
+  // Config::kPrefsKeyCommittedAutoEpochs'/kPrefsKeyCommittedManualEpoch's
+  // comment for why this needs to survive a reboot, not just an in-RAM
+  // session. Auto is keyed by (recordIndex, startEpoch) rather than
+  // recordIndex alone so that an index the device reuses for a genuinely
+  // new record (only possible once test mode is off and old records get
+  // deleted) is correctly treated as "not yet committed" rather than
+  // wrongly skipped.
+  bool isAutoRecordCommitted(uint8_t recordIndex, int64_t startEpoch);
+  void markAutoRecordCommitted(uint8_t recordIndex, int64_t startEpoch);
+  bool isManualRecordCommitted(int64_t startEpoch);
+  void markManualRecordCommitted(int64_t startEpoch);
 
   UsbHidOxHost &usbHost_;
   ICsvBuffer &csvBuffer_;

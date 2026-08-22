@@ -45,6 +45,22 @@ size_t formatCsvRow(int64_t epochSeconds, uint8_t spo2, uint8_t pulseRate,
 FileCsvBuffer::FileCsvBuffer() = default;
 FileCsvBuffer::~FileCsvBuffer() = default;
 
+void FileCsvBuffer::refreshRemainingCapacity() {
+  // Actual free space on the partition, minus a safety margin for
+  // LittleFS's own metadata/wear-leveling overhead and any other files
+  // sharing it (WiFiManager config, OTA staging, ...) — not a fixed
+  // compile-time row count. A hardcoded cap previously left hundreds of KB
+  // of real free space unused while still silently discarding rows once
+  // hit; see appendRow()'s own "CSV buffer full" comment for why that
+  // matters, and Config::kFilesystemFreeSpaceSafetyMarginBytes' comment for
+  // the margin itself.
+  const size_t totalBytes = LittleFS.totalBytes();
+  const size_t usedBytes = LittleFS.usedBytes();
+  const size_t margin = Config::kFilesystemFreeSpaceSafetyMarginBytes;
+  remainingCapacityBytes_ =
+      usedBytes + margin >= totalBytes ? 0 : totalBytes - usedBytes - margin;
+}
+
 bool FileCsvBuffer::begin() {
   if (!LittleFS.begin(/*formatOnFail=*/true)) {
     return false;
@@ -72,6 +88,7 @@ bool FileCsvBuffer::begin() {
     }
     f.close();
   }
+  refreshRemainingCapacity();
   return true;
 }
 
@@ -103,6 +120,8 @@ bool FileCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
     return false;
   }
   rowCount_++;
+  remainingCapacityBytes_ -= len; // safe: isFull() above already ensured
+                                  // remainingCapacityBytes_ >= kMaxCsvRowLength >= len
   // Periodic sync, not per-row — see kFlushEveryNRows' comment. flush()
   // (called unconditionally once the whole download session ends, from
   // StoredRecordDownloader's ScopedCsvFlush) is what actually guarantees
@@ -146,7 +165,7 @@ size_t FileCsvBuffer::sizeBytes() const {
 }
 
 bool FileCsvBuffer::isFull() const {
-  return rowCount_ >= Config::kMaxBufferedRows;
+  return remainingCapacityBytes_ < Config::kMaxCsvRowLength;
 }
 
 void FileCsvBuffer::forEachChunk(size_t chunkSize,
@@ -187,4 +206,5 @@ void FileCsvBuffer::clear() {
     f.close();
   }
   rowCount_ = 0;
+  refreshRemainingCapacity();
 }

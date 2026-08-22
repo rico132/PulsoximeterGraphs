@@ -46,11 +46,29 @@ RamCsvBuffer::~RamCsvBuffer() {
 }
 
 bool RamCsvBuffer::begin() {
-  arenaCapacity_ = Config::kMaxBufferedBytes;
+  // Use as much of the largest free PSRAM block as is actually available,
+  // minus a safety margin reserved for whatever else might still need to
+  // allocate PSRAM later (NimBLE, WiFiManager, OTA — all of which begin()
+  // after this call in main.cpp's setup()) — rather than a fixed
+  // compile-time size. A hardcoded cap previously left hundreds of KB of
+  // real free space unused while still silently discarding rows once hit;
+  // see Config::kPsramArenaSafetyMarginBytes' comment for the margin
+  // itself, and appendDecodedRecord()'s "CSV buffer full" comment for why
+  // silent data loss here matters.
+  const size_t largestFreeBlock =
+      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (largestFreeBlock <= Config::kPsramArenaSafetyMarginBytes) {
+    // No PSRAM (or too little to be worth it) — caller falls back to
+    // FileCsvBuffer.
+    arenaCapacity_ = 0;
+    return false;
+  }
+  arenaCapacity_ = largestFreeBlock - Config::kPsramArenaSafetyMarginBytes;
   arena_ = static_cast<uint8_t *>(
       heap_caps_malloc(arenaCapacity_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!arena_) {
-    // No PSRAM (or allocation failed) — caller falls back to FileCsvBuffer.
+    // Allocation failed despite the free-block query above (e.g. another
+    // allocation raced in between) — caller falls back to FileCsvBuffer.
     arenaCapacity_ = 0;
     return false;
   }
@@ -89,6 +107,10 @@ bool RamCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
     LOCKED_ROM_PRINTF("CsvBuffer: row %u: %s", rowCount_, row);
   }
   return true;
+}
+
+bool RamCsvBuffer::isFull() const {
+  return !arena_ || writeOffset_ + Config::kMaxCsvRowLength > arenaCapacity_;
 }
 
 void RamCsvBuffer::forEachChunk(size_t chunkSize,
