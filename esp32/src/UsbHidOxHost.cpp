@@ -240,8 +240,18 @@ void UsbHidOxHost::closeDevice() {
 
 void UsbHidOxHost::inTransferCallback(usb_transfer_t *transfer) {
   auto *self = static_cast<UsbHidOxHost *>(transfer->context);
+  // actual_num_bytes == 0 shows up as a legitimate COMPLETED transfer with
+  // no data — a zero-length-packet completion, seemingly emitted right
+  // after the device processes an OUT report and before its real reply is
+  // ready. Every real report in this protocol is a fixed 64 bytes (both
+  // live-stream and stored-record exchanges), so a 0-byte completion is
+  // never meaningful data; queueing it produced an all-zero "report" that
+  // every consumer had to misinterpret as a genuine (if garbled) response.
+  // Linux's hidraw driver — what pulseoxdl reads through — evidently
+  // filters these out transparently; discard them here for the same
+  // effect, rather than leaving every caller to notice and skip them.
   if (transfer->status == USB_TRANSFER_STATUS_COMPLETED &&
-      self->reportQueue_) {
+      transfer->actual_num_bytes > 0 && self->reportQueue_) {
     ReportMessage msg{};
     const size_t n =
         static_cast<size_t>(transfer->actual_num_bytes) < sizeof(msg.data)
