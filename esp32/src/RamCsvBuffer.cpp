@@ -4,9 +4,16 @@
 #include <cstdio>
 #include <cstring>
 
+#include <Arduino.h>
 #include <esp_heap_caps.h>
 
 namespace {
+// How many of the very first rows received from the PO-400 (live-stream or
+// stored-record, whichever arrives first) get echoed to Serial — a quick way
+// to eyeball what's actually coming off the device without pulling the BLE
+// dump, e.g. while chasing a link-health issue.
+constexpr uint32_t kDebugRowsToPrint = 10;
+
 // Formats one CSV row per PROTOCOL.md: "YYYY-MM-DD, HH:MM:SS, <spo2>, <pulse>\r\n".
 // No timezone conversion is applied — the epoch value came from the phone's
 // SET_TIME and is rendered via gmtime() as-is; PROTOCOL.md documents that no
@@ -66,6 +73,10 @@ bool RamCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
   memcpy(arena_ + writeOffset_, row, len);
   writeOffset_ += len;
   rowCount_++;
+  if (rowCount_ <= kDebugRowsToPrint) {
+    Serial.printf("CsvBuffer: row %u: ", rowCount_);
+    Serial.write(reinterpret_cast<const uint8_t *>(row), len);
+  }
   return true;
 }
 

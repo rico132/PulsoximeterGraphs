@@ -3,11 +3,18 @@
 #include <ctime>
 #include <cstdio>
 
+#include <Arduino.h>
 #include <LittleFS.h>
 
 #include "Config.h"
 
 namespace {
+// How many of the very first rows received from the PO-400 (live-stream or
+// stored-record, whichever arrives first) get echoed to Serial — a quick way
+// to eyeball what's actually coming off the device without pulling the BLE
+// dump, e.g. while chasing a link-health issue.
+constexpr uint32_t kDebugRowsToPrint = 10;
+
 // Duplicated from RamCsvBuffer.cpp rather than shared, deliberately: it's a
 // ~10-line formatter and the two buffers otherwise share nothing, so a
 // shared header would only add indirection for this one function.
@@ -79,6 +86,10 @@ bool FileCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
     return false;
   }
   rowCount_++;
+  if (rowCount_ <= kDebugRowsToPrint) {
+    Serial.printf("CsvBuffer: row %u: ", rowCount_);
+    Serial.write(reinterpret_cast<const uint8_t *>(row), len);
+  }
   return true;
 }
 
