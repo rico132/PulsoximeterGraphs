@@ -73,10 +73,30 @@ private:
   std::vector<uint8_t> staging_;
 };
 
+// How many packets a decode loop will read while `remaining` fails to reach
+// 0, before concluding datumCount/geometry don't match what the device is
+// actually sending and bailing out instead of spinning forever. A packet can
+// legitimately yield 0 new datums (an all-"top-adjustment" packet in Auto
+// mode), so this can't be a tight bound — but it must be *some* bound, since
+// every individual readReport() call succeeding is not proof that `remaining`
+// will ever reach 0. Chosen generously: normal decoding needs on the order of
+// datumCount / (datums-per-packet) packets (single digits to low tens for
+// realistic record sizes), so datumCount*4 plus a flat floor comfortably
+// covers legitimate decode patterns while still bounding a genuine mismatch.
+uint32_t packetBudget(uint32_t datumCount) {
+  return datumCount * 4 + 200;
+}
+
+// Every kProgressLogInterval packets, tell `onProgress` (if any) how far
+// along a decode is — see ProgressSink's comment in the header for why this
+// indirection exists instead of calling Serial directly here.
+constexpr uint32_t kProgressLogInterval = 20;
+
 } // namespace
 
 DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
-                        AutoState &state, std::vector<uint8_t> &out) {
+                        AutoState &state, std::vector<uint8_t> &out,
+                        const ProgressSink &onProgress) {
   out.clear();
   if (datumCount == 0) {
     return DecodeResult::Ok;
@@ -85,6 +105,8 @@ DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
 
   PacketReassembler reassembler(source);
   uint32_t remaining = datumCount;
+  const uint32_t maxPackets = packetBudget(datumCount);
+  uint32_t packetsRead = 0;
   uint16_t expectedSeq = 0;
   uint8_t packet[kAutoPacketLen];
 
@@ -99,8 +121,15 @@ DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
   };
 
   while (remaining > 0) {
+    if (packetsRead >= maxPackets) {
+      return DecodeResult::PacketBudgetExceeded;
+    }
     if (!reassembler.nextPacket(packet, kAutoPacketLen)) {
       return DecodeResult::ReadError;
+    }
+    packetsRead++;
+    if (onProgress && packetsRead % kProgressLogInterval == 0) {
+      onProgress(packetsRead, remaining);
     }
     if (!checksumOk(packet, kAutoDatumsEnd)) {
       return DecodeResult::ChecksumError;
@@ -149,7 +178,8 @@ DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
 
 DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
                           uint8_t artifactValue, ManualState &state,
-                          std::vector<uint8_t> &out) {
+                          std::vector<uint8_t> &out,
+                          const ProgressSink &onProgress) {
   out.clear();
   if (datumCount == 0) {
     return DecodeResult::Ok;
@@ -158,6 +188,8 @@ DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
 
   PacketReassembler reassembler(source);
   uint32_t remaining = datumCount;
+  const uint32_t maxPackets = packetBudget(datumCount);
+  uint32_t packetsRead = 0;
   uint16_t expectedSeq = 0;
   uint8_t packet[kManualPacketLen];
 
@@ -174,8 +206,15 @@ DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
   };
 
   while (remaining > 0) {
+    if (packetsRead >= maxPackets) {
+      return DecodeResult::PacketBudgetExceeded;
+    }
     if (!reassembler.nextPacket(packet, kManualPacketLen)) {
       return DecodeResult::ReadError;
+    }
+    packetsRead++;
+    if (onProgress && packetsRead % kProgressLogInterval == 0) {
+      onProgress(packetsRead, remaining);
     }
     if (!checksumOk(packet, kManualDatumsEnd)) {
       return DecodeResult::ChecksumError;
@@ -275,6 +314,27 @@ int64_t civilToEpochSeconds(int year, int month, int day, int hour,
   const int64_t days =
       static_cast<int64_t>(era) * 146097LL + static_cast<int64_t>(doe) - 719468LL;
   return days * 86400LL + hour * 3600LL + minute * 60LL + second;
+}
+
+// For logging a decode failure's specific reason (distinguishing "the device
+// stopped responding" from "the device kept responding but never converged,"
+// which points at a datumCount/geometry mismatch rather than a transport
+// problem — see PacketBudgetExceeded's comment in the header).
+const char *decodeResultName(StoredRecordDecode::DecodeResult result) {
+  switch (result) {
+  case StoredRecordDecode::DecodeResult::Ok:
+    return "Ok";
+  case StoredRecordDecode::DecodeResult::ChecksumError:
+    return "ChecksumError";
+  case StoredRecordDecode::DecodeResult::SequenceError:
+    return "SequenceError";
+  case StoredRecordDecode::DecodeResult::ReadError:
+    return "ReadError (device stopped responding)";
+  case StoredRecordDecode::DecodeResult::PacketBudgetExceeded:
+    return "PacketBudgetExceeded (device kept responding but the datum "
+          "count never reached 0 — likely a metadata/geometry mismatch)";
+  }
+  return "Unknown";
 }
 
 // Adapts UsbHidOxHost's blocking readReport() to the pure decode namespace's
@@ -383,13 +443,26 @@ bool StoredRecordDownloader::downloadOneAutoRecord(
         sizeof(Config::kCmdRequestAutoTemplate));
   requestBuf[Config::kAutoRequestRecordIndex] = recordIndex;
 
+  auto logProgress = [recordIndex](const char *measurement) {
+    return [recordIndex, measurement](uint32_t packetsRead,
+                                      uint32_t remaining) {
+      Serial.printf("StoredRecordDownloader: Auto record #%u %s decode — "
+                    "%u packets read, %u datums remaining...\n",
+                    recordIndex, measurement, packetsRead, remaining);
+    };
+  };
+
   requestBuf[Config::kAutoRequestMeasurementIndex] = Config::kAutoMeasurementSpo2;
   if (!sendRequest(requestBuf, sizeof(requestBuf), sizeof(requestBuf))) {
     return false;
   }
   std::vector<uint8_t> spo2;
-  if (StoredRecordDecode::decodeAuto(reportSource, datumCount, autoState,
-                                     spo2) != StoredRecordDecode::DecodeResult::Ok) {
+  StoredRecordDecode::DecodeResult result = StoredRecordDecode::decodeAuto(
+      reportSource, datumCount, autoState, spo2, logProgress("SpO2"));
+  if (result != StoredRecordDecode::DecodeResult::Ok) {
+    Serial.printf("StoredRecordDownloader: Auto record #%u SpO2 decode "
+                 "failed: %s.\n",
+                 recordIndex, decodeResultName(result));
     return false;
   }
 
@@ -398,8 +471,12 @@ bool StoredRecordDownloader::downloadOneAutoRecord(
     return false;
   }
   std::vector<uint8_t> pr;
-  if (StoredRecordDecode::decodeAuto(reportSource, datumCount, autoState,
-                                     pr) != StoredRecordDecode::DecodeResult::Ok) {
+  result = StoredRecordDecode::decodeAuto(reportSource, datumCount, autoState,
+                                          pr, logProgress("pulse-rate"));
+  if (result != StoredRecordDecode::DecodeResult::Ok) {
+    Serial.printf("StoredRecordDownloader: Auto record #%u pulse-rate "
+                 "decode failed: %s.\n",
+                 recordIndex, decodeResultName(result));
     return false;
   }
 
@@ -416,15 +493,26 @@ bool StoredRecordDownloader::downloadOneManualRecord(
   memcpy(requestBuf, Config::kCmdRequestManualTemplate,
         sizeof(Config::kCmdRequestManualTemplate));
 
+  auto logProgress = [](const char *measurement) {
+    return [measurement](uint32_t packetsRead, uint32_t remaining) {
+      Serial.printf("StoredRecordDownloader: Manual record %s decode — "
+                    "%u packets read, %u datums remaining...\n",
+                    measurement, packetsRead, remaining);
+    };
+  };
+
   requestBuf[0] = Config::kManualMeasurementSpo2;
   if (!sendRequest(requestBuf, sizeof(requestBuf), sizeof(requestBuf))) {
     return false;
   }
   std::vector<uint8_t> spo2;
-  if (StoredRecordDecode::decodeManual(reportSource, datumCount,
-                                       StoredRecordDecode::kArtifactSpo2,
-                                       manualState,
-                                       spo2) != StoredRecordDecode::DecodeResult::Ok) {
+  StoredRecordDecode::DecodeResult result = StoredRecordDecode::decodeManual(
+      reportSource, datumCount, StoredRecordDecode::kArtifactSpo2,
+      manualState, spo2, logProgress("SpO2"));
+  if (result != StoredRecordDecode::DecodeResult::Ok) {
+    Serial.printf(
+        "StoredRecordDownloader: Manual record SpO2 decode failed: %s.\n",
+        decodeResultName(result));
     return false;
   }
 
@@ -437,10 +525,13 @@ bool StoredRecordDownloader::downloadOneManualRecord(
     return false;
   }
   std::vector<uint8_t> pr;
-  if (StoredRecordDecode::decodeManual(reportSource, datumCount,
-                                       StoredRecordDecode::kArtifactPr,
-                                       manualState,
-                                       pr) != StoredRecordDecode::DecodeResult::Ok) {
+  result = StoredRecordDecode::decodeManual(
+      reportSource, datumCount, StoredRecordDecode::kArtifactPr, manualState,
+      pr, logProgress("pulse-rate"));
+  if (result != StoredRecordDecode::DecodeResult::Ok) {
+    Serial.printf("StoredRecordDownloader: Manual record pulse-rate decode "
+                 "failed: %s.\n",
+                 decodeResultName(result));
     return false;
   }
 
@@ -449,28 +540,56 @@ bool StoredRecordDownloader::downloadOneManualRecord(
 }
 
 bool StoredRecordDownloader::downloadAndMaybeDelete() {
+  Serial.println(
+      "StoredRecordDownloader: checking PO-400 for stored records...");
   uint8_t presentResp[8] = {0};
   if (!sendExchange(Config::kCmdStoredPresent,
                     sizeof(Config::kCmdStoredPresent), /*writeChecksumLen=*/0,
                     presentResp, sizeof(presentResp),
                     /*readChecksumLen=*/8)) {
+    Serial.println(
+        "StoredRecordDownloader: failed to query stored-record presence.");
     return false;
   }
   const bool present = presentResp[2] != 0;
   if (!present) {
+    Serial.println("StoredRecordDownloader: no stored records present.");
     return true; // Nothing to download; not an error.
   }
   const bool isAuto = presentResp[3] != 0;
+  Serial.printf("StoredRecordDownloader: stored %s record(s) present — "
+               "downloading (test mode %s).\n",
+               isAuto ? "Auto" : "Manual",
+               testModeEnabled_ ? "ON, device data kept" : "OFF, will delete");
 
   if (isAuto) {
+    // Generous but hard bound on how many records this loop will pull
+    // before the device ever reports "last record" — a real PO-400's stored
+    // buffer realistically holds far fewer sessions than this. Without it,
+    // a metadata-format mismatch (e.g. the "isLast" byte at a different
+    // offset than assumed) would keep this loop running forever rather than
+    // failing loudly, since each individual record download can succeed on
+    // its own terms and never trips a transport-level timeout.
+    constexpr uint32_t kMaxAutoRecordsPerSession = 64;
     StoredRecordDecode::AutoState autoState;
     bool isLast = false;
+    uint32_t recordsDownloaded = 0;
     while (!isLast) {
+      if (recordsDownloaded >= kMaxAutoRecordsPerSession) {
+        Serial.printf(
+            "StoredRecordDownloader: aborting — downloaded %u Auto "
+            "records without the device ever reporting 'last record'; "
+            "likely a metadata-format mismatch.\n",
+            recordsDownloaded);
+        return false;
+      }
       uint8_t meta[21] = {0};
       if (!sendExchange(Config::kCmdGetRecordMetadataAuto,
                         sizeof(Config::kCmdGetRecordMetadataAuto),
                         /*writeChecksumLen=*/0, meta, sizeof(meta),
                         /*readChecksumLen=*/21)) {
+        Serial.println(
+            "StoredRecordDownloader: failed to read Auto record metadata.");
         return false;
       }
       isLast = meta[1] != 0;
@@ -488,13 +607,26 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
       const int64_t startEpoch =
           civilToEpochSeconds(year, month, day, hour, minute, second);
 
+      Serial.printf(
+          "StoredRecordDownloader: downloading Auto record #%u — "
+          "%04d-%02d-%02d %02d:%02d:%02d, %u datums...\n",
+          recordIndex, year, month, day, hour, minute, second, datumCount);
       if (!downloadOneAutoRecord(recordIndex, startEpoch, datumCount,
                                  autoState)) {
+        Serial.printf(
+            "StoredRecordDownloader: failed downloading Auto record #%u.\n",
+            recordIndex);
         return false;
       }
+      recordsDownloaded++;
     }
+    Serial.printf(
+        "StoredRecordDownloader: all %u Auto record(s) downloaded.\n",
+        recordsDownloaded);
 
     if (!testModeEnabled_) {
+      Serial.println(
+          "StoredRecordDownloader: deleting Auto records from device.");
       sendExchange(Config::kCmdDeleteRecordsAuto,
                   sizeof(Config::kCmdDeleteRecordsAuto),
                   /*writeChecksumLen=*/0, nullptr, 0,
@@ -506,6 +638,8 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
                       sizeof(Config::kCmdGetRecordMetadataManual),
                       /*writeChecksumLen=*/0, meta, sizeof(meta),
                       /*readChecksumLen=*/14)) {
+      Serial.println(
+          "StoredRecordDownloader: failed to read Manual record metadata.");
       return false;
     }
     const int year = 2000 + meta[2];
@@ -520,12 +654,21 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
     const int64_t startEpoch =
         civilToEpochSeconds(year, month, day, hour, minute, second);
 
+    Serial.printf(
+        "StoredRecordDownloader: downloading Manual record — "
+        "%04d-%02d-%02d %02d:%02d:%02d, %u datums...\n",
+        year, month, day, hour, minute, second, datumCount);
     StoredRecordDecode::ManualState manualState;
     if (!downloadOneManualRecord(startEpoch, datumCount, manualState)) {
+      Serial.println(
+          "StoredRecordDownloader: failed downloading Manual record.");
       return false;
     }
+    Serial.println("StoredRecordDownloader: Manual record downloaded.");
 
     if (!testModeEnabled_) {
+      Serial.println(
+          "StoredRecordDownloader: deleting Manual record from device.");
       sendExchange(Config::kCmdDeleteRecordManual0,
                   sizeof(Config::kCmdDeleteRecordManual0),
                   /*writeChecksumLen=*/0, nullptr, 0,

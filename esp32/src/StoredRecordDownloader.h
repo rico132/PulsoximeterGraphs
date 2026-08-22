@@ -25,6 +25,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace StoredRecordDecode {
@@ -91,10 +92,27 @@ public:
 
 enum class DecodeResult {
   Ok,
-  ChecksumError,  // a datums-command packet's checksum didn't match
-  SequenceError,  // a datums-command packet arrived out of sequence
-  ReadError,      // HidReportSource::readReport() failed
+  ChecksumError,       // a datums-command packet's checksum didn't match
+  SequenceError,       // a datums-command packet arrived out of sequence
+  ReadError,           // HidReportSource::readReport() failed
+  PacketBudgetExceeded, // read this many valid packets without `remaining`
+                        // ever reaching 0 — the device kept streaming
+                        // successfully, so this is not a transport failure;
+                        // it means datumCount (or the nibble geometry) didn't
+                        // match what the device actually sent. Only ever
+                        // observable against real hardware, since the native
+                        // unit tests' fixtures are captured with a matching
+                        // datumCount by construction. See decodeAuto's/
+                        // decodeManual's packet-budget comment.
 };
+
+// Called every kProgressLogInterval packets (see the .cpp) while a decode is
+// in progress, so a caller can surface liveness/progress without the decode
+// namespace itself depending on Serial/millis (kept Arduino-free so the
+// native unit tests still link without them). Real callers (see
+// StoredRecordDownloader.cpp) log packetsRead/remaining; tests pass nullptr.
+using ProgressSink =
+    std::function<void(uint32_t packetsRead, uint32_t remaining)>;
 
 // Ported from process_nibbles_auto()/store_datum_auto() plus the
 // extract_datums() packet-reassembly loop specialized for Auto mode. `state`
@@ -104,16 +122,23 @@ enum class DecodeResult {
 // record) — the reference implementation's countdown-indexed store buffer is
 // provably equivalent to simple in-order appending here (validated against
 // pulseoxdl's own fixtures; see the .cpp for why), which is what this does.
+//
+// Bails out with DecodeResult::PacketBudgetExceeded rather than looping
+// forever if `remaining` doesn't reach 0 within a generous packet budget —
+// see the .cpp for why this can happen against real (vs. fixture) hardware.
 DecodeResult decodeAuto(HidReportSource &source, uint32_t datumCount,
-                        AutoState &state, std::vector<uint8_t> &out);
+                        AutoState &state, std::vector<uint8_t> &out,
+                        const ProgressSink &onProgress = nullptr);
 
 // Ported from process_nibbles_manual()/store_datum_manual(), specialized for
 // Manual mode. `artifactValue` is kArtifactSpo2 or kArtifactPr depending on
 // which measurement is being downloaded (matches extract_datums() setting
-// `artifact` before each measurement's download).
+// `artifact` before each measurement's download). Same packet-budget bailout
+// as decodeAuto above.
 DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
                           uint8_t artifactValue, ManualState &state,
-                          std::vector<uint8_t> &out);
+                          std::vector<uint8_t> &out,
+                          const ProgressSink &onProgress = nullptr);
 
 } // namespace StoredRecordDecode
 
