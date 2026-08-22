@@ -241,11 +241,17 @@ fun GraphScreen(
         // Dragging a selection (below) replaces this with a narrower selectedRange rather than
         // trying to re-decimate this same list on the fly.
         val plottedReadings = remember(readings) { decimateKeepingExtremes(readings) }
+        // Same "does this selection cross a day boundary" check rememberTimeAxisFormatter makes
+        // per-chart (see its own doc) — computed once more here purely to size the shared item
+        // placer's label spacing to match the (possibly longer, date-including) labels it'll
+        // place, not to duplicate the formatting decision itself.
+        val zone = remember { ZoneId.systemDefault() }
+        val multiDayLabels = remember(plottedReadings, zone) { spansMultipleDays(plottedReadings, zone) }
         // Shared between both charts' bottom axes so they pick the exact same tick indices —
         // see the parameter doc on rememberSharedTimeAxisItemPlacer for why leaving each chart
         // to compute its own (Vico's default) caused SpO2 and Pulse to show different times for
         // what's supposed to be the same x-position.
-        val timeAxisItemPlacer = rememberSharedTimeAxisItemPlacer(plottedReadings.size)
+        val timeAxisItemPlacer = rememberSharedTimeAxisItemPlacer(plottedReadings.size, multiDayLabels)
 
         Column(
             modifier = Modifier
@@ -497,9 +503,32 @@ private fun StatsTableRow(
 // just leaving a blank stretch. Indices always have a delta of exactly 1, so this GCD issue
 // can't happen regardless of how sparse or gappy the underlying data is — the axis label
 // formatter below maps each index back to that reading's real timestamp for display.
+/**
+ * Whether [readings] (assumed sorted ascending by timestamp — see ReadingDao's `ORDER BY
+ * timestampEpochSec ASC`) covers more than one local calendar date, comparing only the first and
+ * last reading rather than scanning the whole list — sufficient for a sorted list, and O(1)
+ * instead of O(n) against what can be a many-thousand-row selection.
+ */
+private fun spansMultipleDays(readings: List<ReadingEntity>, zone: ZoneId): Boolean {
+    if (readings.size < 2) return false
+    val firstDate = Instant.ofEpochSecond(readings.first().timestampEpochSec).atZone(zone).toLocalDate()
+    val lastDate = Instant.ofEpochSecond(readings.last().timestampEpochSec).atZone(zone).toLocalDate()
+    return firstDate != lastDate
+}
+
+private val TIME_ONLY_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
+
+// Includes the date on every label once the selected range crosses a day boundary — a gap in the
+// data (e.g. no readings at all on some day in between) would otherwise leave two clusters of
+// points both labeled with a bare "HH:mm", with nothing on the chart itself indicating they're
+// actually days apart rather than the same afternoon.
+private val DATE_AND_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM, HH:mm")
+
 @Composable
-private fun rememberTimeAxisFormatter(readings: List<ReadingEntity>): CartesianValueFormatter =
-    remember(readings) {
+private fun rememberTimeAxisFormatter(readings: List<ReadingEntity>): CartesianValueFormatter {
+    val zone = ZoneId.systemDefault()
+    return remember(readings, zone) {
+        val formatter = if (spansMultipleDays(readings, zone)) DATE_AND_TIME_FORMATTER else TIME_ONLY_FORMATTER
         CartesianValueFormatter { _, value, _ ->
             // Vico's contract forbids ever returning a blank string here — it throws if we do
             // (see the crash this guards against). That's harder to guarantee than it looks:
@@ -517,11 +546,18 @@ private fun rememberTimeAxisFormatter(readings: List<ReadingEntity>): CartesianV
             if (readings.isEmpty()) return@CartesianValueFormatter "–"
             val reading = readings[value.toInt().coerceIn(readings.indices)]
             val instant = Instant.ofEpochSecond(reading.timestampEpochSec)
-            DateTimeFormatter.ofPattern("HH:mm").format(instant.atZone(ZoneId.systemDefault()))
+            formatter.format(instant.atZone(zone))
         }
     }
+}
 
 private const val TARGET_TIME_AXIS_LABEL_COUNT = 6
+
+// Fewer, wider-spaced labels once dates are included (see DATE_AND_TIME_FORMATTER) — "22 Aug,
+// 14:30" needs roughly twice the width "14:30" alone does, and TARGET_TIME_AXIS_LABEL_COUNT's
+// fixed spacing has no awareness of actual label pixel width to widen itself automatically (see
+// rememberSharedTimeAxisItemPlacer's own doc for why spacing is computed this way at all).
+private const val TARGET_TIME_AXIS_LABEL_COUNT_MULTI_DAY = 4
 
 /**
  * A [HorizontalAxis.ItemPlacer] shared by both chart cards' bottom axes, so they land on the
@@ -542,9 +578,10 @@ private const val TARGET_TIME_AXIS_LABEL_COUNT = 6
  * deterministic across the two charts rather than just "usually the same."
  */
 @Composable
-private fun rememberSharedTimeAxisItemPlacer(pointCount: Int): HorizontalAxis.ItemPlacer =
-    remember(pointCount) {
-        val spacing = (pointCount / TARGET_TIME_AXIS_LABEL_COUNT).coerceAtLeast(1)
+private fun rememberSharedTimeAxisItemPlacer(pointCount: Int, multiDay: Boolean): HorizontalAxis.ItemPlacer =
+    remember(pointCount, multiDay) {
+        val targetCount = if (multiDay) TARGET_TIME_AXIS_LABEL_COUNT_MULTI_DAY else TARGET_TIME_AXIS_LABEL_COUNT
+        val spacing = (pointCount / targetCount).coerceAtLeast(1)
         HorizontalAxis.ItemPlacer.aligned(spacing = { spacing }, addExtremeLabelPadding = false)
     }
 
