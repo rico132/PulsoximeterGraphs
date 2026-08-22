@@ -76,6 +76,15 @@ class BleGattClient(
 
         data object Inserting : SyncState
         data object ClearingBuffer : SyncState
+
+        /**
+         * A sync failed in a way [fail] considered transient (see its `retryable` parameter) and
+         * a fresh attempt is already scheduled — shown instead of briefly dropping back to [Idle]
+         * (which would flash the sync dialog closed and reopened a moment later) or surfacing a
+         * [Failed] the user would have to notice and manually retry. [attempt] is 1-based.
+         */
+        data class Retrying(val attempt: Int, val maxAttempts: Int) : SyncState
+
         data class Success(val rowsInserted: Int, val rowsSkipped: Int) : SyncState
         data class Failed(val message: String) : SyncState
     }
@@ -127,6 +136,12 @@ class BleGattClient(
      */
     private var cancelled = false
 
+    // Both reset to a fresh state only by a genuinely new, externally-triggered startSync() call
+    // (isRetry = false below) -- an internal retry's own startSync(isRetry = true) call must NOT
+    // reset retryCount back to 0, or MAX_SYNC_RETRIES would never actually be reached.
+    private var retryCount = 0
+    private var retryJob: Job? = null
+
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
         (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
     }
@@ -135,15 +150,29 @@ class BleGattClient(
 
     /** Kicks off a full sync: scan -> connect -> SET_TIME -> REQUEST_DATA -> insert -> CLEAR_BUFFER. */
     @SuppressLint("MissingPermission") // Callers must check BlePermissions before calling.
-    fun startSync() {
-        if (_syncState.value !is SyncState.Idle &&
-            _syncState.value !is SyncState.Success &&
-            _syncState.value !is SyncState.Failed
-        ) {
-            return // A sync is already in progress.
+    fun startSync() = startSync(isRetry = false)
+
+    /**
+     * [isRetry] is true only when [fail]'s own retry scheduling calls this after a delay -- that
+     * path deliberately bypasses the "already in progress" guard below (by construction, it only
+     * ever runs after the previous attempt has already fully failed and disconnected, so there is
+     * nothing for it to race against) and preserves [retryCount] across the call instead of
+     * resetting it, which is what actually makes [MAX_SYNC_RETRIES] a real cap rather than an
+     * infinite retry loop.
+     */
+    @SuppressLint("MissingPermission")
+    private fun startSync(isRetry: Boolean) {
+        if (!isRetry) {
+            if (_syncState.value !is SyncState.Idle &&
+                _syncState.value !is SyncState.Success &&
+                _syncState.value !is SyncState.Failed
+            ) {
+                return // A sync is already in progress.
+            }
+            retryCount = 0
         }
 
-        log("Sync started")
+        log(if (isRetry) "Retry attempt $retryCount/$MAX_SYNC_RETRIES starting" else "Sync started")
         receiveBuffer.reset()
         lastProgressEmitMs = 0L
         chunkArrivalLogCount = 0
@@ -241,12 +270,21 @@ class BleGattClient(
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 log("Disconnected (status $status)")
                 // Cancelling calls disconnect() itself, so the resulting STATE_DISCONNECTED here
-                // must not get reinterpreted as an unexpected failure on top of the cancel.
+                // must not get reinterpreted as an unexpected failure on top of the cancel. Same
+                // reasoning for Retrying: fail()'s own retry path calls disconnect() too, and on
+                // some devices that still asynchronously delivers a STATE_DISCONNECTED here some
+                // time later -- by then the state is already Retrying (fail() sets it before
+                // calling disconnect(), same ordering as the plain-Failed path), so without this
+                // check a single real failure would schedule two overlapping retries instead of
+                // one.
                 if (!cancelled &&
                     _syncState.value !is SyncState.Success &&
-                    _syncState.value !is SyncState.Failed
+                    _syncState.value !is SyncState.Failed &&
+                    _syncState.value !is SyncState.Retrying
                 ) {
-                    fail("Device disconnected before sync completed")
+                    // A mid-transfer disconnect is exactly the kind of transient BLE hiccup a
+                    // retry can plausibly recover from — see fail()'s own doc on `retryable`.
+                    fail("Device disconnected before sync completed", retryable = true)
                 }
                 closeGatt()
             }
@@ -498,8 +536,8 @@ class BleGattClient(
 
     /**
      * Aborts an in-progress sync and disconnects, WITHOUT saving anything: only effective before
-     * the local database insert has begun (Scanning/Connecting/RequestingData/ReceivingData) —
-     * once the transfer has already completed and insertion is under way (Inserting/
+     * the local database insert has begun (Scanning/Connecting/RequestingData/ReceivingData/
+     * Retrying) — once the transfer has already completed and insertion is under way (Inserting/
      * ClearingBuffer), this is a no-op, since by then there's normally nothing left to
      * meaningfully cancel (the insert itself is a single fast batch write; see PROTOCOL.md's
      * crash-safety ordering). The UI is expected to hide/disable its Cancel affordance in those
@@ -509,10 +547,15 @@ class BleGattClient(
         when (_syncState.value) {
             is SyncState.Scanning, is SyncState.Connecting,
             is SyncState.RequestingData, is SyncState.ReceivingData,
+            is SyncState.Retrying,
             -> {
                 log("Sync cancelled by user")
                 cancelled = true
                 cancelTimeout()
+                // Otherwise a retry already scheduled (see fail()'s `retryable` path) would fire
+                // after this cancel and silently resurrect a sync the user just backed out of.
+                retryJob?.cancel()
+                retryJob = null
                 _syncState.value = SyncState.Idle
                 disconnect()
             }
@@ -633,7 +676,14 @@ class BleGattClient(
         cancelTimeout()
         timeoutJob = scope.launch {
             delay(SYNC_TIMEOUT_MS)
-            fail("Sync timed out")
+            // A stall here is exactly the failure mode a retry can plausibly recover from: BLE
+            // notifications are unacknowledged, so a burst of them (including, worst case, the
+            // final terminator) can go missing in transit with neither side ever finding out --
+            // the ESP32 believes it sent everything and disconnects normally afterward, while the
+            // phone just stops receiving anything at all. Nothing is lost on the device either
+            // way (its buffer isn't cleared until a CLEAR_BUFFER this sync never got to send), so
+            // simply trying the whole transfer again is safe.
+            fail("Sync timed out", retryable = true)
         }
     }
 
@@ -642,9 +692,34 @@ class BleGattClient(
         timeoutJob = null
     }
 
-    private fun fail(message: String) {
+    /**
+     * [retryable]: if true and under [MAX_SYNC_RETRIES], schedules a fresh [startSync] attempt
+     * after [RETRY_DELAY_MS] instead of surfacing [SyncState.Failed] immediately -- safe to do
+     * unconditionally for the failure modes that pass true (see their own call sites) because
+     * neither leaves anything corrupted to clean up first: the ESP32 never clears its buffer
+     * until a CLEAR_BUFFER this sync never got to send, so a from-scratch retry can't lose data,
+     * only re-download what's already safely still sitting on the device.
+     */
+    private fun fail(message: String, retryable: Boolean = false) {
         log("FAILED: $message")
         cancelTimeout()
+        if (retryable && retryCount < MAX_SYNC_RETRIES) {
+            retryCount++
+            val attempt = retryCount
+            log("Will retry in ${RETRY_DELAY_MS}ms (attempt $attempt/$MAX_SYNC_RETRIES) after: $message")
+            // Set *before* disconnect(), same ordering as the plain-Failed path below: on some
+            // devices disconnect()'s gatt.close() still asynchronously delivers a
+            // STATE_DISCONNECTED sometime later (see onConnectionStateChange's own comment), and
+            // Retrying must already be visible by then so that callback's guard doesn't treat it
+            // as a second, unexpected disconnect and schedule a second retry on top of this one.
+            _syncState.value = SyncState.Retrying(attempt, MAX_SYNC_RETRIES)
+            disconnect()
+            retryJob = scope.launch {
+                delay(RETRY_DELAY_MS)
+                startSync(isRetry = true)
+            }
+            return
+        }
         _syncState.value = SyncState.Failed(message)
         disconnect()
     }
@@ -673,5 +748,16 @@ class BleGattClient(
         private const val PROGRESS_EMIT_INTERVAL_MS = 100L
         private const val CHUNK_ARRIVAL_LOG_LIMIT = 20
         private const val SNAPSHOT_INTERVAL_MS = 2_000L
+
+        // See fail()'s own doc: retries are safe here because nothing is destroyed on a failed
+        // attempt (the ESP32 keeps its buffer until CLEAR_BUFFER, which a failed sync never
+        // sends), so this only trades a little time and battery for not making the user notice a
+        // stall and manually re-tap sync themselves.
+        private const val MAX_SYNC_RETRIES = 2
+        // Long enough to give a transient radio hiccup (the failure mode this targets) a moment
+        // to clear rather than immediately repeating into the same conditions; short enough that
+        // three total attempts (this delay twice, plus the initial one) still finishes well
+        // inside the time a user would wait around for a manual retry anyway.
+        private const val RETRY_DELAY_MS = 2_000L
     }
 }

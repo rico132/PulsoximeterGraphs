@@ -295,6 +295,7 @@ private fun isCancelable(state: BleGattClient.SyncState): Boolean = when (state)
     BleGattClient.SyncState.Connecting,
     BleGattClient.SyncState.RequestingData,
     is BleGattClient.SyncState.ReceivingData,
+    is BleGattClient.SyncState.Retrying,
     -> true
     else -> false
 }
@@ -315,6 +316,7 @@ private fun syncStatusText(state: BleGattClient.SyncState): String = when (state
     is BleGattClient.SyncState.ReceivingData -> receivingDataText(state)
     BleGattClient.SyncState.Inserting -> "Saving to database…"
     BleGattClient.SyncState.ClearingBuffer -> "Finishing up…"
+    is BleGattClient.SyncState.Retrying -> "Sync stalled — retrying (${state.attempt}/${state.maxAttempts})…"
     BleGattClient.SyncState.Idle,
     is BleGattClient.SyncState.Success,
     is BleGattClient.SyncState.Failed,
