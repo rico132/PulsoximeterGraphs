@@ -665,10 +665,35 @@ void StoredRecordDownloader::appendDecodedRecord(
     int64_t startEpochSeconds, const std::vector<uint8_t> &spo2,
     const std::vector<uint8_t> &pr) {
   const size_t n = spo2.size() < pr.size() ? spo2.size() : pr.size();
+  // TEMPORARY DIAGNOSTIC: two hardware runs now show decodeAuto() finishing
+  // cleanly (the second onProgress checkpoint reporting 0 datums remaining)
+  // right before a task watchdog abort, with zero further output — not even
+  // RamCsvBuffer::appendRow()'s/FileCsvBuffer::appendRow()'s own first-row
+  // esp_rom_printf, which comes at the *end* of appendRow() after its real
+  // work (memcpy for RAM; LittleFS open+write+close for the fallback). This
+  // brackets the loop itself: an unconditional entry print (n is otherwise
+  // invisible — this record's whole pulse-rate/SpO2 datum count) plus one
+  // every 200 rows, all via esp_rom_printf so it can't itself stall the way
+  // Serial could. If this call is on FileCsvBuffer (no PSRAM), each
+  // appendRow() does a real LittleFS open/write/close — individually slow,
+  // and esp_task_wdt_reset() is never called from this loop at all (only
+  // from UsbHidOxHost::readReport()), so thousands of rows with brief
+  // flash-wait yields in between (matching every "CPU1: IDLE1" snapshot so
+  // far) could plausibly outrun the 30s watchdog with no single genuinely
+  // stuck call. Revert once the actual cause is confirmed.
+  esp_rom_printf(
+      "StoredRecordDownloader: appending %u decoded row(s) to CsvBuffer...\n",
+      static_cast<unsigned>(n));
   for (size_t i = 0; i < n; i++) {
     csvBuffer_.appendRow(startEpochSeconds + static_cast<int64_t>(i), spo2[i],
                         pr[i]);
+    if (i % 200 == 0) {
+      esp_rom_printf("StoredRecordDownloader:   appended row %u/%u...\n",
+                    static_cast<unsigned>(i), static_cast<unsigned>(n));
+    }
   }
+  esp_rom_printf("StoredRecordDownloader: finished appending %u row(s).\n",
+                static_cast<unsigned>(n));
 }
 
 bool StoredRecordDownloader::downloadOneAutoRecord(
