@@ -18,6 +18,7 @@
 // mandatory USB spike and UsbHidOxHost.h's header comment.
 
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 
 #include "BleGattServer.h"
 #include "ClockSync.h"
@@ -59,7 +60,22 @@ void usbTask(void * /*param*/) {
     // the actual "unplugged" log line — there's no wait-for-detach loop
     // here since there's nothing left to do while the device stays
     // attached).
-    if (!g_storedRecordDownloader->downloadAndMaybeDelete()) {
+    //
+    // Subscribed to the task watchdog only for this call's duration — not
+    // during the idle wait above, not during the (separate-task) BLE dump
+    // afterward, both of which previously caused false-positive reboots
+    // when this was subscribed for usbTask's whole lifetime. Real hardware
+    // has shown a rare, still-unexplained hang inside
+    // UsbHidOxHost::readReport()'s otherwise-3s-bounded wait — not a
+    // scheduling/Serial/BLE issue (all ruled out); most likely a fault in
+    // the underlying "beta" usb_host.h driver itself, per its own header's
+    // warning. Test mode keeps every record on the device, so a reboot
+    // here is safe: the next attach just retries the whole download fresh,
+    // which empirically does eventually succeed.
+    esp_task_wdt_add(nullptr);
+    const bool downloadOk = g_storedRecordDownloader->downloadAndMaybeDelete();
+    esp_task_wdt_delete(nullptr);
+    if (!downloadOk) {
       Serial.println(
           "UsbTask: stored-record download failed or device detached "
           "during it.");
@@ -97,6 +113,16 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("PulsoxRelay firmware starting.");
+
+  // 30s: generous margin over normal operation (every observed read/packet
+  // is sub-second) so this never false-triggers on legitimate work, while
+  // still recovering automatically from the rare real-hardware hang seen
+  // inside UsbHidOxHost::readReport() (Serial, BLE, and cross-/same-core
+  // scheduling all ruled out as the cause — see usbTask()'s own comment on
+  // where this gets subscribed/unsubscribed, deliberately only around the
+  // download call itself so idle-wait and the BLE dump can't false-trigger
+  // it the way an earlier, more broadly-scoped attempt did).
+  esp_task_wdt_init(30, /*panic=*/true);
 
   if (g_ramCsvBuffer.begin()) {
     g_csvBuffer = &g_ramCsvBuffer;

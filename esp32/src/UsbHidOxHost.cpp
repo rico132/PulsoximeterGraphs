@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include <esp_task_wdt.h>
+
 #include "Config.h"
 
 namespace {
@@ -372,7 +374,15 @@ bool UsbHidOxHost::readReport(uint8_t *buf, size_t bufSize,
     return false;
   }
   ReportMessage msg;
-  if (xQueueReceive(reportQueue_, &msg, pdMS_TO_TICKS(timeoutMs)) != pdTRUE) {
+  const bool got =
+      xQueueReceive(reportQueue_, &msg, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+  // Every caller of readReport() runs on usbTask, and only while it's
+  // subscribed to the task watchdog (see usbTask()'s comment on the
+  // deliberately narrow window that's true for) — reset here, whether this
+  // wait succeeded or (validly, within its own bound) timed out, so only a
+  // genuine failure of that bound itself trips the watchdog.
+  esp_task_wdt_reset();
+  if (!got) {
     return false;
   }
   const size_t n = msg.length < bufSize ? msg.length : bufSize;
