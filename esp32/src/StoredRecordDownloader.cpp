@@ -361,11 +361,22 @@ class UsbHidReportSource : public StoredRecordDecode::HidReportSource {
 public:
   explicit UsbHidReportSource(UsbHidOxHost &host) : host_(host) {}
   bool readReport(uint8_t report[64]) override {
-    return host_.readReport(report, 64, /*timeoutMs=*/3000);
+    const bool ok = host_.readReport(report, 64, /*timeoutMs=*/3000);
+    // First few raw datum-stream reports only, so a checksum/sequence
+    // failure in decodeAuto/decodeManual (which can't log — no Serial in
+    // the native-tested StoredRecordDecode namespace) is still diagnosable
+    // from here without dumping thousands of lines for a full record.
+    if (ok && loggedCount_ < kMaxLogged) {
+      loggedCount_++;
+      logHex("datum stream RX", report, 64);
+    }
+    return ok;
   }
 
 private:
+  static constexpr int kMaxLogged = 5;
   UsbHidOxHost &host_;
+  int loggedCount_ = 0;
 };
 
 } // namespace
