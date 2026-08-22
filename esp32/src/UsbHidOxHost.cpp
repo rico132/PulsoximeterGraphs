@@ -71,8 +71,21 @@ void UsbHidOxHost::usbHostTaskTrampoline(void *arg) {
 
 void UsbHidOxHost::usbHostTaskLoop() {
   for (;;) {
+    // usb_host_lib_handle_events()'s timeout only bounds how long it waits
+    // for a *library*-level event (device connect/disconnect); it does not
+    // drive per-transfer completions. Those are only dispatched by
+    // usb_host_client_handle_events() below, on the far side of this call —
+    // so a large timeout here means the interrupt-IN transfer can go that
+    // long without being noticed and resubmitted. Observed against real
+    // hardware: a stored-record datum-download burst able to outrun a 50ms
+    // cycle here loses a report every so often, at a different point each
+    // run — not caught by making our own report queue deeper (see
+    // droppedReportCount()'s own history; it stayed at 0 throughout), since
+    // the loss was happening below that, at exactly this dispatch gap. 1ms
+    // makes this loop service client events roughly 50x more often, at the
+    // cost of a bit more CPU spent on this task's own busy-ish polling.
     uint32_t eventFlags = 0;
-    usb_host_lib_handle_events(pdMS_TO_TICKS(50), &eventFlags);
+    usb_host_lib_handle_events(pdMS_TO_TICKS(1), &eventFlags);
     if (clientHandle_) {
       usb_host_client_handle_events(clientHandle_, 0);
     }
