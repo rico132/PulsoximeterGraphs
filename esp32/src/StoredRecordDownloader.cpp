@@ -435,7 +435,21 @@ class UsbHidReportSource : public StoredRecordDecode::HidReportSource {
 public:
   explicit UsbHidReportSource(UsbHidOxHost &host) : host_(host) {}
   bool readReport(uint8_t report[64]) override {
+    const unsigned long startMs = millis();
     const bool ok = host_.readReport(report, 64, /*timeoutMs=*/3000);
+    const unsigned long elapsedMs = millis() - startMs;
+    reportsRead_++;
+    // Every read is normally near-instant while the device is actively
+    // streaming; a single call taking anywhere close to the 3000ms budget
+    // is the direct, unambiguous signal that something stopped flowing
+    // right at that point — logged regardless of the kMaxLogged cap below,
+    // so a stall deep into a long record is still visible without having
+    // to dump every single one of possibly thousands of reads to find it.
+    if (elapsedMs >= 500) {
+      Serial.printf(
+          "StoredRecordDownloader: datum stream read #%lu took %lums (%s).\n",
+          reportsRead_, elapsedMs, ok ? "succeeded" : "TIMED OUT");
+    }
     // First few raw datum-stream reports only, so a checksum/sequence
     // failure in decodeAuto/decodeManual (which can't log — no Serial in
     // the native-tested StoredRecordDecode namespace) is still diagnosable
@@ -451,6 +465,7 @@ private:
   static constexpr int kMaxLogged = 5;
   UsbHidOxHost &host_;
   int loggedCount_ = 0;
+  unsigned long reportsRead_ = 0;
 };
 
 } // namespace
