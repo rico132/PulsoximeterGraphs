@@ -101,9 +101,18 @@ constexpr uint16_t kMinMtu = 23;
 // ---------------------------------------------------------------------------
 // Buffering — plan §"Buffering"
 // ---------------------------------------------------------------------------
-// ~30 bytes/CSV-row; hard cap at ~12h buffered (43,200 rows) before recording
+// ~30 bytes/CSV-row; hard cap at ~22h buffered (80,000 rows) before recording
 // stops until CLEAR_BUFFER. No FIFO rotation (simplest correct MVP behavior).
-constexpr uint32_t kMaxBufferedRows = 43200;
+//
+// Was 43,200 (~12h) — too low for a real multi-record PO-400 sync: a device
+// seen with 6 stored Auto records plus one still-recording totaled 51,367
+// datums (~1.57MB of rows), more than the *previous* 1.5MB littlefs
+// partition could hold at all, and past this cap partway through downloading
+// besides. 80,000 rows * kMaxCsvRowLength = 3.2MB, sized to fit inside the
+// ~3.87MB littlefs partition partitions_8MB.csv now gives FileCsvBuffer
+// (used on any board without PSRAM, which stores this in flash, not a fixed
+// RAM arena) with headroom left over for LittleFS's own metadata overhead.
+constexpr uint32_t kMaxBufferedRows = 80000;
 constexpr uint32_t kApproxBytesPerRow = 30; // typical row size, for the plan's back-of-envelope budget
 // Worst-case row: "YYYY-MM-DD, HH:MM:SS, 100, 255\r\n" == 32 bytes; round up
 // for headroom so the RAM/File buffer arena is sized safely, not just typically.

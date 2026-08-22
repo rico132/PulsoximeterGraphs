@@ -1,0 +1,27 @@
+# Custom partition table for the 8MB-flash ESP32-S3 targets (esp32-s3-usb-otg,
+# esp32-s3-devkitc-1), replacing Espressif's stock default_8MB.csv.
+#
+# Why: the stock table gives app0/app1 3.19MB each (for OTA A/B) and only
+# 1.5MB to spiffs/littlefs — but this firmware is ~1.1MB, and the CSV buffer
+# (FileCsvBuffer, used on any board without PSRAM) needs to hold everything
+# downloaded from the PO-400 in one BLE-sync session. A real device was seen
+# with 51,367 total datums (~1.57MB of CSV rows at worst-case row length)
+# across 7 stored records — more than the stock 1.5MB partition could ever
+# hold, let alone the row-count cap (Config::kMaxBufferedRows) previously
+# tuned to roughly fit inside it. Shrinking each app slot to 2MB (still ~45%
+# headroom over current firmware size) frees enough space to grow spiffs to
+# ~3.87MB, comfortably covering multi-day accumulation on the device before
+# a sync, not just this one already-seen case.
+#
+# Re-flashing with a changed partition table reformats the filesystem region
+# (FileCsvBuffer's own LittleFS.begin(true) formats on a failed mount, which
+# a boundary change causes) — fine as long as nothing unsynced is buffered
+# at the time, since CLEAR_BUFFER already means the phone has it durably.
+#
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x5000,
+otadata,    data, ota,      0xe000,    0x2000,
+app0,       app,  ota_0,    0x10000,   0x200000,
+app1,       app,  ota_1,    0x210000,  0x200000,
+spiffs,     data, spiffs,   0x410000,  0x3e0000,
+coredump,   data, coredump, 0x7f0000,  0x10000,
