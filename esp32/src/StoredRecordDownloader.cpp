@@ -93,16 +93,22 @@ uint32_t packetBudget(uint32_t datumCount) {
 // along a decode is — see ProgressSink's comment in the header for why this
 // indirection exists instead of calling Serial directly here.
 //
-// Was dropped to 1 for one diagnostic run after a task watchdog abort kept
-// reproducing at the exact same report count even with every Serial call in
-// this file's own hot loop moved to esp_rom_printf. That per-packet
-// resolution is what pinned the real cause down to a call site outside this
-// file entirely: RamCsvBuffer::appendRow()/FileCsvBuffer::appendRow()'s
-// first-10-rows debug echo, called from appendDecodedRecord() right after
-// this exact decode finishes, was still using blocking Serial calls
-// back-to-back with no pacing — see those files' appendRow() comments. Back
-// to 20 now that that's fixed.
-constexpr uint32_t kProgressLogInterval = 20;
+// TEMPORARY DIAGNOSTIC (back to 1, not 20): fixing RamCsvBuffer/
+// FileCsvBuffer's first-10-rows debug echo (see those files' appendRow()
+// comments) did NOT stop the task watchdog abort from reproducing at the
+// same report count. Crucially, with that fix in place, no "CsvBuffer: row
+// N:" line (now esp_rom_printf, can't silently fail to show) ever appears
+// before the abort — proving appendDecodedRecord()/appendRow() is never
+// actually reached. The earlier per-packet run's "239 packets read, 37
+// datums remaining" was misread as "decode finishes here": onProgress
+// reports `remaining` as it stood *before* the current packet's own
+// decrements, so that only bounded how many datums packet 239 *could*
+// remove (up to 42) — it didn't prove `remaining` reached 0. It evidently
+// didn't. Back to 1 to find out, empirically, exactly which packet really
+// is last-completed and whether the loop is still making any progress at
+// all past where the previous run stopped looking. Revert to 20 once the
+// actual blocking statement is identified.
+constexpr uint32_t kProgressLogInterval = 1;
 
 } // namespace
 
