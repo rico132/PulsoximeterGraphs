@@ -568,8 +568,18 @@ void StoredRecordDownloader::setTestMode(bool enabled) {
 }
 
 void StoredRecordDownloader::resetCommittedRecords() {
-  preferences_.remove(Config::kPrefsKeyCommittedAutoEpochs);
-  preferences_.remove(Config::kPrefsKeyCommittedManualEpoch);
+  // isKey() first: Preferences::remove() logs an ESP_LOGE-level "nvs_erase_key fail: ...
+  // NOT_FOUND" error whenever the key doesn't exist, even though "nothing to reset" is the
+  // expected, common case here — e.g. a device-pairing with only Auto records never writes
+  // kPrefsKeyCommittedManualEpoch at all, and once one CLEAR_BUFFER has already removed
+  // kPrefsKeyCommittedAutoEpochs, every following CLEAR_BUFFER this pairing would otherwise spam
+  // that same error for it too. isKey() performs the equivalent lookup without logging on a miss.
+  if (preferences_.isKey(Config::kPrefsKeyCommittedAutoEpochs)) {
+    preferences_.remove(Config::kPrefsKeyCommittedAutoEpochs);
+  }
+  if (preferences_.isKey(Config::kPrefsKeyCommittedManualEpoch)) {
+    preferences_.remove(Config::kPrefsKeyCommittedManualEpoch);
+  }
 }
 
 // Auto records are keyed by recordIndex (a uint8_t, so up to 256 possible
