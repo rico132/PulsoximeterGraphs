@@ -142,6 +142,27 @@ class BleGattClient(
     private var retryCount = 0
     private var retryJob: Job? = null
 
+    // Set (only once the "already in progress" guard below has been passed -- see
+    // resyncFromDevice()) right before scanning starts, and consumed exactly once, by
+    // onDescriptorWrite, the moment this specific connection is far enough along to act on it.
+    // Deliberately NOT re-armed for a retry of a resync attempt (startSync(isRetry = true) below
+    // never sets it) -- the USB re-download this triggers on the ESP32 keeps running on its own
+    // task independently of this BLE connection's lifecycle, so triggering it a second time on
+    // retry would only waste USB airtime re-enumerating records the first trigger is already
+    // handling.
+    private var pendingForceResync = false
+
+    // A resync (see pendingForceResync above) makes the ESP32 kick off a fresh multi-record USB
+    // download before it can send anything at all -- BleGattServer's own REQUEST_DATA handler
+    // then silently waits (up to 5 minutes, sending nothing over BLE in the meantime) for that
+    // download to finish before the very first byte goes out. Plain SYNC_TIMEOUT_MS was sized
+    // for "the link stalled", not "the ESP32 is still busy re-downloading everything from the
+    // device" -- without this, a resync would almost always time out (and get auto-retried, and
+    // time out again) before data ever started arriving. Set once per startSync() call, used for
+    // every armTimeout() during that attempt; a longer grace period doesn't weaken genuine-stall
+    // detection during the transfer itself, since every chunk still re-arms it the same way.
+    private var currentSyncTimeoutMs = SYNC_TIMEOUT_MS
+
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
         (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
     }
@@ -153,15 +174,29 @@ class BleGattClient(
     fun startSync() = startSync(isRetry = false)
 
     /**
+     * Like [startSync], but first tells the ESP32 to forget which stored records it's already
+     * delivered and re-download everything fresh from the still-attached PO-400 (see
+     * BleConstants.OPCODE_RESYNC_FROM_DEVICE's own doc) before proceeding with the normal
+     * SET_TIME -> REQUEST_DATA sequence. A plain [startSync] alone can't recover from this: once
+     * a transfer has been confirmed via CLEAR_BUFFER, the ESP32's relay buffer is correctly
+     * empty from then on, regardless of whether the phone still actually has that data (e.g.
+     * after the app's own local data is cleared) -- REQUEST_DATA has nothing to send until
+     * something repopulates that buffer first.
+     */
+    @SuppressLint("MissingPermission")
+    fun resyncFromDevice() = startSync(isRetry = false, forceResync = true)
+
+    /**
      * [isRetry] is true only when [fail]'s own retry scheduling calls this after a delay -- that
      * path deliberately bypasses the "already in progress" guard below (by construction, it only
      * ever runs after the previous attempt has already fully failed and disconnected, so there is
      * nothing for it to race against) and preserves [retryCount] across the call instead of
      * resetting it, which is what actually makes [MAX_SYNC_RETRIES] a real cap rather than an
-     * infinite retry loop.
+     * infinite retry loop. [forceResync] is only ever true from [resyncFromDevice] itself, never
+     * from an internal retry (its default covers that) -- see [pendingForceResync]'s own comment.
      */
     @SuppressLint("MissingPermission")
-    private fun startSync(isRetry: Boolean) {
+    private fun startSync(isRetry: Boolean, forceResync: Boolean = false) {
         if (!isRetry) {
             if (_syncState.value !is SyncState.Idle &&
                 _syncState.value !is SyncState.Success &&
@@ -170,7 +205,20 @@ class BleGattClient(
                 return // A sync is already in progress.
             }
             retryCount = 0
+            // See currentSyncTimeoutMs's own comment: a resync needs to tolerate the ESP32 going
+            // quiet for a while (re-downloading over USB) before it can send anything at all.
+            // Deliberately set only here, not unconditionally below: the USB re-download this
+            // triggers keeps running on the ESP32 independently of this BLE connection, so a
+            // *retry* of a timed-out resync attempt (isRetry = true) may still need to wait
+            // through the same download rather than a fresh one -- resetting to the short
+            // default on retry would just make the retry time out the same way all over again.
+            currentSyncTimeoutMs = if (forceResync) RESYNC_TIMEOUT_MS else SYNC_TIMEOUT_MS
         }
+        // Assigned unconditionally (unlike currentSyncTimeoutMs above): a retry must never
+        // re-send RESYNC_FROM_DEVICE itself (forceResync's default of false already guarantees
+        // that for the isRetry=true call site), only tolerate the same long silence while
+        // whatever it already triggered keeps running.
+        pendingForceResync = forceResync
 
         log(if (isRetry) "Retry attempt $retryCount/$MAX_SYNC_RETRIES starting" else "Sync started")
         receiveBuffer.reset()
@@ -343,7 +391,14 @@ class BleGattClient(
         @SuppressLint("MissingPermission")
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             armTimeout()
-            writeSetTime(gatt)
+            // Consumed here, once, right as it's acted on -- see resyncFromDevice()'s own doc for
+            // why this needs to happen exactly once per requested resync, not on every connection.
+            if (pendingForceResync) {
+                pendingForceResync = false
+                writeResyncFromDevice(gatt)
+            } else {
+                writeSetTime(gatt)
+            }
         }
 
         @Suppress("DEPRECATION")
@@ -358,6 +413,7 @@ class BleGattClient(
             }
             armTimeout()
             when (lastControlWrite) {
+                ControlWrite.RESYNC_FROM_DEVICE -> writeSetTime(gatt)
                 ControlWrite.SET_TIME -> writeRequestData(gatt)
                 ControlWrite.REQUEST_DATA -> _syncState.value = SyncState.ReceivingData(0)
                 ControlWrite.CLEAR_BUFFER -> {
@@ -602,9 +658,15 @@ class BleGattClient(
         }
     }
 
-    private enum class ControlWrite { SET_TIME, REQUEST_DATA, CLEAR_BUFFER, DEVICE_SETTING }
+    private enum class ControlWrite { SET_TIME, REQUEST_DATA, CLEAR_BUFFER, DEVICE_SETTING, RESYNC_FROM_DEVICE }
 
     private var lastControlWrite: ControlWrite? = null
+
+    @SuppressLint("MissingPermission")
+    private fun writeResyncFromDevice(gatt: BluetoothGatt) {
+        lastControlWrite = ControlWrite.RESYNC_FROM_DEVICE
+        writeControl(gatt, byteArrayOf(BleConstants.OPCODE_RESYNC_FROM_DEVICE))
+    }
 
     @SuppressLint("MissingPermission")
     private fun writeSetTime(gatt: BluetoothGatt) {
@@ -686,7 +748,7 @@ class BleGattClient(
     private fun armTimeout() {
         cancelTimeout()
         timeoutJob = scope.launch {
-            delay(SYNC_TIMEOUT_MS)
+            delay(currentSyncTimeoutMs)
             // A stall here is exactly the failure mode a retry can plausibly recover from: BLE
             // notifications are unacknowledged, so a burst of them (including, worst case, the
             // final terminator) can go missing in transit with neither side ever finding out --
@@ -756,6 +818,18 @@ class BleGattClient(
     companion object {
         private const val TAG = "BleGattClient"
         private const val SYNC_TIMEOUT_MS = 30_000L
+
+        // BleGattServer's REQUEST_DATA handler waits up to its own 5-minute ceiling for an
+        // in-progress USB download, sending nothing over BLE while it does -- a resync
+        // deliberately triggers exactly that, so it needs a proportionally patient timeout here
+        // too (see currentSyncTimeoutMs's own comment) rather than the plain SYNC_TIMEOUT_MS,
+        // sized for "the link stalled" during an already-populated, ready-to-send buffer.
+        // Somewhat short of the full 5 minutes: a real multi-record re-download realistically
+        // finishes well within this, and MAX_SYNC_RETRIES' auto-retries still give it more total
+        // patience than a single attempt at the full 5 minutes would, without one single hung
+        // attempt tying up the UI for that whole time before the first retry can even start.
+        private const val RESYNC_TIMEOUT_MS = 150_000L
+
         private const val PROGRESS_EMIT_INTERVAL_MS = 100L
         private const val CHUNK_ARRIVAL_LOG_LIMIT = 20
         private const val SNAPSHOT_INTERVAL_MS = 2_000L

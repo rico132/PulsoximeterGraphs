@@ -6,10 +6,10 @@
 
 BleGattServer::BleGattServer(ICsvBuffer &csvBuffer, ClockSync &clockSync,
                              StoredRecordDownloader &storedRecordDownloader,
-                             OtaManager &otaManager)
+                             OtaManager &otaManager, UsbHidOxHost &usbHost)
     : csvBuffer_(csvBuffer), clockSync_(clockSync),
       storedRecordDownloader_(storedRecordDownloader),
-      otaManager_(otaManager) {}
+      otaManager_(otaManager), usbHost_(usbHost) {}
 
 void BleGattServer::ServerCallbacks::onConnect(NimBLEServer * /*server*/,
                                                NimBLEConnInfo &connInfo) {
@@ -174,6 +174,25 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
   case Config::kOpEnterOtaMode:
     Serial.println("BleGattServer: ENTER_OTA_MODE received.");
     otaManager_.enterOtaMode();
+    break;
+
+  case Config::kOpResyncFromDevice:
+    if (storedRecordDownloader_.downloadInProgress()) {
+      // Already effectively doing this (e.g. a real attach is mid-download,
+      // or an earlier RESYNC_FROM_DEVICE this same connection already
+      // kicked it off) — triggering a second overlapping run would just
+      // waste USB airtime re-enumerating records the first run either
+      // already re-committed or is about to.
+      Serial.println("BleGattServer: RESYNC_FROM_DEVICE received while a "
+                     "download is already in progress — ignoring.");
+      break;
+    }
+    Serial.println(
+        "BleGattServer: RESYNC_FROM_DEVICE received — forgetting which "
+        "records were already committed and re-triggering a fresh USB "
+        "download from the still-attached device.");
+    storedRecordDownloader_.resetCommittedRecords();
+    usbHost_.triggerAttachCallback();
     break;
 
   default:

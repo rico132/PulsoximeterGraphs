@@ -42,6 +42,9 @@ class SettingsViewModel(
 
     fun enterOtaMode() = bleGattClient.enterOtaMode()
 
+    /** See [BleGattClient.resyncFromDevice] -- recovers after this app's own local data is lost. */
+    fun resyncFromDevice() = bleGattClient.resyncFromDevice()
+
     fun isDeviceConnected(): Boolean = when (syncState.value) {
         is BleGattClient.SyncState.Success,
         is BleGattClient.SyncState.ReceivingData,

@@ -246,6 +246,25 @@ private fun DeviceSection(viewModel: SettingsViewModel, testModeEnabled: Boolean
                     Text("Enter OTA mode")
                 }
 
+                HorizontalDivider()
+
+                Text(
+                    "If this app's own data was cleared (or reinstalled) after a sync, a plain " +
+                        "sync has nothing left to send -- the ESP32 already discarded its copy " +
+                        "once this app confirmed receiving it. This asks the ESP32 to " +
+                        "re-download everything fresh from the device itself (nothing is " +
+                        "deleted from the device either way) and connects to fetch it.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                // Deliberately NOT gated on `connected` (unlike the actions above): those write
+                // to an already-open connection from an in-progress sync, but this one starts a
+                // brand new one from scratch, the same way the main sync button does -- tapping
+                // it while a sync is already running is a harmless no-op (BleGattClient.startSync
+                // ignores a call while one is already in progress), same as that button today.
+                Button(onClick = { viewModel.resyncFromDevice() }) {
+                    Text("Re-download all data from device")
+                }
+
                 if (!connected) {
                     Text(
                         "Connect to the device (via a BLE sync) to enable these controls.",

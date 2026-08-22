@@ -144,7 +144,8 @@ void setup() {
   g_otaManager.begin();
 
   static BleGattServer bleGattServer(*g_csvBuffer, g_clockSync,
-                                     *g_storedRecordDownloader, g_otaManager);
+                                     *g_storedRecordDownloader, g_otaManager,
+                                     g_usbHost);
   g_bleGattServer = &bleGattServer;
   g_bleGattServer->begin();
 

@@ -79,6 +79,20 @@ public:
   void onAttach(AttachCallback callback) { attachCallback_ = callback; }
   void onDetach(DetachCallback callback) { detachCallback_ = callback; }
 
+  // Fires the same callback a real USB attach event would, without requiring
+  // the PO-400 to actually be unplugged and replugged — used by
+  // BleGattServer's RESYNC_FROM_DEVICE opcode so a phone that's lost its own
+  // local copy (e.g. app data cleared) can ask for a fresh full re-download
+  // of whatever the device still has. Safe to call even with nothing
+  // attached: the resulting downloadAndMaybeDelete() run will simply fail on
+  // its first USB exchange, exactly as it would for a real attach callback
+  // firing spuriously, and is reported as a failure the same way.
+  void triggerAttachCallback() {
+    if (attachCallback_) {
+      attachCallback_();
+    }
+  }
+
 private:
   struct ReportMessage {
     uint8_t data[64];

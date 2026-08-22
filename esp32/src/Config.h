@@ -82,6 +82,18 @@ enum ControlOpcode : uint8_t {
   kOpSetTestMode = 0x04,
   kOpSetWifiCredentials = 0x05,
   kOpEnterOtaMode = 0x06,
+  // Forgets which stored records this device-pairing already committed to
+  // the CSV buffer (see StoredRecordDownloader::resetCommittedRecords()) and
+  // re-triggers a fresh USB download from the still-attached PO-400, as if
+  // it had just been plugged in again — without requiring it actually be
+  // unplugged and replugged. The PO-400's own onboard records are untouched
+  // either way (deleting them is a separate, test-mode-gated step) — this
+  // opcode exists because CLEAR_BUFFER's crash-safety guarantee only covers
+  // "the phone hasn't confirmed receipt yet", not "the phone deliberately
+  // discarded its own already-confirmed copy later" (e.g. the app's local
+  // data was cleared) — REQUEST_DATA alone can't recover from that since the
+  // ESP32's relay buffer is, correctly, already empty by that point.
+  kOpResyncFromDevice = 0x07,
 };
 
 // End-of-transfer marker on the Data characteristic: exactly one notification

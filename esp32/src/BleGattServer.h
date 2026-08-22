@@ -11,12 +11,13 @@
 #include "ICsvBuffer.h"
 #include "OtaManager.h"
 #include "StoredRecordDownloader.h"
+#include "UsbHidOxHost.h"
 
 class BleGattServer {
 public:
   BleGattServer(ICsvBuffer &csvBuffer, ClockSync &clockSync,
                StoredRecordDownloader &storedRecordDownloader,
-               OtaManager &otaManager);
+               OtaManager &otaManager, UsbHidOxHost &usbHost);
 
   void begin();
 
@@ -55,6 +56,7 @@ private:
   ClockSync &clockSync_;
   StoredRecordDownloader &storedRecordDownloader_;
   OtaManager &otaManager_;
+  UsbHidOxHost &usbHost_;
 
   ServerCallbacks serverCallbacks_{*this};
   ControlCallbacks controlCallbacks_{*this};

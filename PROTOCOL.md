@@ -48,6 +48,7 @@ ESP32 = peripheral/server. Phone = central/client. Advertised device name: `Puls
 | `0x04` | `SET_TEST_MODE` | 1 byte, `0x00` or `0x01` | When `0x01` (on), the ESP32 never deletes downloaded stored records from the PO-400. Persisted in NVS. **Defaults to `0x01` (on/non-destructive)** until explicitly turned off. |
 | `0x05` | `SET_WIFI_CREDENTIALS` | `[ssidLen:u8][ssid bytes][passLen:u8][pass bytes]` | Configure WiFi STA credentials for OTA, stored via WiFiManager's NVS storage. |
 | `0x06` | `ENTER_OTA_MODE` | none | Ask the ESP32 to bring up WiFi (using stored credentials, or a captive portal if none stored) and start `ArduinoOTA`, so a `pio run -t upload --upload-port <ip>` can flash new firmware. WiFi auto-tears-down after an idle timeout. |
+| `0x07` | `RESYNC_FROM_DEVICE` | none | Forget which stored records this device-pairing already delivered and re-download everything fresh from the still-attached PO-400, as if it had just been plugged in again — without physically unplugging it. For recovering after the phone's own local copy is lost (e.g. app data cleared): CLEAR_BUFFER's crash-safety guarantee only covers "the phone hasn't confirmed receipt yet", not "the phone later discarded its own already-confirmed copy" — by then the ESP32's relay buffer is correctly already empty, so a plain `REQUEST_DATA` alone returns nothing. Only re-downloads (via USB) into the ESP32's own relay buffer; never deletes anything from the PO-400 itself. |
 
 ### Data characteristic (notify)
 
