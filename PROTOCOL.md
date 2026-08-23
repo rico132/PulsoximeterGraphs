@@ -135,6 +135,15 @@ see `BleGattServer::ServerCallbacks::onDisconnect`.
   flows phone→ESP32 and the other only ESP32→phone). `errorCode` is either one of Arduino-ESP32's
   `Update.h` `UPDATE_ERROR_*` codes, or the sentinel `0xFF` for a failure the ESP32 rejected
   before ever touching flash (busy with a USB download, or an update already in progress).
+- **Notify**: `[0x09][state:u8]` — tag `0x09` (`STATUS_TAG_USB_DOWNLOAD_STATE`), `state` `0x01` =
+  a `REQUEST_DATA` dump is blocked waiting on a USB re-download from the PO-400, `0x00` = that
+  download finished. Sent once when the wait begins, then again every ~5s for as long as it
+  continues (see `BleGattServer::requestDataDump()`), so a client that's subscribed can show
+  "waiting for USB download" instead of a stalled-looking "receiving data (0 bytes)" during a
+  window where no Data notifications have gone out yet for a reason unrelated to the BLE link —
+  and so its own inactivity timeout, if any, doesn't misinterpret a legitimately long multi-record
+  download as a stalled connection. Subscribing to this is optional: `REQUEST_DATA` behaves
+  identically either way, this only affects what a subscribed client can show while it waits.
 
 ### Firmware release asset
 
@@ -184,6 +193,9 @@ compatible and the common case needs no header at all.
    before streaming any of it — see `REQUEST_DATA`'s own table entry for exactly when — which can
    take a while (the ESP32 waits up to 5 minutes internally); size any client-side inactivity
    timeout accordingly, and re-arm it on every Data notification, not just once at the start.
+   Subscribing to the Status characteristic's `STATUS_TAG_USB_DOWNLOAD_STATE` notification (see
+   above) lets a client both show that it's this USB wait, not a stalled BLE link, and re-arm its
+   own timeout off those notifications too, since no Data notifications go out during this window.
 4. Reassemble Data notifications until the `0x00` terminator; parse the CSV blob.
 5. **Drop any row whose timestamp already exists locally before inserting the rest** — every
    `REQUEST_DATA` returns the PO-400's *entire* current stored history, not just what's new

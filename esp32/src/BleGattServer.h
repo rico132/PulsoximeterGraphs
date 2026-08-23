@@ -92,6 +92,7 @@ private:
   void handleStartFirmwareUpdate(const uint8_t *data, size_t length);
   void handleFinishFirmwareUpdate();
   void notifyFirmwareUpdateResult(bool success, uint8_t errorCode = 0);
+  void notifyUsbDownloadState(bool inProgress);
 
   ICsvBuffer &csvBuffer_;
   ClockSync &clockSync_;

@@ -88,6 +88,14 @@ object BleConstants {
     const val STATUS_TAG_FIRMWARE_UPDATE_RESULT: Byte = 0x08
 
     /**
+     * Payload: 1 byte, 0x01 = a USB re-download from the PO-400 has started and REQUEST_DATA's
+     * dump is blocked waiting on it; 0x00 = that download finished. Sent once when the wait
+     * begins, then again every ~5s for as long as it continues — see [BleGattClient]'s handling
+     * of it for why (both showing the right status text and re-arming its inactivity timeout).
+     */
+    const val STATUS_TAG_USB_DOWNLOAD_STATE: Byte = 0x09
+
+    /**
      * Multi-file transfer extension — app + `tools/ble_csv_sender.py` only, NOT part of the
      * ESP32 contract (the firmware always sends exactly one implicit file and never needs to
      * change). If the very first byte of the reassembled Data blob equals this magic value, what

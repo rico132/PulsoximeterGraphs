@@ -295,6 +295,7 @@ private fun isCancelable(state: BleGattClient.SyncState): Boolean = when (state)
     BleGattClient.SyncState.Scanning,
     BleGattClient.SyncState.Connecting,
     BleGattClient.SyncState.RequestingData,
+    BleGattClient.SyncState.WaitingForUsbDownload,
     is BleGattClient.SyncState.ReceivingData,
     is BleGattClient.SyncState.Retrying,
     -> true
@@ -314,6 +315,7 @@ private fun syncStatusText(state: BleGattClient.SyncState): String = when (state
     BleGattClient.SyncState.Scanning -> "Scanning for PulsoxRelay…"
     BleGattClient.SyncState.Connecting -> "Connecting…"
     BleGattClient.SyncState.RequestingData -> "Requesting data…"
+    BleGattClient.SyncState.WaitingForUsbDownload -> "Waiting for USB download…"
     is BleGattClient.SyncState.ReceivingData -> receivingDataText(state)
     BleGattClient.SyncState.Inserting -> "Saving to database…"
     BleGattClient.SyncState.ClearingBuffer -> "Finishing up…"

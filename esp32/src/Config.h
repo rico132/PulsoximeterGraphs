@@ -271,6 +271,16 @@ enum StatusTag : uint8_t {
   // Notified exactly once per attempt: either once kOpFinishFirmwareUpdate concludes, or
   // immediately if kOpStartFirmwareUpdate itself was rejected.
   kStatusFirmwareUpdateResult = 0x08,
+  // Payload: 1 byte, 0x01 = a USB re-download from the PO-400 has started and REQUEST_DATA's
+  // dump is blocked waiting on it; 0x00 = that download finished and the dump is proceeding.
+  // See BleGattServer::requestDataDump()'s own comment for exactly when this fires — notified
+  // once when the wait begins, then again periodically (every ~5s) for as long as it continues,
+  // so the phone's own inactivity timeout (re-armed by any Status notification, same as a Data
+  // chunk) doesn't mistake a long multi-record USB download for a stalled connection. Lets the
+  // phone show "waiting for the USB download" instead of "receiving data (0 bytes)" during a
+  // window where no Data notifications have gone out yet for a reason that has nothing to do
+  // with the BLE link itself.
+  kStatusUsbDownloadState = 0x09,
 };
 
 } // namespace Config

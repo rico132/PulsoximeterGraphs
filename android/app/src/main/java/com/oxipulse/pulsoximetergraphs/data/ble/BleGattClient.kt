@@ -67,6 +67,18 @@ class BleGattClient(
         data object RequestingData : SyncState
 
         /**
+         * REQUEST_DATA was accepted, but the ESP32 hasn't sent any Data yet because it's first
+         * re-downloading the PO-400's records over USB — see [BleConstants.STATUS_TAG_USB_DOWNLOAD_STATE]
+         * and `BleGattServer::requestDataDump()`'s own doc. Without this, that wait looked
+         * identical to [ReceivingData] stuck at 0 bytes, which reads as a stalled transfer rather
+         * than the ESP32 legitimately busy with something that has nothing to do with the BLE
+         * link itself. Falls back to [ReceivingData] once either an explicit "download finished"
+         * notification arrives, or (if that notification is ever lost — GATT notify() has no
+         * delivery guarantee) the first real Data chunk does.
+         */
+        data object WaitingForUsbDownload : SyncState
+
+        /**
          * [totalBytes]/[fileIndex]/[fileCount] are only known once a multi-file header has been
          * parsed (see [MultiFileMeta]) — null for a legacy single-file transfer (real ESP32, or
          * the sender script's single-file path), where the total size is never declared upfront.
@@ -118,6 +130,7 @@ class BleGattClient(
     private var bluetoothGatt: BluetoothGatt? = null
     private var controlCharacteristic: BluetoothGattCharacteristic? = null
     private var dataCharacteristic: BluetoothGattCharacteristic? = null
+    private var statusCharacteristic: BluetoothGattCharacteristic? = null
 
     private val receiveBuffer = ByteArrayOutputStream()
     private var receiveStartMs = 0L
@@ -429,6 +442,10 @@ class BleGattClient(
             }
             controlCharacteristic = service.getCharacteristic(BleConstants.CONTROL_CHARACTERISTIC_UUID)
             dataCharacteristic = service.getCharacteristic(BleConstants.DATA_CHARACTERISTIC_UUID)
+            // Optional, unlike Control/Data: CSV sync itself has never depended on it (see
+            // enableStatusNotifications's own doc), so a hypothetical device lacking it should
+            // still sync fine, just without the nicer "waiting for USB download" status text.
+            statusCharacteristic = service.getCharacteristic(BleConstants.STATUS_CHARACTERISTIC_UUID)
             if (controlCharacteristic == null || dataCharacteristic == null) {
                 fail("Required characteristics not found")
                 return
@@ -469,7 +486,12 @@ class BleGattClient(
         @SuppressLint("MissingPermission")
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             armTimeout()
-            writeSetTime(gatt)
+            // Data's CCCD write is chained into Status's (see enableDataNotifications) before
+            // ever proceeding to writeSetTime — this is what completes each link in that chain.
+            when (descriptor.characteristic?.uuid) {
+                BleConstants.DATA_CHARACTERISTIC_UUID -> enableStatusNotifications(gatt)
+                else -> writeSetTime(gatt)
+            }
         }
 
         @Suppress("DEPRECATION")
@@ -503,9 +525,30 @@ class BleGattClient(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
         ) {
-            if (characteristic.uuid != BleConstants.DATA_CHARACTERISTIC_UUID) return
             val value = characteristic.value ?: return
-            onDataChunk(value)
+            when (characteristic.uuid) {
+                BleConstants.DATA_CHARACTERISTIC_UUID -> onDataChunk(value)
+                BleConstants.STATUS_CHARACTERISTIC_UUID -> onStatusNotification(value)
+                else -> Unit
+            }
+        }
+    }
+
+    private fun onStatusNotification(value: ByteArray) {
+        if (value.isEmpty() || value[0] != BleConstants.STATUS_TAG_USB_DOWNLOAD_STATE) return
+        val inProgress = value.size >= 2 && value[1] == 0x01.toByte()
+        // Any Status notification means the ESP32 is still actively working on this request even
+        // though no Data has arrived yet — re-arm the same inactivity timeout a Data chunk would,
+        // so a long multi-record USB re-download isn't mistaken for a stalled connection (see
+        // BleGattServer::requestDataDump()'s periodic re-notify while it waits).
+        armTimeout()
+        val state = _syncState.value
+        if (inProgress) {
+            if (state is SyncState.RequestingData || state is SyncState.ReceivingData) {
+                _syncState.value = SyncState.WaitingForUsbDownload
+            }
+        } else if (state is SyncState.WaitingForUsbDownload) {
+            _syncState.value = SyncState.ReceivingData(0)
         }
     }
 
@@ -519,7 +562,15 @@ class BleGattClient(
         // whole CSV, send a redundant second CLEAR_BUFFER, and re-emit a duplicate Success state
         // (and the snackbar it triggers) for a transfer the user already saw complete.
         val state = _syncState.value
-        if (state !is SyncState.RequestingData && state !is SyncState.ReceivingData) return
+        // WaitingForUsbDownload is included here too: real data arriving is itself proof the
+        // wait is over, even if BleGattServer's explicit "download finished" notification (see
+        // onStatusNotification) was ever lost — GATT notify() has no delivery guarantee.
+        if (state !is SyncState.RequestingData &&
+            state !is SyncState.ReceivingData &&
+            state !is SyncState.WaitingForUsbDownload
+        ) {
+            return
+        }
 
         // Every chunk received is forward progress, so the watchdog resets here too — a large
         // CSV sent in many small notifications must not time out purely because the transfer as
@@ -684,7 +735,7 @@ class BleGattClient(
         when (_syncState.value) {
             is SyncState.Scanning, is SyncState.Connecting,
             is SyncState.RequestingData, is SyncState.ReceivingData,
-            is SyncState.Retrying,
+            is SyncState.WaitingForUsbDownload, is SyncState.Retrying,
             -> {
                 log("Sync cancelled by user")
                 cancelled = true
@@ -710,7 +761,38 @@ class BleGattClient(
         }
         val cccd = dataChar.getDescriptor(BleConstants.CLIENT_CHARACTERISTIC_CONFIG_UUID)
         if (cccd == null) {
-            // No CCCD present (unusual); fall back to writing SET_TIME directly.
+            // No CCCD present (unusual); chain straight on to Status instead of writeSetTime
+            // directly, same as the normal path below (onDescriptorWrite) would.
+            enableStatusNotifications(gatt)
+            return
+        }
+        writeDescriptor(gatt, cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+    }
+
+    /**
+     * Enables notifications on the Status characteristic, purely for
+     * [BleConstants.STATUS_TAG_USB_DOWNLOAD_STATE] (see [onStatusNotification]) — unlike Data,
+     * this is optional: [statusCharacteristic] can be null (an ancient device predating it) or
+     * this can otherwise fail, and CSV sync itself proceeds regardless either way, just without
+     * that nicer status text. Chained after Data's own notification setup (see
+     * [onDescriptorWrite]) rather than in parallel, so there's only ever one in-flight descriptor
+     * write to track at a time.
+     */
+    @SuppressLint("MissingPermission")
+    private fun enableStatusNotifications(gatt: BluetoothGatt) {
+        val statusChar = statusCharacteristic
+        if (statusChar == null) {
+            writeSetTime(gatt)
+            return
+        }
+        val enabled = gatt.setCharacteristicNotification(statusChar, true)
+        if (!enabled) {
+            log("Failed to enable Status notifications — continuing without them")
+            writeSetTime(gatt)
+            return
+        }
+        val cccd = statusChar.getDescriptor(BleConstants.CLIENT_CHARACTERISTIC_CONFIG_UUID)
+        if (cccd == null) {
             writeSetTime(gatt)
             return
         }

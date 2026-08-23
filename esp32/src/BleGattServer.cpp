@@ -386,6 +386,7 @@ void BleGattServer::requestDataDump() {
     Serial.println(
         "BleGattServer: REQUEST_DATA received while a USB download is in "
         "progress — waiting for it to finish before dumping...");
+    notifyUsbDownloadState(/*inProgress=*/true);
     constexpr uint32_t kMaxWaitMs = 5UL * 60UL * 1000UL; // 5 minutes
     const unsigned long waitStartMs = millis();
     unsigned long lastLogMs = waitStartMs;
@@ -402,6 +403,11 @@ void BleGattServer::requestDataDump() {
         Serial.println(
             "BleGattServer: ...still waiting for the USB download to "
             "finish...");
+        // Re-sent periodically, not just once entering this block — see
+        // Config::kStatusUsbDownloadState's own doc for why: the phone's inactivity timeout is
+        // re-armed by any Status notification, so this is what keeps a legitimately long
+        // multi-record download from being mistaken for a stalled connection.
+        notifyUsbDownloadState(/*inProgress=*/true);
       }
       vTaskDelay(pdMS_TO_TICKS(200));
     }
@@ -411,6 +417,9 @@ void BleGattServer::requestDataDump() {
           "download to finish — abandoning this dump.");
       return;
     }
+    // Explicit, rather than leaving the phone to infer "download over" purely from the first
+    // Data notification arriving — see Config::kStatusUsbDownloadState's own doc.
+    notifyUsbDownloadState(/*inProgress=*/false);
   }
 
   uint16_t mtu = server_->getPeerMTU(connHandle_);
@@ -573,6 +582,16 @@ void BleGattServer::notifyFirmwareUpdateResult(bool success, uint8_t errorCode) 
                         success ? uint8_t{0x01} : uint8_t{0x00}, errorCode};
   const size_t payloadLen = success ? 2 : 3;
   statusChar_->setValue(payload, payloadLen);
+  statusChar_->notify(connHandle_);
+}
+
+void BleGattServer::notifyUsbDownloadState(bool inProgress) {
+  if (!statusChar_ || !connected_) {
+    return;
+  }
+  const uint8_t payload[2] = {Config::kStatusUsbDownloadState,
+                              inProgress ? uint8_t{0x01} : uint8_t{0x00}};
+  statusChar_->setValue(payload, sizeof(payload));
   statusChar_->notify(connHandle_);
 }
 
