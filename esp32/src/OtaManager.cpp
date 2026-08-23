@@ -37,8 +37,14 @@ void OtaManager::setOtaPasswordFromSerial(const std::string &password) {
 }
 
 void OtaManager::beginArduinoOta() {
-  const String storedPassword =
-      preferences_.getString(Config::kPrefsKeyOtaPassword, "");
+  // isKey() first: Preferences::getString() logs an ESP_LOGE-level "nvs_get_str len fail: ...
+  // NOT_FOUND" error whenever the key doesn't exist yet — the expected, common case for any
+  // device-pairing that has never provisioned an OTA password at all (most users). isKey()
+  // performs the equivalent lookup without logging on a miss; skipping straight to the
+  // empty-string fallback here is exactly what getString()'s own default would have produced.
+  const String storedPassword = preferences_.isKey(Config::kPrefsKeyOtaPassword)
+                                     ? preferences_.getString(Config::kPrefsKeyOtaPassword, "")
+                                     : String("");
   if (storedPassword.isEmpty()) {
     // Refuse to start ArduinoOTA without a provisioned password (see the
     // plan's security note in Config.h) — WiFi/mDNS still come up (needed

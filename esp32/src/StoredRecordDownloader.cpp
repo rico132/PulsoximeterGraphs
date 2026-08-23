@@ -591,16 +591,27 @@ void StoredRecordDownloader::resetCommittedRecords() {
 bool StoredRecordDownloader::isAutoRecordCommitted(uint8_t recordIndex,
                                                    int64_t startEpoch) {
   int64_t committed[256] = {0};
-  preferences_.getBytes(Config::kPrefsKeyCommittedAutoEpochs, committed,
-                        sizeof(committed));
+  // isKey() first: Preferences::getBytes() logs an ESP_LOGE-level "nvs_get_blob len fail: ...
+  // NOT_FOUND" error whenever the key doesn't exist yet — the expected, common case here on
+  // every single record checked before this device-pairing's very first commit (e.g. right
+  // after a fresh boot, or right after resetCommittedRecords() erased it). isKey() performs the
+  // equivalent lookup without logging on a miss; leaving `committed` all-zeros here is exactly
+  // the same fallback getBytes() would have produced anyway (see the array's own initializer).
+  if (preferences_.isKey(Config::kPrefsKeyCommittedAutoEpochs)) {
+    preferences_.getBytes(Config::kPrefsKeyCommittedAutoEpochs, committed,
+                          sizeof(committed));
+  }
   return startEpoch != 0 && committed[recordIndex] == startEpoch;
 }
 
 void StoredRecordDownloader::markAutoRecordCommitted(uint8_t recordIndex,
                                                      int64_t startEpoch) {
   int64_t committed[256] = {0};
-  preferences_.getBytes(Config::kPrefsKeyCommittedAutoEpochs, committed,
-                        sizeof(committed));
+  // See isAutoRecordCommitted()'s identical guard above for why.
+  if (preferences_.isKey(Config::kPrefsKeyCommittedAutoEpochs)) {
+    preferences_.getBytes(Config::kPrefsKeyCommittedAutoEpochs, committed,
+                          sizeof(committed));
+  }
   committed[recordIndex] = startEpoch;
   preferences_.putBytes(Config::kPrefsKeyCommittedAutoEpochs, committed,
                         sizeof(committed));
