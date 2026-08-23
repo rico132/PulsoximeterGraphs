@@ -15,6 +15,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -29,6 +30,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -204,6 +206,7 @@ private fun DeviceSection(viewModel: SettingsViewModel, testModeEnabled: Boolean
         }
 
         FirmwareUpdateCard(viewModel)
+        UnpairAllDevicesCard(viewModel)
     }
 }
 
@@ -289,6 +292,77 @@ private fun FirmwareUpdateCard(viewModel: SettingsViewModel) {
                 }
             }
         }
+    }
+}
+
+/**
+ * Deletes every BLE bond the ESP32 holds — including this phone's own — over the same
+ * independent BLE client [FirmwareUpdateCard] uses (see [BleFirmwareUpdateClient.unpairAllDevices]):
+ * scans for and connects to the device itself, writes UNPAIR_ALL_DEVICES, then the ESP32
+ * disconnects everyone, requiring a fresh re-pair (with the PIN still on its serial log) for any
+ * phone including this one. Gated behind a confirmation dialog since it affects every currently-
+ * paired device, not just whichever one triggers it — unlike the rest of this screen's controls,
+ * this one can't be undone by just tapping it again.
+ */
+@Composable
+private fun UnpairAllDevicesCard(viewModel: SettingsViewModel) {
+    val unpairState by viewModel.unpairState.collectAsState()
+    var showConfirmDialog by remember { mutableStateOf(false) }
+    val inProgress = unpairState is BleFirmwareUpdateClient.UnpairState.InProgress
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Unpair all devices", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Forgets every phone currently paired with the ESP32, including this one. Each " +
+                    "one will need to pair again afterward, using the PIN shown on the device's " +
+                    "serial log.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Button(onClick = { showConfirmDialog = true }, enabled = !inProgress) {
+                Text(if (inProgress) "Unpairing…" else "Unpair all devices")
+            }
+            when (val state = unpairState) {
+                BleFirmwareUpdateClient.UnpairState.Success ->
+                    Text(
+                        "Done — every device (including this phone) must pair again now.",
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                is BleFirmwareUpdateClient.UnpairState.Failed ->
+                    Text("Failed: ${state.message}", color = MaterialTheme.colorScheme.error)
+                BleFirmwareUpdateClient.UnpairState.InProgress,
+                BleFirmwareUpdateClient.UnpairState.Idle,
+                -> Unit
+            }
+        }
+    }
+
+    if (showConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showConfirmDialog = false },
+            title = { Text("Unpair all devices?") },
+            text = {
+                Text(
+                    "This forgets every phone paired with the ESP32, including this one. " +
+                        "You'll need to pair again afterward to use it.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showConfirmDialog = false
+                        viewModel.unpairAllDevices()
+                    },
+                ) {
+                    Text("Unpair")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showConfirmDialog = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
     }
 }
 

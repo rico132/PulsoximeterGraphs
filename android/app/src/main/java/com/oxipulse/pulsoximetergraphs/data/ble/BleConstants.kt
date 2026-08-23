@@ -64,6 +64,13 @@ object BleConstants {
     /** No payload — discards an in-progress firmware update without touching the boot partition. */
     const val OPCODE_ABORT_FIRMWARE_UPDATE: Byte = 0x09
 
+    /**
+     * No payload — deletes every BLE bond the ESP32 currently holds, including this phone's own,
+     * then disconnects. Any phone must re-pair from scratch afterward, using the PIN still shown
+     * on the ESP32's serial log.
+     */
+    const val OPCODE_UNPAIR_ALL_DEVICES: Byte = 0x0A
+
     /** End-of-transfer marker on the Data characteristic: exactly one 0x00 byte. */
     val DATA_TERMINATOR: ByteArray = byteArrayOf(0x00)
 

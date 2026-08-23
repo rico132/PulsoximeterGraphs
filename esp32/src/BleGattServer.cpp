@@ -302,6 +302,23 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
     firmwareUpdater_.abort();
     break;
 
+  case Config::kOpUnpairAllDevices: {
+    const int bondCount = NimBLEDevice::getNumBonds();
+    NimBLEDevice::deleteAllBonds();
+    Serial.printf(
+        "BleGattServer: UNPAIR_ALL_DEVICES received — cleared %d bonded "
+        "device(s).\n",
+        bondCount);
+    // This phone's own bond was just deleted along with everyone else's — the link is still
+    // nominally connected but no longer backed by any bond, so disconnect it now rather than
+    // leave it in that inconsistent state. onDisconnect() already re-starts advertising, so
+    // this phone (or any other) can immediately pair fresh with the PIN still on the serial log.
+    if (connected_ && server_) {
+      server_->disconnect(connHandle_);
+    }
+    break;
+  }
+
   default:
     Serial.printf("BleGattServer: unknown control opcode 0x%02X ignored.\n",
                  opcode);

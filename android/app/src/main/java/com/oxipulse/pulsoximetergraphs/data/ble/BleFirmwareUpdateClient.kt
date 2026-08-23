@@ -55,6 +55,11 @@ import kotlinx.coroutines.launch
  * 5. Wait for a Status notification carrying the result. Success means the ESP32 has already
  *    switched its boot partition and is rebooting into the new image on its own — this client
  *    does not (and cannot) do anything further to make that happen.
+ *
+ * A third, unrelated admin action — [unpairAllDevices] — also lives here rather than in its own
+ * class: it needs the exact same scan/connect/bond/discover machinery and nothing else, and
+ * (like a version check) is a single write followed by an expected ESP32-initiated disconnect,
+ * not a multi-step transfer — see [UnpairState]'s own doc.
  */
 class BleFirmwareUpdateClient(private val context: Context) {
 
@@ -75,8 +80,22 @@ class BleFirmwareUpdateClient(private val context: Context) {
         data class Failed(val message: String) : VersionCheckState
     }
 
-    /** Which of [startUpdate]/[checkDeviceVersion] the current connection is for — see their own docs. */
-    private enum class Mode { NONE, CHECK_VERSION, UPDATE }
+    /**
+     * PROTOCOL.md's UNPAIR_ALL_DEVICES: deletes every BLE bond the ESP32 holds, including this
+     * phone's own, then disconnects. [InProgress] covers the whole scan-through-write span (no
+     * finer-grained steps, same granularity as [VersionCheckState.Checking]) — success is simply
+     * the ESP32 acking the write, since the disconnect that follows is expected, not something to
+     * wait on (see [onCharacteristicWrite]'s handling of it).
+     */
+    sealed interface UnpairState {
+        data object Idle : UnpairState
+        data object InProgress : UnpairState
+        data object Success : UnpairState
+        data class Failed(val message: String) : UnpairState
+    }
+
+    /** Which of [startUpdate]/[checkDeviceVersion]/[unpairAllDevices] the current connection is for. */
+    private enum class Mode { NONE, CHECK_VERSION, UPDATE, UNPAIR_ALL }
     private var mode = Mode.NONE
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -86,6 +105,9 @@ class BleFirmwareUpdateClient(private val context: Context) {
 
     private val _versionCheckState = MutableStateFlow<VersionCheckState>(VersionCheckState.Idle)
     val versionCheckState: StateFlow<VersionCheckState> = _versionCheckState.asStateFlow()
+
+    private val _unpairState = MutableStateFlow<UnpairState>(UnpairState.Idle)
+    val unpairState: StateFlow<UnpairState> = _unpairState.asStateFlow()
 
     private var bluetoothGatt: BluetoothGatt? = null
     private var controlCharacteristic: BluetoothGattCharacteristic? = null
@@ -144,6 +166,21 @@ class BleFirmwareUpdateClient(private val context: Context) {
         cancelled = false
         log("Checking device firmware version")
         _versionCheckState.value = VersionCheckState.Checking
+        armTimeout()
+        beginScan()
+    }
+
+    /**
+     * Connects, then writes UNPAIR_ALL_DEVICES — see [UnpairState]'s own doc for what that does
+     * and why success doesn't wait for the ESP32's own disconnect.
+     */
+    @SuppressLint("MissingPermission")
+    fun unpairAllDevices() {
+        if (mode != Mode.NONE) return // Already busy with an update, version check, or unpair.
+        this.mode = Mode.UNPAIR_ALL
+        cancelled = false
+        log("Unpairing all devices")
+        _unpairState.value = UnpairState.InProgress
         armTimeout()
         beginScan()
     }
@@ -354,13 +391,18 @@ class BleFirmwareUpdateClient(private val context: Context) {
                 // update: the ESP32 reboots itself into the new firmware immediately after
                 // reporting success (see BleGattServer::handleFinishFirmwareUpdate) rather than
                 // waiting for the phone to disconnect first. A version check disconnects itself
-                // deliberately once it has its answer (see onCharacteristicRead below). Neither
-                // is a failure — only an *unexpected* disconnect, before either flow reached its
-                // own success state, is.
+                // deliberately once it has its answer (see onCharacteristicRead below), and an
+                // unpair-all request disconnects itself the moment the write is acked (see
+                // onCharacteristicWrite below) — the ESP32 also disconnects on its own right
+                // after, but by then this side has already moved on. None of these are failures
+                // — only an *unexpected* disconnect, before the relevant flow reached its own
+                // success state, is.
                 val alreadyConcluded = when (mode) {
                     Mode.UPDATE -> _updateState.value is UpdateState.Success || _updateState.value is UpdateState.Failed
                     Mode.CHECK_VERSION -> _versionCheckState.value is VersionCheckState.Checked ||
                         _versionCheckState.value is VersionCheckState.Failed
+                    Mode.UNPAIR_ALL -> _unpairState.value is UnpairState.Success ||
+                        _unpairState.value is UnpairState.Failed
                     Mode.NONE -> true
                 }
                 if (!cancelled && !alreadyConcluded) {
@@ -401,6 +443,7 @@ class BleFirmwareUpdateClient(private val context: Context) {
                 // No notifications needed for a single plain read — see checkDeviceVersion's own doc.
                 Mode.CHECK_VERSION -> gatt.readCharacteristic(statusCharacteristic)
                 Mode.UPDATE -> enableStatusNotifications(gatt)
+                Mode.UNPAIR_ALL -> writeUnpairAllDevices(gatt)
                 Mode.NONE -> Unit
             }
         }
@@ -457,6 +500,17 @@ class BleFirmwareUpdateClient(private val context: Context) {
                         sendNextChunk(gatt)
                     }
                     ControlWrite.FINISH_FIRMWARE_UPDATE -> _updateState.value = UpdateState.Verifying
+                    ControlWrite.UNPAIR_ALL_DEVICES -> {
+                        // The ack IS the result here — there's no further notification to wait
+                        // for (contrast FINISH_FIRMWARE_UPDATE's Status notification above). The
+                        // ESP32 disconnects on its own right after processing this opcode, but
+                        // this side already knows the outcome, so it disconnects proactively too
+                        // rather than depending on that — see onConnectionStateChange's own doc.
+                        log("Unpair-all acked by the ESP32")
+                        cancelTimeout()
+                        _unpairState.value = UnpairState.Success
+                        disconnect()
+                    }
                     else -> Unit
                 }
             }
@@ -522,7 +576,9 @@ class BleFirmwareUpdateClient(private val context: Context) {
         }
     }
 
-    private enum class ControlWrite { START_FIRMWARE_UPDATE, FINISH_FIRMWARE_UPDATE, ABORT_FIRMWARE_UPDATE }
+    private enum class ControlWrite {
+        START_FIRMWARE_UPDATE, FINISH_FIRMWARE_UPDATE, ABORT_FIRMWARE_UPDATE, UNPAIR_ALL_DEVICES
+    }
 
     private var lastControlWrite: ControlWrite? = null
 
@@ -548,6 +604,12 @@ class BleFirmwareUpdateClient(private val context: Context) {
     private fun writeAbort(gatt: BluetoothGatt) {
         lastControlWrite = ControlWrite.ABORT_FIRMWARE_UPDATE
         writeControl(gatt, byteArrayOf(BleConstants.OPCODE_ABORT_FIRMWARE_UPDATE))
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun writeUnpairAllDevices(gatt: BluetoothGatt) {
+        lastControlWrite = ControlWrite.UNPAIR_ALL_DEVICES
+        writeControl(gatt, byteArrayOf(BleConstants.OPCODE_UNPAIR_ALL_DEVICES))
     }
 
     // WRITE_TYPE_NO_RESPONSE (see BleGattServer.cpp's matching WRITE_NR characteristic property
@@ -612,14 +674,15 @@ class BleFirmwareUpdateClient(private val context: Context) {
 
     private fun armTimeout() {
         cancelTimeout()
-        // A version check is meant to fail fast if the device just isn't reachable right now
-        // (see checkDeviceVersion's own doc: the caller treats that as "unknown," not an error,
-        // and shouldn't have to wait a full minute to find out) -- an actual firmware push needs
-        // far more patience for a legitimately slow multi-hundred-KB transfer.
-        val timeoutMs = if (mode == Mode.CHECK_VERSION) VERSION_CHECK_TIMEOUT_MS else UPDATE_TIMEOUT_MS
+        // A version check or unpair-all request is meant to fail fast if the device just isn't
+        // reachable right now (see checkDeviceVersion's own doc: the caller treats that as
+        // "unknown," not an error, and shouldn't have to wait a full minute to find out) -- an
+        // actual firmware push needs far more patience for a legitimately slow multi-hundred-KB
+        // transfer.
+        val timeoutMs = if (mode == Mode.UPDATE) UPDATE_TIMEOUT_MS else VERSION_CHECK_TIMEOUT_MS
         timeoutJob = scope.launch {
             delay(timeoutMs)
-            fail(if (mode == Mode.CHECK_VERSION) "Device unreachable" else "Firmware update timed out")
+            fail(if (mode == Mode.UPDATE) "Firmware update timed out" else "Device unreachable")
         }
     }
 
@@ -629,16 +692,18 @@ class BleFirmwareUpdateClient(private val context: Context) {
     }
 
     /**
-     * Routes to whichever of [_updateState]/[_versionCheckState] the current connection is
-     * actually for (see [mode]) — both [startUpdate] and [checkDeviceVersion] share every bit of
-     * connect/bond/discover machinery below, and a failure at any point in it (bonding, service
-     * discovery, MTU negotiation, a stall, ...) is equally possible for either.
+     * Routes to whichever of [_updateState]/[_versionCheckState]/[_unpairState] the current
+     * connection is actually for (see [mode]) — [startUpdate], [checkDeviceVersion], and
+     * [unpairAllDevices] all share every bit of connect/bond/discover machinery below, and a
+     * failure at any point in it (bonding, service discovery, MTU negotiation, a stall, ...) is
+     * equally possible for any of them.
      *
      * No retry logic here unlike [BleGattClient.fail] — a partially-written firmware image left
      * on a stall is nothing to preserve or resume (the ESP32 only ever commits a *complete,
-     * verified* image; see BleFirmwareUpdater's own doc), and a version check has nothing at
-     * stake to protect either — so simply surfacing the failure and letting the user explicitly
-     * retry is simpler and no less safe than automatic retries would be.
+     * verified* image; see BleFirmwareUpdater's own doc), and neither a version check nor an
+     * unpair-all request has anything at stake to protect either — so simply surfacing the
+     * failure and letting the user explicitly retry is simpler and no less safe than automatic
+     * retries would be.
      */
     private fun fail(message: String) {
         log("FAILED: $message")
@@ -646,6 +711,7 @@ class BleFirmwareUpdateClient(private val context: Context) {
         when (mode) {
             Mode.UPDATE -> _updateState.value = UpdateState.Failed(message)
             Mode.CHECK_VERSION -> _versionCheckState.value = VersionCheckState.Failed(message)
+            Mode.UNPAIR_ALL -> _unpairState.value = UnpairState.Failed(message)
             Mode.NONE -> Unit
         }
         disconnect()
@@ -673,6 +739,7 @@ class BleFirmwareUpdateClient(private val context: Context) {
     fun resetState() {
         _updateState.value = UpdateState.Idle
         _versionCheckState.value = VersionCheckState.Idle
+        _unpairState.value = UnpairState.Idle
     }
 
     companion object {

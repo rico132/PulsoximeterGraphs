@@ -32,6 +32,8 @@ class SettingsViewModel(
         bleFirmwareUpdateClient.updateState
     val deviceVersionCheckState: StateFlow<BleFirmwareUpdateClient.VersionCheckState> =
         bleFirmwareUpdateClient.versionCheckState
+    val unpairState: StateFlow<BleFirmwareUpdateClient.UnpairState> =
+        bleFirmwareUpdateClient.unpairState
 
     sealed interface FirmwareCheckState {
         data object Idle : FirmwareCheckState
@@ -146,6 +148,12 @@ class SettingsViewModel(
     }
 
     fun cancelFirmwareUpdate() = bleFirmwareUpdateClient.cancelUpdate()
+
+    /** See [BleFirmwareUpdateClient.unpairAllDevices] — forgets every phone paired with the ESP32. */
+    fun unpairAllDevices() {
+        bleFirmwareUpdateClient.resetState()
+        bleFirmwareUpdateClient.unpairAllDevices()
+    }
 
     companion object {
         fun factory(
