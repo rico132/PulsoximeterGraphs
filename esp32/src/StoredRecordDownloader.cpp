@@ -312,10 +312,41 @@ DecodeResult decodeManual(HidReportSource &source, uint32_t datumCount,
 
 #include <ctime>
 
+#include <esp_heap_caps.h>
+
 #include "Config.h"
 #include "RomPrintfLock.h"
 
 namespace {
+
+// RAII scratch copy that's guaranteed to live in internal RAM, never PSRAM
+// — see appendDecodedRecord()'s own comment for why. Falls back to a null
+// data() (caller then reads the original, PSRAM-backed vector directly
+// instead — slower, but still fully correct) if internal RAM is
+// momentarily too tight for even this one small allocation.
+class InternalRamCopy {
+public:
+  explicit InternalRamCopy(const std::vector<uint8_t> &source)
+      : data_(static_cast<uint8_t *>(heap_caps_malloc(
+            source.empty() ? 1 : source.size(),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))) {
+    if (data_ && !source.empty()) {
+      memcpy(data_, source.data(), source.size());
+    }
+  }
+  ~InternalRamCopy() {
+    if (data_) {
+      heap_caps_free(data_);
+    }
+  }
+  InternalRamCopy(const InternalRamCopy &) = delete;
+  InternalRamCopy &operator=(const InternalRamCopy &) = delete;
+
+  const uint8_t *data() const { return data_; }
+
+private:
+  uint8_t *data_;
+};
 
 // Sets `flag` for the lifetime of the enclosing scope, regardless of which
 // of downloadAndMaybeDelete()'s several early returns is taken — simpler
@@ -722,9 +753,28 @@ bool StoredRecordDownloader::appendDecodedRecord(
   Serial.printf(
       "StoredRecordDownloader: appending %u decoded row(s) to CsvBuffer...\n",
       static_cast<unsigned>(n));
+
+  // spo2/pr are plain std::vector<uint8_t> — for a record this size (easily
+  // tens of KB; e.g. a real 9807-datum record is ~9.8KB per vector),
+  // comfortably over the 4KB threshold (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL)
+  // arduino-esp32 uses to auto-route any single allocation to PSRAM instead
+  // of internal RAM (see esp32-hal-psram.c's psramInit(), which calls
+  // heap_caps_malloc_extmem_enable() with exactly this threshold) — nothing
+  // here asked for that, it just happens by default once a std::vector
+  // grows past it. Reading spo2[i]/pr[i] straight out of PSRAM, scattered
+  // across this loop's thousands of iterations and interleaved with the
+  // rest of each iteration's own (fast, internal-RAM) work, is a far worse
+  // access pattern for PSRAM's cache than one big, purely sequential copy —
+  // so copy both into scratch internal-RAM buffers once, upfront, and read
+  // from those in the loop instead.
+  const InternalRamCopy spo2Fast(spo2);
+  const InternalRamCopy prFast(pr);
+  const uint8_t *spo2Data = spo2Fast.data() ? spo2Fast.data() : spo2.data();
+  const uint8_t *prData = prFast.data() ? prFast.data() : pr.data();
+
   for (size_t i = 0; i < n; i++) {
     if (!csvBuffer_.appendRow(startEpochSeconds + static_cast<int64_t>(i),
-                              spo2[i], pr[i])) {
+                              spo2Data[i], prData[i])) {
       // Previously ignored entirely: appendRow() returning false (buffer
       // full) was silently swallowed here, so hitting the cap partway
       // through a download meant every row after that point — including,
