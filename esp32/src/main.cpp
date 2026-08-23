@@ -87,10 +87,12 @@ void usbTask(void * /*param*/) {
   }
 }
 
-// Minimal serial debug command for provisioning the OTA password. Per the
-// plan's security note, this is deliberately the ONLY way to set it — never
+// Minimal serial debug commands for provisioning secrets. Per the plan's
+// security note (OTA password) and Config::kPrefsKeyBlePasskey's own comment
+// (BLE pairing PIN), both are deliberately ONLY settable this way — never
 // reachable via any BLE opcode, so a compromised phone/BLE link alone can
-// never push firmware. Usage: type `otapass <password>` then Enter.
+// never push firmware or set its own known pairing PIN. Usage: type
+// `otapass <password>` or `blepin <6 digits>`, then Enter.
 void pollSerialDebugCommands() {
   static String line;
   while (Serial.available() > 0) {
@@ -99,6 +101,9 @@ void pollSerialDebugCommands() {
       if (line.startsWith("otapass ")) {
         g_otaManager.setOtaPasswordFromSerial(
             std::string(line.substring(8).c_str()));
+      } else if (line.startsWith("blepin ")) {
+        g_bleGattServer->setPairingPasskeyFromSerial(
+            std::string(line.substring(7).c_str()));
       }
       line = "";
     } else {

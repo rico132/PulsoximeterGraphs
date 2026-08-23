@@ -34,9 +34,32 @@ ESP32 = peripheral/server. Phone = central/client. Advertised device name: `Puls
 | UUID | Characteristic | Properties | Purpose |
 |---|---|---|---|
 | `6f2a1000-2f5b-4a9c-91c4-0d8f6b1c9a01` | Service | — | scan filter target |
-| `6f2a1001-2f5b-4a9c-91c4-0d8f6b1c9a01` | Control | write-with-response | opcodes below |
-| `6f2a1002-2f5b-4a9c-91c4-0d8f6b1c9a01` | Data | notify | chunked CSV bytes |
-| `6f2a1003-2f5b-4a9c-91c4-0d8f6b1c9a01` | Status (stretch, not MVP) | read/notify | buffered-row count |
+| `6f2a1001-2f5b-4a9c-91c4-0d8f6b1c9a01` | Control | write-with-response, encrypted+authenticated | opcodes below |
+| `6f2a1002-2f5b-4a9c-91c4-0d8f6b1c9a01` | Data | notify, encrypted+authenticated | chunked CSV bytes |
+| `6f2a1003-2f5b-4a9c-91c4-0d8f6b1c9a01` | Status (stretch, not MVP) | read/notify, encrypted+authenticated | buffered-row count |
+
+### BLE pairing
+
+All three characteristics require a bonded, encrypted, MITM-protected (authenticated) link —
+without this, anyone within BLE range could connect to a "PulsoxRelay" and read someone's
+SpO2/pulse history with zero access control. The ESP32 requires LE Secure Connections pairing
+(`NimBLEDevice::setSecurityAuth(bonding=true, mitm=true, sc=true)`) with passkey entry
+(`BLE_HS_IO_DISPLAY_ONLY`): the phone's OS shows its own native "enter PIN" pairing dialog on
+first connection to a given ESP32, before any GATT operation against these characteristics can
+succeed (a write/subscribe attempt beforehand fails with an ATT "insufficient authentication"
+error).
+
+The PIN itself is **not a fixed value in this document or in source** — a hardcoded literal
+committed to a shared repo would stop being a secret at all. Instead the ESP32 generates a random
+6-digit PIN on first boot (or after an NVS wipe), persists it, and prints it to its serial log on
+every boot. It can be changed at any time via the serial-only `blepin <6 digits>` debug command —
+deliberately never reachable via any BLE opcode, so a not-yet-paired attacker can never set their
+own known PIN (same reasoning as `SET_WIFI_CREDENTIALS`'s OTA password, which is serial-only for
+the identical reason). Changing the PIN only affects *future* pairings; phones already bonded are
+unaffected, since the PIN is only used during the initial pairing handshake.
+
+Once bonded, a phone reconnects automatically without re-pairing (the link's encryption keys are
+cached by both sides) — the PIN only needs to be entered once per phone.
 
 ### Control opcodes (1 byte, optional payload)
 
@@ -80,7 +103,8 @@ compatible and the common case needs no header at all.
 
 ### Recommended sync sequence (phone side)
 
-1. Connect, discover services, request MTU 503.
+1. Connect. If not already bonded with this ESP32, pair first (see "BLE pairing" above) — the
+   phone's OS handles the PIN-entry dialog natively — then discover services and request MTU 503.
 2. Write `SET_TIME` (always, every connection).
 3. Write `REQUEST_DATA`. This may first re-download everything the PO-400 currently has over USB
    before streaming any of it — see `REQUEST_DATA`'s own table entry for exactly when — which can

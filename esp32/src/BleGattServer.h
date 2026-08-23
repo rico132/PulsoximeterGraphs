@@ -6,6 +6,7 @@
 #pragma once
 
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 
 #include "ClockSync.h"
 #include "ICsvBuffer.h"
@@ -20,6 +21,16 @@ public:
                OtaManager &otaManager, UsbHidOxHost &usbHost);
 
   void begin();
+
+  // Sets a new BLE pairing PIN (exactly 6 digits) and persists it to NVS —
+  // called only from main.cpp's serial debug command, deliberately never
+  // reachable via any BLE opcode (same reasoning as
+  // OtaManager::setOtaPasswordFromSerial: a not-yet-paired attacker must
+  // never be able to set their own known PIN). Takes effect for the *next*
+  // pairing attempt; devices already bonded are unaffected (the passkey is
+  // only used during the initial pairing handshake, not for already-
+  // established encrypted links) — see Config::kPrefsKeyBlePasskey's comment.
+  void setPairingPasskeyFromSerial(const std::string &pin);
 
 private:
   // Forwarders rather than direct multiple-inheritance from the NimBLE
@@ -57,6 +68,7 @@ private:
   StoredRecordDownloader &storedRecordDownloader_;
   OtaManager &otaManager_;
   UsbHidOxHost &usbHost_;
+  Preferences preferences_;
 
   ServerCallbacks serverCallbacks_{*this};
   ControlCallbacks controlCallbacks_{*this};

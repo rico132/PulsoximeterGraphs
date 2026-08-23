@@ -169,6 +169,22 @@ constexpr bool kDefaultTestMode = true; // default ON — never destroy real dat
 constexpr const char *kPrefsKeyCommittedAutoEpochs = "auto_committed";
 constexpr const char *kPrefsKeyCommittedManualEpoch = "manual_committed";
 
+// BLE pairing PIN — see BleGattServer::begin()'s NimBLEDevice::setSecurityAuth()
+// call and the Control/Data/Status characteristics' *_ENC/*_AUTHEN
+// properties: without pairing, literally anyone within BLE range could
+// connect to a "PulsoxRelay" and read someone's SpO2/pulse history — health
+// data — with zero access control. Deliberately never a fixed literal baked
+// in here: if this repo is ever shared, a hardcoded PIN committed to source
+// stops being a secret at all. Instead BleGattServer generates a random one
+// on first boot (or after an NVS wipe), persists it under this key, and
+// prints it to Serial every boot so it stays retrievable. Same
+// serial-only-provisioning boundary as kPrefsKeyOtaPassword below, and for
+// the same reason: this must never be settable via any BLE opcode, or a
+// not-yet-paired attacker could simply set their own known PIN — see
+// BleGattServer::setPairingPasskeyFromSerial(), reachable only via
+// main.cpp's `blepin <6 digits>` serial debug command.
+constexpr const char *kPrefsKeyBlePasskey = "ble_passkey";
+
 // ---------------------------------------------------------------------------
 // OTA / WiFi
 // ---------------------------------------------------------------------------

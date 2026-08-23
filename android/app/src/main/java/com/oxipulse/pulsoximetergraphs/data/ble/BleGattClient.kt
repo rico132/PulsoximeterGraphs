@@ -13,11 +13,15 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.ParcelUuid
 import android.os.SystemClock
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
@@ -242,6 +246,97 @@ class BleGattClient(
         bluetoothGatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
 
+    private var bondStateReceiver: BroadcastReceiver? = null
+
+    /**
+     * The ESP32 now requires pairing before it will accept any control write or notification
+     * subscription (see PROTOCOL.md's "BLE pairing" section) -- without this, a phone that's
+     * never paired would get an immediate "insufficient authentication" GATT error on its first
+     * write (SET_TIME), surfaced as an opaque failure with no explanation. Proactively pairing
+     * here instead, rather than waiting for that error and hoping the OS auto-recovers from it
+     * (behavior that's historically inconsistent across Android versions/OEMs), makes the flow
+     * deterministic: already bonded -> proceed immediately; not yet bonded -> request it and wait
+     * for the system pairing dialog (where the user enters the PIN the ESP32 printed to its
+     * serial log) before continuing.
+     */
+    @SuppressLint("MissingPermission")
+    private fun ensureBondedThenDiscoverServices(gatt: BluetoothGatt) {
+        val device = gatt.device
+        if (device.bondState == BluetoothDevice.BOND_BONDED) {
+            log("Already bonded with ${device.address}, discovering services")
+            gatt.discoverServices()
+            return
+        }
+        log("Not yet bonded — requesting pairing (enter the PIN shown on the ESP32's serial log)")
+        registerBondStateReceiver(gatt)
+        if (device.bondState == BluetoothDevice.BOND_NONE) {
+            device.createBond()
+        }
+        // BOND_BONDING: a bond attempt is already under way (e.g. this is a reconnect while the
+        // user is still working through the system pairing dialog from a moment ago) -- nothing
+        // more to do here than wait for the receiver below.
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun registerBondStateReceiver(gatt: BluetoothGatt) {
+        if (bondStateReceiver != null) return // Already waiting on one for this connection.
+        val targetAddress = gatt.device.address
+        val receiver = object : BroadcastReceiver() {
+            @SuppressLint("MissingPermission")
+            override fun onReceive(receiverContext: Context, intent: Intent) {
+                if (intent.action != BluetoothDevice.ACTION_BOND_STATE_CHANGED) return
+                val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                }
+                if (device?.address != targetAddress) return // Some other device's bond event.
+
+                when (intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE)) {
+                    BluetoothDevice.BOND_BONDED -> {
+                        log("Pairing succeeded")
+                        unregisterBondStateReceiver()
+                        armTimeout() // Pairing can take a while; don't let it alone trip the watchdog.
+                        gatt.discoverServices()
+                    }
+                    BluetoothDevice.BOND_NONE -> {
+                        // Only a real failure if we were actually mid-pairing -- BOND_NONE is
+                        // also this extra's value on totally unrelated bond broadcasts.
+                        val previous = intent.getIntExtra(
+                            BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE,
+                            BluetoothDevice.BOND_NONE,
+                        )
+                        if (previous == BluetoothDevice.BOND_BONDING) {
+                            unregisterBondStateReceiver()
+                            fail("Pairing failed or was cancelled — check the PIN and try again")
+                        }
+                    }
+                    else -> Unit // BOND_BONDING: still in progress, keep waiting.
+                }
+            }
+        }
+        bondStateReceiver = receiver
+        ContextCompat.registerReceiver(
+            context,
+            receiver,
+            IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+    }
+
+    private fun unregisterBondStateReceiver() {
+        bondStateReceiver?.let {
+            try {
+                context.unregisterReceiver(it)
+            } catch (e: IllegalArgumentException) {
+                // Already unregistered (e.g. this is closeGatt()'s cleanup call running after the
+                // receiver's own onReceive() already unregistered itself) -- not an error.
+            }
+        }
+        bondStateReceiver = null
+    }
+
     private fun phyName(phy: Int): String = when (phy) {
         BluetoothDevice.PHY_LE_1M -> "1M"
         BluetoothDevice.PHY_LE_2M -> "2M"
@@ -276,7 +371,7 @@ class BleGattClient(
                     BluetoothDevice.PHY_LE_2M_MASK,
                     BluetoothDevice.PHY_OPTION_NO_PREFERRED,
                 )
-                gatt.discoverServices()
+                ensureBondedThenDiscoverServices(gatt)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 log("Disconnected (status $status)")
                 // Cancelling calls disconnect() itself, so the resulting STATE_DISCONNECTED here
@@ -753,6 +848,10 @@ class BleGattClient(
 
     @SuppressLint("MissingPermission")
     private fun closeGatt() {
+        // Whatever else this connection was doing, it's over -- if bonding was still pending
+        // (e.g. the user backed out of the system pairing dialog, or the link dropped mid-
+        // pairing), there's no longer anything for the receiver to wait for.
+        unregisterBondStateReceiver()
         bluetoothGatt?.close()
         bluetoothGatt = null
         controlCharacteristic = null

@@ -2,7 +2,40 @@
 
 #include <cstring>
 
+#include <esp_random.h>
+
 #include "Config.h"
+
+namespace {
+// Loads the persisted BLE pairing PIN, or — on first boot ever, or after an
+// NVS wipe — generates a fresh random one and persists it. Never a fixed
+// literal baked into source: see Config::kPrefsKeyBlePasskey's own comment
+// for why a hardcoded PIN wouldn't actually be a secret. esp_random() is a
+// real HWRNG on the ESP32, safe to use directly with no seeding needed.
+// Printed to Serial every boot (not just when freshly generated) so it's
+// always retrievable by just power-cycling and watching the log, with no
+// separate "did I ever write this down" bookkeeping required.
+uint32_t loadOrGenerateBlePasskey(Preferences &preferences) {
+  uint32_t passkey;
+  if (preferences.isKey(Config::kPrefsKeyBlePasskey)) {
+    passkey = static_cast<uint32_t>(
+        preferences.getULong(Config::kPrefsKeyBlePasskey, 0));
+  } else {
+    passkey = esp_random() % 1000000UL; // 000000-999999
+    preferences.putULong(Config::kPrefsKeyBlePasskey, passkey);
+    Serial.println(
+        "BleGattServer: no BLE pairing PIN was set yet — generated a new "
+        "one (see below).");
+  }
+  Serial.println("========================================================");
+  Serial.printf("BleGattServer: BLE pairing PIN: %06u\n", passkey);
+  Serial.println(
+      "Enter this PIN when your phone asks to pair with 'PulsoxRelay'. "
+      "Change it any time via the serial debug command: blepin <6 digits>");
+  Serial.println("========================================================");
+  return passkey;
+}
+} // namespace
 
 BleGattServer::BleGattServer(ICsvBuffer &csvBuffer, ClockSync &clockSync,
                              StoredRecordDownloader &storedRecordDownloader,
@@ -46,25 +79,62 @@ void BleGattServer::ControlCallbacks::onWrite(
 }
 
 void BleGattServer::begin() {
+  preferences_.begin(Config::kPrefsNamespace, /*readOnly=*/false);
+
   NimBLEDevice::init(Config::kDeviceName);
   NimBLEDevice::setMTU(Config::kPreferredMtu);
+
+  // Require pairing — bonded, encrypted, and authenticated (MITM-protected
+  // via the passkey below) — before the stack will accept a write or read
+  // against any *_ENC/*_AUTHEN characteristic (see below). Without this,
+  // literally anyone within BLE range could connect to a "PulsoxRelay" and
+  // read someone's SpO2/pulse history with zero access control — see
+  // Config::kPrefsKeyBlePasskey's own comment for the full reasoning.
+  // sc=true (LE Secure Connections, ECDH-based key exchange) rather than
+  // legacy pairing — supported by every Android version this app targets.
+  NimBLEDevice::setSecurityAuth(/*bonding=*/true, /*mitm=*/true, /*sc=*/true);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
+  NimBLEDevice::setSecurityPasskey(loadOrGenerateBlePasskey(preferences_));
 
   server_ = NimBLEDevice::createServer();
   server_->setCallbacks(&serverCallbacks_);
 
   NimBLEService *service = server_->createService(Config::kServiceUuid);
 
+  // WRITE alone declares the operation type; _ENC/_AUTHEN layer the actual
+  // access-control requirement on top — the stack rejects a write from an
+  // unpaired/unauthenticated link with an ATT "Insufficient Authentication"
+  // error rather than ever reaching handleControlWrite() at all. Every
+  // control opcode (REQUEST_DATA, SET_TIME, CLEAR_BUFFER, ...) goes through
+  // this one characteristic, so gating it here is what actually protects all
+  // of them — nothing downstream (the Data dump, USB re-download, ...) can
+  // ever be triggered without first getting past this.
   controlChar_ = service->createCharacteristic(
-      Config::kControlCharUuid, NIMBLE_PROPERTY::WRITE);
+      Config::kControlCharUuid, NIMBLE_PROPERTY::WRITE |
+                                    NIMBLE_PROPERTY::WRITE_ENC |
+                                    NIMBLE_PROPERTY::WRITE_AUTHEN);
   controlChar_->setCallbacks(&controlCallbacks_);
 
-  dataChar_ = service->createCharacteristic(Config::kDataCharUuid,
-                                           NIMBLE_PROPERTY::NOTIFY);
+  // READ_ENC/READ_AUTHEN here mainly guards the CCCD (notification
+  // subscribe) — defense in depth alongside the Control gate above, which is
+  // what actually prevents an unauthenticated connection from ever making
+  // the ESP32 send anything on this characteristic in the first place (see
+  // its own comment).
+  dataChar_ = service->createCharacteristic(
+      Config::kDataCharUuid, NIMBLE_PROPERTY::NOTIFY |
+                                 NIMBLE_PROPERTY::READ_ENC |
+                                 NIMBLE_PROPERTY::READ_AUTHEN);
 
   // Stretch / not-MVP per PROTOCOL.md, but declared for scan-filter/GATT
-  // completeness: reports the current buffered row count on read.
+  // completeness: reports the current buffered row count on read. Gated the
+  // same way as Data above, for the same reason — it's otherwise plain
+  // NIMBLE_PROPERTY::READ, which would let an unauthenticated connection
+  // read it directly.
   statusChar_ = service->createCharacteristic(
-      Config::kStatusCharUuid, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+      Config::kStatusCharUuid, NIMBLE_PROPERTY::READ |
+                                   NIMBLE_PROPERTY::READ_ENC |
+                                   NIMBLE_PROPERTY::READ_AUTHEN |
+                                   NIMBLE_PROPERTY::NOTIFY);
 
   // NimBLE-Arduino 2.x: services are started implicitly when the server
   // starts advertising; NimBLEService::start() is a deprecated no-op kept
@@ -310,4 +380,22 @@ void BleGattServer::requestDataDump() {
     Serial.println(
         "BleGattServer: data dump aborted — phone disconnected mid-dump.");
   }
+}
+
+void BleGattServer::setPairingPasskeyFromSerial(const std::string &pin) {
+  if (pin.length() != 6 ||
+      pin.find_first_not_of("0123456789") != std::string::npos) {
+    Serial.println(
+        "BleGattServer: blepin requires exactly 6 digits (e.g. 'blepin "
+        "482913') — ignoring.");
+    return;
+  }
+  const uint32_t passkey = static_cast<uint32_t>(std::stoul(pin));
+  preferences_.putULong(Config::kPrefsKeyBlePasskey, passkey);
+  NimBLEDevice::setSecurityPasskey(passkey);
+  Serial.printf(
+      "BleGattServer: BLE pairing PIN updated via serial to %06u. Already-"
+      "bonded phones are unaffected; any *new* pairing from now on must "
+      "enter this PIN.\n",
+      passkey);
 }
