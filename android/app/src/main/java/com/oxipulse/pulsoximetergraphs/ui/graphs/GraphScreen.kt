@@ -524,7 +524,15 @@ private val TIME_ONLY_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern
 // data (e.g. no readings at all on some day in between) would otherwise leave two clusters of
 // points both labeled with a bare "HH:mm", with nothing on the chart itself indicating they're
 // actually days apart rather than the same afternoon.
-private val DATE_AND_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM, HH:mm")
+//
+// Date and time are on separate lines (a real newline inside the quoted pattern literal, not a
+// wider single-line "d MMM, HH:mm") because Vico's default bottom-axis label component renders a
+// single line and silently ellipsizes whatever doesn't fit in it — "22 Aug, 14:30" doesn't, and
+// was rendering as "22 Aug, 14…" with the time cut off entirely. rememberTimeAxisLabelComponent
+// below opts the label component into 2 lines so this actually wraps instead of truncating; each
+// line alone ("22 Aug" / "14:30") is no wider than the single-line "14:30"-only label already
+// rendered fine in the non-multi-day case, so this fits with room to spare.
+private val DATE_AND_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM'\n'HH:mm")
 
 @Composable
 private fun rememberTimeAxisFormatter(readings: List<ReadingEntity>): CartesianValueFormatter {
@@ -555,11 +563,25 @@ private fun rememberTimeAxisFormatter(readings: List<ReadingEntity>): CartesianV
 
 private const val TARGET_TIME_AXIS_LABEL_COUNT = 6
 
-// Fewer, wider-spaced labels once dates are included (see DATE_AND_TIME_FORMATTER) — "22 Aug,
-// 14:30" needs roughly twice the width "14:30" alone does, and TARGET_TIME_AXIS_LABEL_COUNT's
-// fixed spacing has no awareness of actual label pixel width to widen itself automatically (see
+// Fewer, wider-spaced labels once dates are included (see DATE_AND_TIME_FORMATTER) — even split
+// across 2 lines, "22 Aug" / "14:30" reads more comfortably with more breathing room between
+// ticks than plain "14:30" needs, and TARGET_TIME_AXIS_LABEL_COUNT's fixed spacing has no
+// awareness of actual label pixel width to widen itself automatically (see
 // rememberSharedTimeAxisItemPlacer's own doc for why spacing is computed this way at all).
 private const val TARGET_TIME_AXIS_LABEL_COUNT_MULTI_DAY = 4
+
+/**
+ * The bottom axis's label component, shared by both chart cards so a multi-day selection wraps
+ * identically on each. Vico's default axis label component renders a single line and silently
+ * ellipsizes any label that doesn't fit within it — harmless for the plain "HH:mm" labels used
+ * outside a multi-day selection, but it was truncating DATE_AND_TIME_FORMATTER's output (e.g.
+ * "22 Aug, 14:30" rendered as "22 Aug, 14…", losing the time entirely — see that formatter's own
+ * doc). Allowing 2 lines here doesn't force wrapping for the single-line "HH:mm" case; a
+ * formatted value only spans 2 lines if it actually contains the newline DATE_AND_TIME_FORMATTER
+ * puts there, so one label component works for both.
+ */
+@Composable
+private fun rememberTimeAxisLabelComponent() = rememberAxisLabelComponent(lineCount = 2)
 
 /**
  * A [HorizontalAxis.ItemPlacer] shared by both chart cards' bottom axes, so they land on the
@@ -993,6 +1015,7 @@ private fun Spo2ChartContent(
                             itemPlacer = yAxisItemPlacer,
                         ),
                         bottomAxis = HorizontalAxis.rememberBottom(
+                            label = rememberTimeAxisLabelComponent(),
                             valueFormatter = timeAxisFormatter,
                             itemPlacer = timeAxisItemPlacer,
                         ),
@@ -1080,6 +1103,7 @@ private fun PulseChartContent(
                             itemPlacer = yAxisItemPlacer,
                         ),
                         bottomAxis = HorizontalAxis.rememberBottom(
+                            label = rememberTimeAxisLabelComponent(),
                             valueFormatter = timeAxisFormatter,
                             itemPlacer = timeAxisItemPlacer,
                         ),

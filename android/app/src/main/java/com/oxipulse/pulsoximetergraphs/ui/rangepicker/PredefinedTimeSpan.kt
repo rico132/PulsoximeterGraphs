@@ -34,10 +34,15 @@ enum class PredefinedTimeSpan(val label: String, private val amount: Long, priva
      * February, not 30 days back).
      */
     fun toRange(zone: ZoneId = ZoneId.systemDefault(), now: Instant = Instant.now()): ClosedRange<Instant> {
-        // LocalDate.ofInstant(now, zone), NOT LocalDate.now(zone) -- the latter reads the real
+        // now.atZone(zone).toLocalDate(), NOT LocalDate.now(zone) -- the latter reads the real
         // system clock directly, ignoring the [now] passed in above (only the range's end would
         // then respect an injected [now], not "today" for the start-date subtraction below).
-        val today = LocalDate.ofInstant(now, zone)
+        // Also deliberately NOT LocalDate.ofInstant(now, zone): that overload was only added to
+        // Android's java.time in API 34, so it throws NoSuchMethodError and crashes this screen
+        // on every Android 12/12L/13 device (API 31-33, and this app's own minSdk is 31) the
+        // instant a predefined span is picked. atZone()/toLocalDate() do the exact same
+        // conversion and have been available since java.time first shipped on Android (API 26).
+        val today = now.atZone(zone).toLocalDate()
         val startDate: LocalDate = today.minus(amount, unit)
         val start = startDate.atStartOfDay(zone).toInstant()
         return start..now
