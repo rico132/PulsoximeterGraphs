@@ -173,16 +173,33 @@ void BleGattServer::begin() {
                                    NIMBLE_PROPERTY::NOTIFY);
   statusChar_->setCallbacks(&statusCallbacks_);
 
-  // WRITE (with response, not WRITE_NR) deliberately, same as Control — each chunk's ack is
-  // what paces the phone into sending the next one (see PROTOCOL.md's "BLE firmware update"
-  // section), rather than letting it fire the whole image at the link as fast as possible with
-  // no backpressure. Gated by the same *_ENC/*_AUTHEN pairing requirement as every other
-  // characteristic here — an arbitrary phone flashing arbitrary firmware onto this device is
-  // now possible at all, so this absolutely must never be reachable from an unauthenticated
-  // link (see Config::kPrefsKeyBlePasskey's own comment for the full reasoning, which applies
-  // here even more than to reading health data).
+  // WRITE_NR (write *without* response), unlike Control — see PROTOCOL.md's "BLE firmware
+  // update" section for the full throughput reasoning. The old design used a plain WRITE here so
+  // each chunk's ATT-level ack paced the phone into sending the next one; that meant a full
+  // write-request/write-response round trip per ~500-byte chunk, capping a multi-hundred-KB
+  // image to roughly one chunk per BLE connection interval. WRITE_NR lets the phone queue many
+  // chunks back-to-back with no per-chunk round trip, which is safe here specifically because:
+  // (1) BLE's link layer is itself a reliable, in-order transport — "no response" only skips the
+  // *application-level* ack, not delivery guarantees, so nothing can arrive corrupted or out of
+  // order; (2) this NimBLE host processes queued ATT operations for a connection strictly in the
+  // order received, and handleFirmwareChunk() below calls Update::write() synchronously before
+  // returning, so the *next* opcode after the last chunk (FINISH_FIRMWARE_UPDATE, sent as a
+  // Control write) can only be handled once every prior chunk has actually finished being
+  // written to flash — ordering and completion are still both guaranteed, just without the
+  // round-trip cost; (3) ESP32 SPI flash writes easily outrun realistic BLE throughput even at
+  // 2M PHY, so this NimBLE host task backing up behind slow flash writes isn't a real risk. Gated
+  // by the same *_ENC/*_AUTHEN pairing requirement as every other characteristic here — an
+  // arbitrary phone flashing arbitrary firmware onto this device is now possible at all, so this
+  // absolutely must never be reachable from an unauthenticated link (see
+  // Config::kPrefsKeyBlePasskey's own comment for the full reasoning, which applies here even
+  // more than to reading health data). Note that a WRITE_NR (ATT "Write Command") that fails
+  // this security check is silently dropped rather than erroring back to the phone — the BLE
+  // spec gives commands no error-response mechanism at all — but by the time any chunk is ever
+  // sent the link has already had to pass this exact same gate on the preceding
+  // START_FIRMWARE_UPDATE control write, which does get an explicit ack, so this is never
+  // actually reachable in practice.
   firmwareChar_ = service->createCharacteristic(
-      Config::kFirmwareCharUuid, NIMBLE_PROPERTY::WRITE |
+      Config::kFirmwareCharUuid, NIMBLE_PROPERTY::WRITE_NR |
                                      NIMBLE_PROPERTY::WRITE_ENC |
                                      NIMBLE_PROPERTY::WRITE_AUTHEN);
   firmwareChar_->setCallbacks(&firmwareCallbacks_);

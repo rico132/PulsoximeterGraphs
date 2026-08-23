@@ -37,7 +37,7 @@ ESP32 = peripheral/server. Phone = central/client. Advertised device name: `Puls
 | `6f2a1001-2f5b-4a9c-91c4-0d8f6b1c9a01` | Control | write-with-response, encrypted+authenticated | opcodes below |
 | `6f2a1002-2f5b-4a9c-91c4-0d8f6b1c9a01` | Data | notify, encrypted+authenticated | chunked CSV bytes |
 | `6f2a1003-2f5b-4a9c-91c4-0d8f6b1c9a01` | Status | read/notify, encrypted+authenticated | firmware version (read), firmware-update result (notify) |
-| `6f2a1004-2f5b-4a9c-91c4-0d8f6b1c9a01` | Firmware | write-with-response, encrypted+authenticated | chunked firmware-image bytes, phone → ESP32 |
+| `6f2a1004-2f5b-4a9c-91c4-0d8f6b1c9a01` | Firmware | write-without-response, encrypted+authenticated | chunked firmware-image bytes, phone → ESP32 |
 
 ### BLE pairing
 
@@ -96,11 +96,15 @@ Sequence (phone side):
    sent — this is what the ESP32 verifies against, so it catches download corruption too, not
    just whatever might go wrong over BLE itself.
 2. Write `START_FIRMWARE_UPDATE` with the image's total size and that MD5.
-3. Write the image to the Firmware characteristic in `negotiatedMtu - 3`-byte chunks, **one at a
-   time, waiting for each write's ATT response before sending the next** — this is what paces
-   the phone to the ESP32's actual flash-write speed rather than flooding the link with no
-   backpressure (unlike the Data characteristic's ESP32→phone notify stream, which has no such
-   per-chunk ack).
+3. Write the image to the Firmware characteristic in `negotiatedMtu - 3`-byte chunks, using
+   **write-without-response** — queuing the next chunk as soon as the previous one is locally
+   queued, with no per-chunk ATT-level round trip (unlike Control/`START_FIRMWARE_UPDATE` above,
+   which does wait for its ack). This relies on BLE's link layer already being a reliable,
+   in-order transport (write-without-response only skips the *application-level* ack, not
+   delivery guarantees) and on the ESP32 processing writes for one connection strictly in
+   arrival order — see `BleGattServer.cpp`'s own comment on the Firmware characteristic for the
+   full reasoning, including why this can't reorder ahead of the `FINISH_FIRMWARE_UPDATE` write
+   that follows it.
 4. Once every chunk has been acknowledged, write `FINISH_FIRMWARE_UPDATE`.
 5. Wait for a Status notification (see below) carrying the result. On success, the ESP32 has
    already switched its boot partition and reboots on its own — the phone does not, and cannot,

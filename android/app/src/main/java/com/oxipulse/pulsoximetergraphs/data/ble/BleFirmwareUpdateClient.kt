@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
@@ -45,10 +46,12 @@ import kotlinx.coroutines.launch
  * Flow (see PROTOCOL.md §"BLE firmware update"):
  * 1. Scan, connect, pair if needed (same as [BleGattClient]), discover services.
  * 2. Write START_FIRMWARE_UPDATE ([size][expectedMd5Hex]).
- * 3. Write the image to the Firmware characteristic in `negotiatedMtu - 3`-byte chunks, one at a
- *    time, waiting for each write's ack before sending the next — this is what paces the phone
- *    to the ESP32's actual flash-write speed instead of flooding the link with no backpressure.
- * 4. Write FINISH_FIRMWARE_UPDATE once every chunk has been acked.
+ * 3. Write the image to the Firmware characteristic in `negotiatedMtu - 3`-byte chunks using
+ *    write-without-response, queuing the next chunk as soon as the previous one is accepted
+ *    into the local outgoing queue rather than waiting for an ATT-level round trip per chunk —
+ *    see [sendNextChunk]'s own doc and `BleGattServer.cpp`'s matching characteristic-property
+ *    comment for why this is still safe and ordered despite the lack of a per-chunk ack.
+ * 4. Write FINISH_FIRMWARE_UPDATE once every chunk has been queued.
  * 5. Wait for a Status notification carrying the result. Success means the ESP32 has already
  *    switched its boot partition and is rebooting into the new image on its own — this client
  *    does not (and cannot) do anything further to make that happen.
@@ -547,17 +550,48 @@ class BleFirmwareUpdateClient(private val context: Context) {
         writeControl(gatt, byteArrayOf(BleConstants.OPCODE_ABORT_FIRMWARE_UPDATE))
     }
 
+    // WRITE_TYPE_NO_RESPONSE (see BleGattServer.cpp's matching WRITE_NR characteristic property
+    // for the full reasoning): onCharacteristicWrite below still fires for this write type, but
+    // as soon as the write is queued locally rather than after a full ATT-level round trip to
+    // the ESP32 — that's what lets chunks flow back-to-back instead of one per BLE connection
+    // interval, without giving up delivery ordering/reliability (both are guaranteed at the link
+    // layer regardless of write type).
     @Suppress("DEPRECATION")
     @SuppressLint("MissingPermission")
     private fun sendNextChunk(gatt: BluetoothGatt) {
         val characteristic = firmwareCharacteristic ?: return fail("Firmware characteristic missing")
         val end = (bytesSent + chunkSize).coerceAtMost(firmwareBytes.size)
         val chunk = firmwareBytes.copyOfRange(bytesSent, end)
+        if (!writeFirmwareChunk(gatt, characteristic, chunk)) {
+            // Android's local outgoing GATT queue is momentarily full — a real possibility now
+            // that chunks are queued back-to-back rather than paced by a round trip each. Back
+            // off briefly and retry the exact same chunk (bytesSent isn't advanced until a write
+            // actually gets queued) rather than either losing it or busy-looping tightly.
+            scope.launch {
+                delay(CHUNK_QUEUE_RETRY_DELAY_MS)
+                sendNextChunk(gatt)
+            }
+            return
+        }
         bytesSent = end
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            gatt.writeCharacteristic(characteristic, chunk, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+    }
+
+    /** True if `chunk` was successfully handed to the local Bluetooth stack's outgoing queue. */
+    @Suppress("DEPRECATION")
+    @SuppressLint("MissingPermission")
+    private fun writeFirmwareChunk(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        chunk: ByteArray,
+    ): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeCharacteristic(
+                characteristic,
+                chunk,
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE,
+            ) == BluetoothStatusCodes.SUCCESS
         } else {
-            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
             characteristic.value = chunk
             gatt.writeCharacteristic(characteristic)
         }
@@ -644,14 +678,19 @@ class BleFirmwareUpdateClient(private val context: Context) {
     companion object {
         private const val TAG = "BleFirmwareUpdateClient"
 
-        // Generous: a multi-hundred-KB to low-single-digit-MB image, sent one small chunk at a
-        // time with a full write-then-ack round trip per chunk (see this class's own doc for
-        // why), can legitimately take well over a minute on a slow link. Re-armed on every
-        // chunk ack, so this is a stall timeout, not a fixed ceiling on the whole transfer.
+        // Generous: even with write-without-response chunking (see this class's own doc), a
+        // multi-hundred-KB to low-single-digit-MB image can legitimately take a while on a slow
+        // link. Re-armed on every chunk queued, so this is a stall timeout, not a fixed ceiling
+        // on the whole transfer.
         private const val UPDATE_TIMEOUT_MS = 60_000L
 
         // A version check only ever does one scan + connect + bond(if needed) + one read, so
         // there's much less legitimate work to wait through — see armTimeout()'s own comment.
         private const val VERSION_CHECK_TIMEOUT_MS = 15_000L
+
+        // How long to back off before retrying a chunk write whose local queue was full — see
+        // sendNextChunk's own doc. Short on purpose: this is pacing against the local Bluetooth
+        // stack briefly catching up, not a network-level retry.
+        private const val CHUNK_QUEUE_RETRY_DELAY_MS = 10L
     }
 }
