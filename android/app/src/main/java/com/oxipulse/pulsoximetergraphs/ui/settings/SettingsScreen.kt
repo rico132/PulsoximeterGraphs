@@ -46,6 +46,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.oxipulse.pulsoximetergraphs.data.ble.BleFirmwareUpdateClient
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.di.AppContainer
 import kotlinx.coroutines.Dispatchers
@@ -62,6 +63,7 @@ fun SettingsScreen(
         factory = SettingsViewModel.factory(
             appContainer.thresholdsRepository,
             appContainer.bleGattClient,
+            appContainer.bleFirmwareUpdateClient,
             appContainer.readingsRepository,
         ),
     )
@@ -251,6 +253,94 @@ private fun DeviceSection(viewModel: SettingsViewModel, testModeEnabled: Boolean
                         "Connect to the device (via a BLE sync) to enable these controls.",
                         style = MaterialTheme.typography.bodySmall,
                     )
+                }
+            }
+        }
+
+        FirmwareUpdateCard(viewModel)
+    }
+}
+
+/**
+ * Firmware update over BLE — a from-scratch alternative to the WiFi/ArduinoOTA card above,
+ * requiring no WiFi credentials at all: checks this repo's latest GitHub release for a firmware
+ * asset, downloads it, and pushes it straight to the ESP32 over the same BLE link already used
+ * for syncing (see [BleFirmwareUpdateClient] and PROTOCOL.md §"BLE firmware update"). Does not
+ * require [DeviceSection]'s own `connected` (an active CSV sync) — it scans for and connects to
+ * the device itself, independently, the moment "Check for update" is tapped.
+ */
+@Composable
+private fun FirmwareUpdateCard(viewModel: SettingsViewModel) {
+    val checkState by viewModel.firmwareCheckState.collectAsState()
+    val updateState by viewModel.firmwareUpdateState.collectAsState()
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Firmware update (BLE)", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Checks this project's latest GitHub release for new ESP32 firmware, downloads " +
+                    "it, and sends it to the device over Bluetooth — no WiFi needed.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+
+            val uploading = updateState is BleFirmwareUpdateClient.UpdateState.Uploading ||
+                updateState is BleFirmwareUpdateClient.UpdateState.Verifying ||
+                updateState is BleFirmwareUpdateClient.UpdateState.Scanning ||
+                updateState is BleFirmwareUpdateClient.UpdateState.Connecting
+
+            when (val state = updateState) {
+                is BleFirmwareUpdateClient.UpdateState.Uploading -> {
+                    val percent = if (state.totalBytes > 0) {
+                        (state.bytesSent * 100 / state.totalBytes).coerceIn(0, 100)
+                    } else {
+                        0
+                    }
+                    Text("Sending firmware… $percent% (${state.bytesSent}/${state.totalBytes} bytes)")
+                }
+                BleFirmwareUpdateClient.UpdateState.Verifying ->
+                    Text("Verifying and switching boot partition…")
+                BleFirmwareUpdateClient.UpdateState.Scanning -> Text("Looking for PulsoxRelay…")
+                BleFirmwareUpdateClient.UpdateState.Connecting -> Text("Connecting…")
+                BleFirmwareUpdateClient.UpdateState.Success ->
+                    Text(
+                        "Update succeeded — the device is rebooting into the new firmware.",
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                is BleFirmwareUpdateClient.UpdateState.Failed ->
+                    Text("Update failed: ${state.message}", color = MaterialTheme.colorScheme.error)
+                BleFirmwareUpdateClient.UpdateState.Idle -> Unit
+            }
+
+            when (val state = checkState) {
+                SettingsViewModel.FirmwareCheckState.Idle -> Unit
+                SettingsViewModel.FirmwareCheckState.Checking -> Text("Checking for updates…")
+                is SettingsViewModel.FirmwareCheckState.UpToDate ->
+                    Text("Up to date (${state.version}).")
+                is SettingsViewModel.FirmwareCheckState.Error ->
+                    Text("Check failed: ${state.message}", color = MaterialTheme.colorScheme.error)
+                is SettingsViewModel.FirmwareCheckState.UpdateAvailable -> {
+                    val currentText = state.currentVersion?.let { "current: $it" } ?: "current device version unknown"
+                    Text("Update available: ${state.release.version} ($currentText)")
+                    Button(
+                        onClick = { viewModel.downloadAndStartFirmwareUpdate(state.release) },
+                        enabled = !uploading,
+                    ) {
+                        Text("Download and install")
+                    }
+                }
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = viewModel::checkForFirmwareUpdate,
+                    enabled = checkState != SettingsViewModel.FirmwareCheckState.Checking && !uploading,
+                ) {
+                    Text("Check for update")
+                }
+                if (uploading) {
+                    OutlinedButton(onClick = viewModel::cancelFirmwareUpdate) {
+                        Text("Cancel")
+                    }
                 }
             }
         }

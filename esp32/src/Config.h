@@ -73,6 +73,10 @@ constexpr const char *kServiceUuid = "6f2a1000-2f5b-4a9c-91c4-0d8f6b1c9a01";
 constexpr const char *kControlCharUuid = "6f2a1001-2f5b-4a9c-91c4-0d8f6b1c9a01";
 constexpr const char *kDataCharUuid = "6f2a1002-2f5b-4a9c-91c4-0d8f6b1c9a01";
 constexpr const char *kStatusCharUuid = "6f2a1003-2f5b-4a9c-91c4-0d8f6b1c9a01";
+// Raw firmware-image bytes, phone -> ESP32, chunked the same way the Data characteristic
+// chunks CSV bytes ESP32 -> phone (each write <= negotiatedMtu - 3) — see BleFirmwareUpdater
+// and PROTOCOL.md §"BLE firmware update (OTA over BLE)".
+constexpr const char *kFirmwareCharUuid = "6f2a1004-2f5b-4a9c-91c4-0d8f6b1c9a01";
 
 // Control opcodes (1 byte, optional payload) — PROTOCOL.md §"Control opcodes".
 enum ControlOpcode : uint8_t {
@@ -82,6 +86,20 @@ enum ControlOpcode : uint8_t {
   kOpSetTestMode = 0x04,
   kOpSetWifiCredentials = 0x05,
   kOpEnterOtaMode = 0x06,
+  // Payload: [size:u32 LE][expectedMd5Hex:32 ASCII bytes]. Begins receiving a new firmware
+  // image into the *inactive* OTA partition — see BleFirmwareUpdater::begin(). Refused (see
+  // its own status result) while a USB stored-record download is in progress, or while an
+  // update is already underway.
+  kOpStartFirmwareUpdate = 0x07,
+  // No payload. Sent once the phone has written exactly `size` bytes to the Firmware
+  // characteristic. Verifies size + MD5 and, ONLY on success, flips the boot partition to the
+  // newly-written image (Update::end()'s own behavior — see BleFirmwareUpdater::finish()) and
+  // reboots. On failure, the currently-running firmware and its boot partition are completely
+  // untouched; nothing reboots.
+  kOpFinishFirmwareUpdate = 0x08,
+  // No payload. Discards whatever has been written so far and frees the in-progress OTA
+  // handle, without touching the boot partition — e.g. the phone gave up mid-transfer.
+  kOpAbortFirmwareUpdate = 0x09,
 };
 
 // End-of-transfer marker on the Data characteristic: exactly one notification
@@ -209,5 +227,41 @@ constexpr const char *kPrefsKeyOtaPassword = "ota_pass";
 // password must only ever be set via a physically-attached serial/USB debug
 // command, never over BLE, so a compromised phone link alone can't push
 // firmware.
+
+// ---------------------------------------------------------------------------
+// BLE firmware update (OTA over BLE) — PROTOCOL.md §"BLE firmware update"
+// ---------------------------------------------------------------------------
+// Overridable at build time (see platformio.ini's `-D FIRMWARE_VERSION=...`), so a CI-built
+// release binary's compiled-in version always matches the git tag it's published under — the
+// Android app compares this (read from the Status characteristic) against the latest GitHub
+// release tag to decide whether an update is actually available. "dev" here is only ever what
+// a local, non-release build reports; it deliberately never matches a real release tag, so a
+// locally-flashed dev build always reads as "outdated" rather than silently comparing equal to
+// whatever the latest tag happens to be.
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION "dev"
+#endif
+constexpr const char *kFirmwareVersion = FIRMWARE_VERSION;
+
+// Status characteristic (see BleGattServer) notification tags — the first byte of any
+// notification on that characteristic says which of these it is; everything after is that
+// message's own payload. Distinct from the Control opcodes above (those flow phone -> ESP32;
+// these flow ESP32 -> phone) despite FIRMWARE_UPDATE_RESULT sharing FINISH_FIRMWARE_UPDATE's
+// opcode value — the two are never ambiguous since they're never read from the same byte
+// stream.
+enum StatusTag : uint8_t {
+  // Payload: kFirmwareVersion's bytes, ASCII, NOT null-terminated. Sent once on every read of
+  // the Status characteristic (BleGattServer has no other use for it yet) — see
+  // BleFirmwareUpdater's own doc for why the phone needs this at all.
+  kStatusFirmwareVersion = 0x01,
+  // Payload: 1 byte, 0x01 success / 0x00 failure, then (failure only) 1 more byte: either
+  // Update.h's own UPDATE_ERROR_* code (see Update.h) if the failure happened during
+  // writing/finalizing, or the sentinel 0xFF for a failure BleGattServer itself rejected the
+  // attempt for before ever touching Update (e.g. a USB download was in progress, or one
+  // firmware update was already under way) — see BleGattServer::handleStartFirmwareUpdate().
+  // Notified exactly once per attempt: either once kOpFinishFirmwareUpdate concludes, or
+  // immediately if kOpStartFirmwareUpdate itself was rejected.
+  kStatusFirmwareUpdateResult = 0x08,
+};
 
 } // namespace Config

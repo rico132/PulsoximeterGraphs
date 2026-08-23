@@ -1,6 +1,7 @@
 package com.oxipulse.pulsoximetergraphs.di
 
 import android.content.Context
+import com.oxipulse.pulsoximetergraphs.data.ble.BleFirmwareUpdateClient
 import com.oxipulse.pulsoximetergraphs.data.ble.BleGattClient
 import com.oxipulse.pulsoximetergraphs.data.db.AppDatabase
 import com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository
@@ -28,6 +29,10 @@ class AppContainer(context: Context) {
 
     val bleGattClient: BleGattClient by lazy {
         BleGattClient(appContext, readingsRepository)
+    }
+
+    val bleFirmwareUpdateClient: BleFirmwareUpdateClient by lazy {
+        BleFirmwareUpdateClient(appContext)
     }
 
     val themePreferenceRepository: ThemePreferenceRepository by lazy {

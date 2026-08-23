@@ -1,6 +1,7 @@
 #include "BleGattServer.h"
 
 #include <cstring>
+#include <vector>
 
 #include <esp_random.h>
 
@@ -70,6 +71,13 @@ void BleGattServer::ServerCallbacks::onDisconnect(NimBLEServer * /*server*/,
   // resumes from the same unclaimed buffer, so no resend/ack bookkeeping is
   // needed here.
   owner_.connected_ = false;
+  // A firmware update abandoned mid-transfer (phone crashed, walked out of range, ...) would
+  // otherwise leave BleFirmwareUpdater::inProgress() stuck true forever — every future
+  // START_FIRMWARE_UPDATE would then be refused as "already in progress" until a manual power
+  // cycle. Aborting here doesn't touch the boot partition (see BleFirmwareUpdater's own header
+  // doc for why that's always safe), so this is purely "free up the ability to try again" —
+  // nothing an already-in-flight update needs to survive a disconnect for.
+  owner_.firmwareUpdater_.abort();
   Serial.printf(
       "BleGattServer: phone disconnected (reason=%d) — advertising again.\n",
       reason);
@@ -86,6 +94,24 @@ void BleGattServer::ControlCallbacks::onWrite(
     NimBLECharacteristic *characteristic, NimBLEConnInfo & /*connInfo*/) {
   const NimBLEAttValue value = characteristic->getValue();
   owner_.handleControlWrite(value.data(), value.size());
+}
+
+void BleGattServer::FirmwareCallbacks::onWrite(
+    NimBLECharacteristic *characteristic, NimBLEConnInfo & /*connInfo*/) {
+  const NimBLEAttValue value = characteristic->getValue();
+  owner_.handleFirmwareChunk(value.data(), value.size());
+}
+
+void BleGattServer::StatusCallbacks::onRead(NimBLECharacteristic *characteristic,
+                                            NimBLEConnInfo & /*connInfo*/) {
+  // The only thing worth reading off Status today (see Config::kStatusFirmwareVersion's own
+  // doc) — a plain read, unlike the update-result notification below, so the app's "check for
+  // update" flow can learn the running version without first triggering anything else.
+  const size_t versionLen = strlen(Config::kFirmwareVersion);
+  std::vector<uint8_t> value(1 + versionLen);
+  value[0] = Config::kStatusFirmwareVersion;
+  std::memcpy(value.data() + 1, Config::kFirmwareVersion, versionLen);
+  characteristic->setValue(value.data(), value.size());
 }
 
 void BleGattServer::begin() {
@@ -145,6 +171,21 @@ void BleGattServer::begin() {
                                    NIMBLE_PROPERTY::READ_ENC |
                                    NIMBLE_PROPERTY::READ_AUTHEN |
                                    NIMBLE_PROPERTY::NOTIFY);
+  statusChar_->setCallbacks(&statusCallbacks_);
+
+  // WRITE (with response, not WRITE_NR) deliberately, same as Control — each chunk's ack is
+  // what paces the phone into sending the next one (see PROTOCOL.md's "BLE firmware update"
+  // section), rather than letting it fire the whole image at the link as fast as possible with
+  // no backpressure. Gated by the same *_ENC/*_AUTHEN pairing requirement as every other
+  // characteristic here — an arbitrary phone flashing arbitrary firmware onto this device is
+  // now possible at all, so this absolutely must never be reachable from an unauthenticated
+  // link (see Config::kPrefsKeyBlePasskey's own comment for the full reasoning, which applies
+  // here even more than to reading health data).
+  firmwareChar_ = service->createCharacteristic(
+      Config::kFirmwareCharUuid, NIMBLE_PROPERTY::WRITE |
+                                     NIMBLE_PROPERTY::WRITE_ENC |
+                                     NIMBLE_PROPERTY::WRITE_AUTHEN);
+  firmwareChar_->setCallbacks(&firmwareCallbacks_);
 
   // NimBLE-Arduino 2.x: services are started implicitly when the server
   // starts advertising; NimBLEService::start() is a deprecated no-op kept
@@ -262,6 +303,19 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
   case Config::kOpEnterOtaMode:
     Serial.println("BleGattServer: ENTER_OTA_MODE received.");
     otaManager_.enterOtaMode();
+    break;
+
+  case Config::kOpStartFirmwareUpdate:
+    handleStartFirmwareUpdate(data, length);
+    break;
+
+  case Config::kOpFinishFirmwareUpdate:
+    handleFinishFirmwareUpdate();
+    break;
+
+  case Config::kOpAbortFirmwareUpdate:
+    Serial.println("BleGattServer: ABORT_FIRMWARE_UPDATE received.");
+    firmwareUpdater_.abort();
     break;
 
   default:
@@ -398,6 +452,117 @@ void BleGattServer::requestDataDump() {
     Serial.println(
         "BleGattServer: data dump aborted — phone disconnected mid-dump.");
   }
+}
+
+void BleGattServer::handleStartFirmwareUpdate(const uint8_t *data,
+                                              size_t length) {
+  // [opcode:1][size:4 LE][md5hex:32 ASCII] — see Config::kOpStartFirmwareUpdate's own doc.
+  constexpr size_t kExpectedLength = 1 + 4 + 32;
+  if (length != kExpectedLength) {
+    Serial.printf(
+        "BleGattServer: START_FIRMWARE_UPDATE received with wrong length "
+        "(%u, expected %u) — ignoring.\n",
+        static_cast<unsigned>(length), static_cast<unsigned>(kExpectedLength));
+    notifyFirmwareUpdateResult(false, 0xFF);
+    return;
+  }
+
+  // Refused rather than merely delayed: unlike REQUEST_DATA (which can safely wait for a USB
+  // download already in flight, see requestDataDump()'s own comment), letting a phone queue a
+  // firmware flash to start automatically the instant USB traffic settles is a much bigger
+  // surprise to leave latent — better the phone sees an immediate, explicit failure and retries
+  // once it knows the device is actually free.
+  if (storedRecordDownloader_.downloadInProgress()) {
+    Serial.println(
+        "BleGattServer: START_FIRMWARE_UPDATE refused — a USB stored-record "
+        "download is in progress.");
+    notifyFirmwareUpdateResult(false, 0xFF);
+    return;
+  }
+
+  uint32_t size = 0;
+  for (int i = 0; i < 4; i++) {
+    size |= static_cast<uint32_t>(data[1 + i]) << (8 * i);
+  }
+  char md5Hex[33];
+  std::memcpy(md5Hex, data + 5, 32);
+  md5Hex[32] = '\0';
+
+  BleFirmwareUpdater::BeginResult beginResult;
+  if (!firmwareUpdater_.begin(size, md5Hex, &beginResult)) {
+    Serial.printf(
+        "BleGattServer: START_FIRMWARE_UPDATE failed (BeginResult=%d).\n",
+        static_cast<int>(beginResult));
+    notifyFirmwareUpdateResult(false, 0xFF);
+    return;
+  }
+
+  firmwareExpectedSize_ = size;
+  firmwareBytesReceived_ = 0;
+  Serial.printf(
+      "BleGattServer: START_FIRMWARE_UPDATE accepted, expecting %u bytes.\n",
+      static_cast<unsigned>(size));
+}
+
+void BleGattServer::handleFirmwareChunk(const uint8_t *data, size_t length) {
+  if (length == 0) {
+    return;
+  }
+  if (!firmwareUpdater_.writeChunk(data, length)) {
+    Serial.println(
+        "BleGattServer: firmware chunk write failed — aborting this update.");
+    notifyFirmwareUpdateResult(false, firmwareUpdater_.lastError());
+    firmwareUpdater_.abort();
+    return;
+  }
+  firmwareBytesReceived_ += length;
+}
+
+void BleGattServer::handleFinishFirmwareUpdate() {
+  Serial.println("BleGattServer: FINISH_FIRMWARE_UPDATE received.");
+  if (!firmwareUpdater_.inProgress()) {
+    Serial.println(
+        "BleGattServer: FINISH_FIRMWARE_UPDATE received but no update is in "
+        "progress — ignoring.");
+    notifyFirmwareUpdateResult(false, 0xFF);
+    return;
+  }
+  // Checked here too, not just left to Update::end()'s own size check, so a short transfer is
+  // never even attempted to finalize — belt-and-suspenders around the exact same "only a fully-
+  // received image ever flips the boot partition" guarantee (see BleFirmwareUpdater's header).
+  if (firmwareBytesReceived_ != firmwareExpectedSize_) {
+    Serial.printf(
+        "BleGattServer: FINISH_FIRMWARE_UPDATE received after only %u/%u "
+        "bytes — aborting instead of finalizing.\n",
+        static_cast<unsigned>(firmwareBytesReceived_),
+        static_cast<unsigned>(firmwareExpectedSize_));
+    firmwareUpdater_.abort();
+    notifyFirmwareUpdateResult(false, 0xFF);
+    return;
+  }
+
+  const bool success = firmwareUpdater_.finish();
+  notifyFirmwareUpdateResult(success, success ? 0 : firmwareUpdater_.lastError());
+  if (!success) {
+    return;
+  }
+
+  // Give the notification above (and the phone's GATT stack) a moment to actually go out over
+  // the air before the link drops out from under it — ESP.restart() tears down BLE immediately.
+  Serial.println("BleGattServer: restarting to boot the new firmware...");
+  delay(500);
+  ESP.restart();
+}
+
+void BleGattServer::notifyFirmwareUpdateResult(bool success, uint8_t errorCode) {
+  if (!statusChar_ || !connected_) {
+    return;
+  }
+  uint8_t payload[3] = {Config::kStatusFirmwareUpdateResult,
+                        success ? uint8_t{0x01} : uint8_t{0x00}, errorCode};
+  const size_t payloadLen = success ? 2 : 3;
+  statusChar_->setValue(payload, payloadLen);
+  statusChar_->notify(connHandle_);
 }
 
 void BleGattServer::regeneratePairingPasskey() {

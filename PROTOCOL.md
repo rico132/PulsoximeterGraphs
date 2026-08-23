@@ -36,11 +36,12 @@ ESP32 = peripheral/server. Phone = central/client. Advertised device name: `Puls
 | `6f2a1000-2f5b-4a9c-91c4-0d8f6b1c9a01` | Service | — | scan filter target |
 | `6f2a1001-2f5b-4a9c-91c4-0d8f6b1c9a01` | Control | write-with-response, encrypted+authenticated | opcodes below |
 | `6f2a1002-2f5b-4a9c-91c4-0d8f6b1c9a01` | Data | notify, encrypted+authenticated | chunked CSV bytes |
-| `6f2a1003-2f5b-4a9c-91c4-0d8f6b1c9a01` | Status (stretch, not MVP) | read/notify, encrypted+authenticated | buffered-row count |
+| `6f2a1003-2f5b-4a9c-91c4-0d8f6b1c9a01` | Status | read/notify, encrypted+authenticated | firmware version (read), firmware-update result (notify) |
+| `6f2a1004-2f5b-4a9c-91c4-0d8f6b1c9a01` | Firmware | write-with-response, encrypted+authenticated | chunked firmware-image bytes, phone → ESP32 |
 
 ### BLE pairing
 
-All three characteristics require a bonded, encrypted, MITM-protected (authenticated) link —
+All characteristics require a bonded, encrypted, MITM-protected (authenticated) link —
 without this, anyone within BLE range could connect to a "PulsoxRelay" and read someone's
 SpO2/pulse history with zero access control. The ESP32 requires LE Secure Connections pairing
 (`NimBLEDevice::setSecurityAuth(bonding=true, mitm=true, sc=true)`) with passkey entry
@@ -73,6 +74,66 @@ cached by both sides) — the PIN only needs to be entered once per phone.
 | `0x04` | `SET_TEST_MODE` | 1 byte, `0x00` or `0x01` | When `0x01` (on), the ESP32 never deletes downloaded stored records from the PO-400. Persisted in NVS. **Defaults to `0x01` (on/non-destructive)** until explicitly turned off. |
 | `0x05` | `SET_WIFI_CREDENTIALS` | `[ssidLen:u8][ssid bytes][passLen:u8][pass bytes]` | Configure WiFi STA credentials for OTA, stored via WiFiManager's NVS storage. |
 | `0x06` | `ENTER_OTA_MODE` | none | Ask the ESP32 to bring up WiFi (using stored credentials, or a captive portal if none stored) and start `ArduinoOTA`, so a `pio run -t upload --upload-port <ip>` can flash new firmware. WiFi auto-tears-down after an idle timeout. |
+| `0x07` | `START_FIRMWARE_UPDATE` | `[size:u32 LE][expectedMd5Hex:32 ASCII bytes]` | Begin receiving a new firmware image into the ESP32's *inactive* OTA partition — see "BLE firmware update" below. Refused (result reported immediately, see the Status characteristic below) if a USB stored-record download is in progress, or an update is already under way. |
+| `0x08` | `FINISH_FIRMWARE_UPDATE` | none | Sent once exactly `size` bytes have been written to the Firmware characteristic. Verifies size + MD5 and, **only on success**, switches the boot partition to the new image and reboots. |
+| `0x09` | `ABORT_FIRMWARE_UPDATE` | none | Discards an in-progress firmware update without touching the boot partition. |
+
+### BLE firmware update (OTA over BLE)
+
+An alternative to `ENTER_OTA_MODE`'s WiFi/`ArduinoOTA` path above, requiring no WiFi credentials
+at all: the phone downloads a firmware image (see "Firmware release asset" below) and pushes it
+directly over the same BLE link already used for CSV syncs. Uses the exact same dual-partition
+OTA mechanism `ArduinoOTA` already relies on (`app0`/`app1` in `esp32/partitions_8MB.csv`, via
+Arduino-ESP32's `Update` library/`esp_ota_*`): the image is written entirely into the *inactive*
+partition while the current firmware keeps running from the active one, and the boot partition is
+flipped to the new image **only if `Update::end()` considers the write completely valid** (right
+size, matching MD5) — a failed or abandoned update leaves the currently-running, already-proven-
+bootable firmware completely untouched.
+
+Sequence (phone side):
+
+1. Compute the image's MD5 (32-char lowercase hex) locally, from the exact bytes about to be
+   sent — this is what the ESP32 verifies against, so it catches download corruption too, not
+   just whatever might go wrong over BLE itself.
+2. Write `START_FIRMWARE_UPDATE` with the image's total size and that MD5.
+3. Write the image to the Firmware characteristic in `negotiatedMtu - 3`-byte chunks, **one at a
+   time, waiting for each write's ATT response before sending the next** — this is what paces
+   the phone to the ESP32's actual flash-write speed rather than flooding the link with no
+   backpressure (unlike the Data characteristic's ESP32→phone notify stream, which has no such
+   per-chunk ack).
+4. Once every chunk has been acknowledged, write `FINISH_FIRMWARE_UPDATE`.
+5. Wait for a Status notification (see below) carrying the result. On success, the ESP32 has
+   already switched its boot partition and reboots on its own — the phone does not, and cannot,
+   do anything further to make that happen. On failure, the ESP32 keeps running its current
+   firmware unchanged and does not reboot.
+
+A disconnect at any point during an update (phone crash, out of range, ...) is handled the same
+as an explicit `ABORT_FIRMWARE_UPDATE`: the ESP32 discards the partial write and frees the
+in-progress `Update` handle so a future update attempt isn't refused as "already in progress" —
+see `BleGattServer::ServerCallbacks::onDisconnect`.
+
+### Status characteristic
+
+- **Read**: always returns `[0x01][versionBytes...]` — the firmware's own compiled-in version
+  string (`Config::kFirmwareVersion`, ASCII, not null-terminated), tag `0x01`
+  (`STATUS_TAG_FIRMWARE_VERSION`). Set at build time (see "Firmware release asset" below); a
+  locally-flashed dev build reports `"dev"`.
+- **Notify**: `[0x08][success:u8][errorCode:u8 if success==0x00]` — sent exactly once per firmware
+  update attempt, tag `0x08` (`STATUS_TAG_FIRMWARE_UPDATE_RESULT`, deliberately the same numeric
+  value as the `FINISH_FIRMWARE_UPDATE` opcode — the two are never ambiguous, since one only ever
+  flows phone→ESP32 and the other only ESP32→phone). `errorCode` is either one of Arduino-ESP32's
+  `Update.h` `UPDATE_ERROR_*` codes, or the sentinel `0xFF` for a failure the ESP32 rejected
+  before ever touching flash (busy with a USB download, or an update already in progress).
+
+### Firmware release asset
+
+`.github/workflows/android-release.yml` builds the ESP32 firmware (env `esp32-s3-usb-otg`) with
+`-D FIRMWARE_VERSION="<release tag>"` and attaches the resulting `firmware-esp32-s3-usb-otg.bin`
+to the same GitHub release it already publishes the signed APK to on every push to `main` — one
+release, two assets. The Android app's "Check for update" (Settings → Device) reads the latest
+release's tag and firmware asset via GitHub's REST API, compares the tag against the connected
+ESP32's own reported version (Status characteristic read), and offers to download + push the
+asset over BLE if they differ.
 
 ### Data characteristic (notify)
 

@@ -15,8 +15,15 @@ object BleConstants {
     val CONTROL_CHARACTERISTIC_UUID: UUID = UUID.fromString("6f2a1001-2f5b-4a9c-91c4-0d8f6b1c9a01")
     val DATA_CHARACTERISTIC_UUID: UUID = UUID.fromString("6f2a1002-2f5b-4a9c-91c4-0d8f6b1c9a01")
 
-    /** Stretch, not MVP per PROTOCOL.md — declared for completeness, not currently read/used. */
+    /** Firmware version (read) + firmware-update result (notify) — see the opcodes below. */
     val STATUS_CHARACTERISTIC_UUID: UUID = UUID.fromString("6f2a1003-2f5b-4a9c-91c4-0d8f6b1c9a01")
+
+    /**
+     * Raw firmware-image bytes, phone -> ESP32, chunked the same way the Data characteristic
+     * chunks CSV bytes ESP32 -> phone (each write <= negotiatedMtu - 3). See
+     * [BleFirmwareUpdater] and PROTOCOL.md §"BLE firmware update (OTA over BLE)".
+     */
+    val FIRMWARE_CHARACTERISTIC_UUID: UUID = UUID.fromString("6f2a1004-2f5b-4a9c-91c4-0d8f6b1c9a01")
 
     /** Standard BLE Client Characteristic Configuration Descriptor, used to enable notifications. */
     val CLIENT_CHARACTERISTIC_CONFIG_UUID: UUID =
@@ -42,8 +49,37 @@ object BleConstants {
     /** No payload — ESP32 brings up WiFi and starts ArduinoOTA. */
     const val OPCODE_ENTER_OTA_MODE: Byte = 0x06
 
+    /**
+     * Payload: `[size:u32 LE][expectedMd5Hex:32 ASCII bytes]`. Begins receiving a new firmware
+     * image into the ESP32's inactive OTA partition — see [BleFirmwareUpdater].
+     */
+    const val OPCODE_START_FIRMWARE_UPDATE: Byte = 0x07
+
+    /**
+     * No payload — sent once exactly `size` bytes (from [OPCODE_START_FIRMWARE_UPDATE]) have
+     * been written to [FIRMWARE_CHARACTERISTIC_UUID]. The ESP32 verifies size + MD5 and, only on
+     * success, switches its boot partition to the new image and reboots — see
+     * [STATUS_TAG_FIRMWARE_UPDATE_RESULT].
+     */
+    const val OPCODE_FINISH_FIRMWARE_UPDATE: Byte = 0x08
+
+    /** No payload — discards an in-progress firmware update without touching the boot partition. */
+    const val OPCODE_ABORT_FIRMWARE_UPDATE: Byte = 0x09
+
     /** End-of-transfer marker on the Data characteristic: exactly one 0x00 byte. */
     val DATA_TERMINATOR: ByteArray = byteArrayOf(0x00)
+
+    // --- Status characteristic notification/read tags (first byte of its value) ---
+
+    /** Payload: the running firmware's version string, ASCII, not null-terminated. */
+    const val STATUS_TAG_FIRMWARE_VERSION: Byte = 0x01
+
+    /**
+     * Payload: 1 byte, 0x01 success / 0x00 failure, then (failure only) 1 more byte: an
+     * ESP32 Update.h `UPDATE_ERROR_*` code, or the sentinel 0xFF for a failure the ESP32 rejected
+     * before ever touching flash (e.g. busy with a USB download, or one update already running).
+     */
+    const val STATUS_TAG_FIRMWARE_UPDATE_RESULT: Byte = 0x08
 
     /**
      * Multi-file transfer extension — app + `tools/ble_csv_sender.py` only, NOT part of the

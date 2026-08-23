@@ -1,10 +1,14 @@
-name: Build and release APK
+name: Build and release APK + firmware
 
-# Builds the Android release APK, signed with the fixed keystore in the RELEASE_KEYSTORE_*
-# secrets (see build.gradle.kts), and publishes it as a GitHub release on every push to main
-# (or on manual trigger). The version tag is computed automatically and is always a 0.x.y
-# tag — this workflow will never create or touch a 1.0.0+ tag. Once the app is ready for a
-# real 1.0.0, that release should be tagged/published by hand.
+# Builds the signed Android release APK and the ESP32 firmware, and publishes both as one
+# GitHub release on every push to main (or on manual trigger). The version tag is computed
+# automatically and is always a 0.x.y tag — this workflow will never create or touch a 1.0.0+
+# tag. Once the app is ready for a real 1.0.0, that release should be tagged/published by hand.
+#
+# Split into separate compute-version / build-android / build-firmware / release jobs (rather
+# than one linear job, as this used to be) so the two builds — a Gradle/JDK toolchain and a
+# PlatformIO/Python one, sharing nothing — run in parallel instead of back-to-back, and so a
+# failure in one doesn't need to be disentangled from the other's log output.
 
 on:
   push:
@@ -20,27 +24,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-release:
+  compute-version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version_name: ${{ steps.version.outputs.version_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # need full tag history to compute the next version
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          build-root-directory: android
 
       # Only ever considers existing v0.x.y tags, so a manually created v1.0.0 (or higher)
       # tag is invisible to this bump — the automated series stays on 0.x.y forever.
@@ -58,6 +51,29 @@ jobs:
           echo "Previous tag: ${latest:-<none>}; next: $next"
           echo "version=$next" >> "$GITHUB_OUTPUT"
           echo "version_name=${next#v}" >> "$GITHUB_OUTPUT"
+
+  build-android:
+    needs: compute-version
+    runs-on: ubuntu-latest
+    outputs:
+      apk-name: ${{ steps.apk.outputs.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: android
 
       # Decode the release keystore from its base64 secret into a file outside the repo/workspace
       # tree, so every release is signed with the same certificate — required for Android to
@@ -80,22 +96,93 @@ jobs:
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: >
           ./android/build.sh assembleRelease --no-daemon
-          -PappVersionName=${{ steps.version.outputs.version_name }}
+          -PappVersionName=${{ needs.compute-version.outputs.version_name }}
           -PappVersionCode=${{ github.run_number }}
 
       - name: Rename APK for release
         id: apk
         run: |
-          version="${{ steps.version.outputs.version }}"
-          src="android/app/build/outputs/apk/release/app-release.apk"
-          dest="android/app/build/outputs/apk/release/PulsoximeterGraphs-${version}.apk"
-          mv "$src" "$dest"
-          echo "path=$dest" >> "$GITHUB_OUTPUT"
+          version="${{ needs.compute-version.outputs.version }}"
+          name="PulsoximeterGraphs-${version}.apk"
+          mv android/app/build/outputs/apk/release/app-release.apk "android/app/build/outputs/apk/release/${name}"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: android/app/build/outputs/apk/release/${{ steps.apk.outputs.name }}
+          retention-days: 1
+
+  build-firmware:
+    needs: compute-version
+    runs-on: ubuntu-latest
+    outputs:
+      firmware-name: ${{ steps.firmware.outputs.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      # esp32-s3-usb-otg is the primary/documented hardware target (see esp32/platformio.ini) —
+      # the one the Android app's "Check for update" flow looks for (see PROTOCOL.md's "Firmware
+      # release asset" section). esp32-s3-devkitc-1 is a valid alternate build target for anyone
+      # building from source, but isn't published here to keep exactly one unambiguous asset for
+      # the app to pick up automatically.
+      #
+      # FIRMWARE_VERSION is what Config::kFirmwareVersion compiles in and the Status
+      # characteristic reports back to the app — passing the release tag here is what makes that
+      # on-device version string always match the tag this exact binary is published under,
+      # rather than needing a manual bump kept in sync by hand.
+      - name: Build firmware
+        # PLATFORMIO_BUILD_FLAGS is appended to (not a replacement of) esp32/platformio.ini's own
+        # build_flags for every environment — there's no `pio run` CLI flag for this, so an env
+        # var is the actual supported override mechanism.
+        env:
+          PLATFORMIO_BUILD_FLAGS: -D FIRMWARE_VERSION=\"${{ needs.compute-version.outputs.version }}\"
+        run: pio run -e esp32-s3-usb-otg -d esp32
+
+      - name: Rename firmware for release
+        id: firmware
+        run: |
+          name="firmware-esp32-s3-usb-otg-${{ needs.compute-version.outputs.version }}.bin"
+          mv esp32/.pio/build/esp32-s3-usb-otg/firmware.bin "esp32/.pio/build/esp32-s3-usb-otg/${name}"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: esp32/.pio/build/esp32-s3-usb-otg/${{ steps.firmware.outputs.name }}
+          retention-days: 1
+
+  release:
+    needs: [compute-version, build-android, build-firmware]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: release-assets
+
+      - name: Download firmware artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: release-assets
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: ${{ steps.version.outputs.version }}
+          tag_name: ${{ needs.compute-version.outputs.version }}
+          name: ${{ needs.compute-version.outputs.version }}
           generate_release_notes: true
-          files: ${{ steps.apk.outputs.path }}
+          files: release-assets/*
