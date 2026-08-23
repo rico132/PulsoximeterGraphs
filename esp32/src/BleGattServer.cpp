@@ -9,10 +9,12 @@
 
 namespace {
 // Generates a fresh random passkey and persists it — shared by first-ever-boot provisioning
-// (loadOrGenerateBlePasskey() below) and the explicit `blepin` serial "regenerate" signal (see
-// BleGattServer::regeneratePairingPasskey()). Never a fixed literal baked into source: see
-// Config::kPrefsKeyBlePasskey's own comment for why a hardcoded PIN wouldn't actually be a
-// secret. esp_random() is a real HWRNG on the ESP32, safe to use directly with no seeding needed.
+// (loadOrGenerateBlePasskey() below), the explicit `blepin` serial "regenerate" signal (see
+// BleGattServer::regeneratePairingPasskey()), and UNPAIR_ALL_DEVICES (see handleControlWrite's
+// own case for why that one also rotates the PIN, not just the bond list). Never a fixed literal
+// baked into source: see Config::kPrefsKeyBlePasskey's own comment for why a hardcoded PIN
+// wouldn't actually be a secret. esp_random() is a real HWRNG on the ESP32, safe to use directly
+// with no seeding needed.
 uint32_t generateAndStoreNewPasskey(Preferences &preferences) {
   const uint32_t passkey = esp_random() % 1000000UL; // 000000-999999
   preferences.putULong(Config::kPrefsKeyBlePasskey, passkey);
@@ -305,14 +307,22 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
   case Config::kOpUnpairAllDevices: {
     const int bondCount = NimBLEDevice::getNumBonds();
     NimBLEDevice::deleteAllBonds();
+    // Also rotate the pairing PIN, not just the bond list: clearing bonds alone only forces a
+    // *re-pair*, not a lockout — anyone who already knows the current PIN (or a phone that was
+    // just unpaired) could simply pair right back with it. A fresh PIN means re-pairing actually
+    // requires reading the new one off the serial log, i.e. physical access, matching what
+    // "unpair everyone" is presumably meant to achieve.
+    const uint32_t newPasskey = generateAndStoreNewPasskey(preferences_);
+    NimBLEDevice::setSecurityPasskey(newPasskey);
     Serial.printf(
         "BleGattServer: UNPAIR_ALL_DEVICES received — cleared %d bonded "
-        "device(s).\n",
+        "device(s) and generated a new pairing PIN.\n",
         bondCount);
+    printPasskey(newPasskey);
     // This phone's own bond was just deleted along with everyone else's — the link is still
     // nominally connected but no longer backed by any bond, so disconnect it now rather than
     // leave it in that inconsistent state. onDisconnect() already re-starts advertising, so
-    // this phone (or any other) can immediately pair fresh with the PIN still on the serial log.
+    // this phone (or any other) can pair fresh once they read the new PIN above.
     if (connected_ && server_) {
       server_->disconnect(connHandle_);
     }

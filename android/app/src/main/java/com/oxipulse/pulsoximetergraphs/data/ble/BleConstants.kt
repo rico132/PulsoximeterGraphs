@@ -66,8 +66,9 @@ object BleConstants {
 
     /**
      * No payload — deletes every BLE bond the ESP32 currently holds, including this phone's own,
-     * then disconnects. Any phone must re-pair from scratch afterward, using the PIN still shown
-     * on the ESP32's serial log.
+     * and regenerates its pairing PIN, then disconnects. Any phone must re-pair from scratch
+     * afterward using the new PIN shown on the ESP32's serial log — the old PIN no longer works,
+     * even for a phone that was already paired.
      */
     const val OPCODE_UNPAIR_ALL_DEVICES: Byte = 0x0A
 

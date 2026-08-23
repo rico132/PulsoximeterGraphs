@@ -296,11 +296,12 @@ private fun FirmwareUpdateCard(viewModel: SettingsViewModel) {
 }
 
 /**
- * Deletes every BLE bond the ESP32 holds — including this phone's own — over the same
- * independent BLE client [FirmwareUpdateCard] uses (see [BleFirmwareUpdateClient.unpairAllDevices]):
- * scans for and connects to the device itself, writes UNPAIR_ALL_DEVICES, then the ESP32
- * disconnects everyone, requiring a fresh re-pair (with the PIN still on its serial log) for any
- * phone including this one. Gated behind a confirmation dialog since it affects every currently-
+ * Deletes every BLE bond the ESP32 holds — including this phone's own — and regenerates its
+ * pairing PIN, over the same independent BLE client [FirmwareUpdateCard] uses (see
+ * [BleFirmwareUpdateClient.unpairAllDevices]): scans for and connects to the device itself,
+ * writes UNPAIR_ALL_DEVICES, then the ESP32 disconnects everyone, requiring a fresh re-pair
+ * with the *new* PIN (shown on its serial log) for any phone including this one — the old PIN no
+ * longer works for anyone. Gated behind a confirmation dialog since it affects every currently-
  * paired device, not just whichever one triggers it — unlike the rest of this screen's controls,
  * this one can't be undone by just tapping it again.
  */
@@ -314,9 +315,10 @@ private fun UnpairAllDevicesCard(viewModel: SettingsViewModel) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Unpair all devices", style = MaterialTheme.typography.titleMedium)
             Text(
-                "Forgets every phone currently paired with the ESP32, including this one. Each " +
-                    "one will need to pair again afterward, using the PIN shown on the device's " +
-                    "serial log.",
+                "Forgets every phone currently paired with the ESP32, including this one, and " +
+                    "generates a new pairing PIN — the old PIN stops working for everyone. Each " +
+                    "phone will need to pair again afterward, using the new PIN shown on the " +
+                    "device's serial log.",
                 style = MaterialTheme.typography.bodySmall,
             )
             Button(onClick = { showConfirmDialog = true }, enabled = !inProgress) {
@@ -325,7 +327,7 @@ private fun UnpairAllDevicesCard(viewModel: SettingsViewModel) {
             when (val state = unpairState) {
                 BleFirmwareUpdateClient.UnpairState.Success ->
                     Text(
-                        "Done — every device (including this phone) must pair again now.",
+                        "Done — every device (including this phone) needs the new PIN to pair again.",
                         color = MaterialTheme.colorScheme.primary,
                     )
                 is BleFirmwareUpdateClient.UnpairState.Failed ->
@@ -343,8 +345,10 @@ private fun UnpairAllDevicesCard(viewModel: SettingsViewModel) {
             title = { Text("Unpair all devices?") },
             text = {
                 Text(
-                    "This forgets every phone paired with the ESP32, including this one. " +
-                        "You'll need to pair again afterward to use it.",
+                    "This forgets every phone paired with the ESP32, including this one, and " +
+                        "generates a new pairing PIN. The old PIN stops working — you'll need to " +
+                        "read the new one off the device's serial log to pair again, even on " +
+                        "this phone.",
                 )
             },
             confirmButton = {

@@ -82,10 +82,12 @@ class BleFirmwareUpdateClient(private val context: Context) {
 
     /**
      * PROTOCOL.md's UNPAIR_ALL_DEVICES: deletes every BLE bond the ESP32 holds, including this
-     * phone's own, then disconnects. [InProgress] covers the whole scan-through-write span (no
-     * finer-grained steps, same granularity as [VersionCheckState.Checking]) — success is simply
-     * the ESP32 acking the write, since the disconnect that follows is expected, not something to
-     * wait on (see [onCharacteristicWrite]'s handling of it).
+     * phone's own, and regenerates its pairing PIN, then disconnects — the old PIN stops working
+     * even for a phone that was already paired, so this is a real lockout, not just a forced
+     * re-pair. [InProgress] covers the whole scan-through-write span (no finer-grained steps,
+     * same granularity as [VersionCheckState.Checking]) — success is simply the ESP32 acking the
+     * write, since the disconnect that follows is expected, not something to wait on (see
+     * [onCharacteristicWrite]'s handling of it).
      */
     sealed interface UnpairState {
         data object Idle : UnpairState

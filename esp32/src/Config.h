@@ -103,13 +103,17 @@ enum ControlOpcode : uint8_t {
   // handle, without touching the boot partition — e.g. the phone gave up mid-transfer.
   kOpAbortFirmwareUpdate = 0x09,
   // No payload. Deletes every BLE bond this ESP32 currently holds (NimBLEDevice::
-  // deleteAllBonds()) — including the one for the very phone sending this opcode — then
-  // disconnects, so any phone (this one or another) must re-pair from scratch with the PIN
-  // still printed to the serial log. Reachable over BLE (unlike the pairing PIN itself, which
-  // only ever changes via the serial-only `blepin` command) since this can only ever *reduce*
-  // what a connection is trusted to do, never grant new trust — the write to get here already
-  // required passing the exact same encrypted+authenticated gate every other Control opcode
-  // does, and clearing all bonds can't be used to bypass or escalate anything.
+  // deleteAllBonds()) — including the one for the very phone sending this opcode — and also
+  // regenerates the pairing PIN (same generation path as the serial-only `blepin` command),
+  // then disconnects. Any phone, this one included, must re-pair from scratch afterward using
+  // whichever new PIN this printed to the serial log. The PIN rotation is what makes this an
+  // actual lockout rather than just a forced re-pair — clearing bonds alone would leave anyone
+  // who already knows the (unchanged) PIN able to just pair straight back. Reachable over BLE
+  // (unlike a bare PIN regeneration on its own, which stays serial-only via `blepin`) since this
+  // can only ever *reduce* what a connection is trusted to do, never grant new trust — the write
+  // to get here already required passing the exact same encrypted+authenticated gate every
+  // other Control opcode does, and neither clearing bonds nor rotating the PIN can be used to
+  // bypass or escalate anything.
   kOpUnpairAllDevices = 0x0A,
 };
 

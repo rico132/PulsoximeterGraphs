@@ -56,9 +56,14 @@ committed to a shared repo would stop being a secret at all. Instead the ESP32 g
 subsequent reboot/power cycle unchanged), and prints it to its serial log on every boot. It can be
 regenerated at any time by sending a bare `blepin` (no argument — a replacement PIN is always
 randomly generated, never operator-chosen, exactly like first-boot provisioning) over the serial
-debug console — deliberately never reachable via any BLE opcode, so a not-yet-paired attacker can
-never set their own known PIN. Regenerating the PIN only affects *future* pairings; phones
-already bonded are unaffected, since the PIN is only used during the initial pairing handshake.
+debug console, or by sending `UNPAIR_ALL_DEVICES` over BLE (which regenerates it as a side effect
+of unpairing everyone — see that opcode's own row above). Neither path ever lets a caller choose
+the resulting value, and `UNPAIR_ALL_DEVICES` also unpairs the very connection that sent it, so
+there's no way to use it to quietly plant a known PIN while staying paired — a not-yet-paired
+attacker still can never set their own known PIN. Regenerating the PIN only affects *future*
+pairings; phones already bonded are unaffected (unless the regeneration came from
+`UNPAIR_ALL_DEVICES`, which also just deleted every bond), since the PIN is only used during the
+initial pairing handshake.
 
 Once bonded, a phone reconnects automatically without re-pairing (the link's encryption keys are
 cached by both sides) — the PIN only needs to be entered once per phone.
@@ -74,7 +79,7 @@ cached by both sides) — the PIN only needs to be entered once per phone.
 | `0x07` | `START_FIRMWARE_UPDATE` | `[size:u32 LE][expectedMd5Hex:32 ASCII bytes]` | Begin receiving a new firmware image into the ESP32's *inactive* OTA partition — see "BLE firmware update" below. Refused (result reported immediately, see the Status characteristic below) if a USB stored-record download is in progress, or an update is already under way. |
 | `0x08` | `FINISH_FIRMWARE_UPDATE` | none | Sent once exactly `size` bytes have been written to the Firmware characteristic. Verifies size + MD5 and, **only on success**, switches the boot partition to the new image and reboots. |
 | `0x09` | `ABORT_FIRMWARE_UPDATE` | none | Discards an in-progress firmware update without touching the boot partition. |
-| `0x0A` | `UNPAIR_ALL_DEVICES` | none | Deletes every BLE bond the ESP32 currently holds (`NimBLEDevice::deleteAllBonds()`) — including the one for the phone sending this opcode — then disconnects. Any phone, this one included, must re-pair from scratch afterward using the PIN still shown on the serial log. Reachable over BLE (unlike the pairing PIN itself) since it can only ever *reduce* trust, never grant or escalate it — sending it already required passing the same encrypted+authenticated gate as every other Control opcode. |
+| `0x0A` | `UNPAIR_ALL_DEVICES` | none | Deletes every BLE bond the ESP32 currently holds (`NimBLEDevice::deleteAllBonds()`) — including the one for the phone sending this opcode — **and regenerates the pairing PIN** (same generation path as the serial-only `blepin` command), then disconnects. Any phone, this one included, must re-pair from scratch afterward using whichever new PIN gets printed to the serial log. The PIN rotation is what makes this a real lockout rather than just a forced re-pair — without it, anyone who already knows the old PIN could simply pair right back. Reachable over BLE (unlike a bare PIN regeneration on its own) since it can only ever *reduce* trust, never grant or escalate it — sending it already required passing the same encrypted+authenticated gate as every other Control opcode. |
 
 `0x05` and `0x06` used to be `SET_WIFI_CREDENTIALS`/`ENTER_OTA_MODE`, driving a WiFiManager +
 `ArduinoOTA` WiFi update path — removed now that BLE firmware update below is the only
