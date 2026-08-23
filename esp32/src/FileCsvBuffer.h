@@ -32,16 +32,16 @@ public:
 private:
   static constexpr const char *kBufferPath = "/csvbuf.dat";
   uint32_t rowCount_ = 0;
-  // Opened lazily on the first appendRow() call and kept open across every
-  // subsequent one, rather than reopened per row: LittleFS's open() has to
-  // re-traverse the file's whole block list to find the append position
-  // (cost grows with file size), and close() commits a directory metadata
-  // update that can trigger metadata-block compaction — both easily
-  // O(log file size) or worse. Paying that on every single datum of every
-  // record was, on real hardware, enough to blow past the 30s task
-  // watchdog partway through appending one record's ~9800 rows (see
-  // appendRow()'s own comment). mutable so the read-only accessors
-  // (sizeBytes(), forEachChunk()) can flush it first — defense in depth
+  // Opened lazily on the first flushWriteBatchToFile() call and kept open
+  // across every subsequent one, rather than reopened per batch: LittleFS's
+  // open() has to re-traverse the file's whole block list to find the
+  // append position (cost grows with file size), and close() commits a
+  // directory metadata update that can trigger metadata-block compaction —
+  // both easily O(log file size) or worse. Paying that on every single
+  // datum of every record was, on real hardware, enough to blow past the
+  // 30s task watchdog partway through appending one record's ~9800 rows
+  // (see flushWriteBatchToFile()'s own comment). mutable so the read-only
+  // accessors (sizeBytes(), forEachChunk()) can flush it first — defense in depth
   // against being called before flush() explicitly is, since only
   // flush()/close() actually make its buffered writes visible to a
   // separately-opened read handle on the same path.
@@ -62,4 +62,22 @@ private:
   // what lets consecutive rows within one record skip re-deriving the
   // whole calendar breakdown from scratch).
   CsvRowFormatter csvRowFormatter_;
+  // Batches many rows' worth of formatted CSV text before ever calling
+  // appendFile_.write() — see appendRow()'s own comment for why: each
+  // separate .write() call carries real per-call overhead (the Arduino
+  // Stream/File dispatch chain, LittleFS's own per-call bookkeeping)
+  // independent of the actual flash program time, and that overhead is
+  // paid once per *call*, not once per byte — so coalescing a few dozen
+  // small (~30 byte) row writes into one much larger write cuts it down
+  // proportionally. mutable for the same reason appendFile_ is (see its
+  // own comment): sizeBytes()/forEachChunk() must flush this batch to
+  // appendFile_ before reading, even though they're logically read-only.
+  mutable uint8_t writeBatch_[512];
+  mutable size_t writeBatchLen_ = 0;
+  // Pushes whatever's currently staged in writeBatch_ into appendFile_ (a
+  // single File::write() call) and resets writeBatchLen_ to 0 — NOT an
+  // OS-level flush()/sync(); see flush()'s own doc for that. A no-op if
+  // nothing is staged. Opens appendFile_ lazily on first use, same as
+  // appendRow() always did. Returns false only on a real write failure.
+  bool flushWriteBatchToFile() const;
 };

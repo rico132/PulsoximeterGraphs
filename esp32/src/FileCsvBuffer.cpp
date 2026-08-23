@@ -47,51 +47,75 @@ bool FileCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
   if (isFull()) {
     return false;
   }
-  char row[Config::kMaxCsvRowLength];
-  const size_t len = csvRowFormatter_.format(epochSeconds, spo2, pulseRate,
-                                             row, sizeof(row));
-  // Kept open across calls rather than reopened every row — see
+  // Make room in the batch first if this row wouldn't fit — see
+  // writeBatch_'s own comment for why batching several dozen rows into one
+  // File::write() call is worth doing at all.
+  if (writeBatchLen_ + Config::kMaxCsvRowLength > sizeof(writeBatch_)) {
+    if (!flushWriteBatchToFile()) {
+      return false;
+    }
+  }
+  // Formatted directly into its place in the batch rather than into a
+  // separate stack buffer first — same reasoning as RamCsvBuffer::
+  // appendRow()'s identical change: the space is already guaranteed
+  // available by the check above, so there's nothing left for a copy to
+  // protect against.
+  const size_t len = csvRowFormatter_.format(
+      epochSeconds, spo2, pulseRate,
+      reinterpret_cast<char *>(writeBatch_ + writeBatchLen_),
+      sizeof(writeBatch_) - writeBatchLen_);
+  writeBatchLen_ += len;
+  rowCount_++;
+  remainingCapacityBytes_ -= len; // safe: isFull() above already ensured
+                                  // remainingCapacityBytes_ >= kMaxCsvRowLength >= len
+  return true;
+}
+
+bool FileCsvBuffer::flushWriteBatchToFile() const {
+  if (writeBatchLen_ == 0) {
+    return true;
+  }
+  // Kept open across calls rather than reopened every batch — see
   // appendFile_'s own comment in the header for the full reasoning. Real
   // hardware confirmed the open+write+close-per-row version could not get
   // through appending even half of one record's ~9800 rows before a task
-  // watchdog abort: this loop (StoredRecordDownloader::appendDecodedRecord())
-  // never feeds the watchdog itself, only UsbHidOxHost::readReport() does,
-  // so there was nothing bounding how long LittleFS's per-open/close cost
-  // (which grows with the file's own size) was allowed to run.
+  // watchdog abort: appendRow()'s loop (StoredRecordDownloader::
+  // appendDecodedRecord()) never feeds the watchdog itself, only
+  // UsbHidOxHost::readReport() does, so there was nothing bounding how long
+  // LittleFS's per-open/close cost (which grows with the file's own size)
+  // was allowed to run.
   if (!appendFile_) {
     appendFile_ = LittleFS.open(kBufferPath, "a");
     if (!appendFile_) {
       return false;
     }
   }
-  const size_t written =
-      appendFile_.write(reinterpret_cast<const uint8_t *>(row), len);
-  if (written != len) {
+  const size_t written = appendFile_.write(writeBatch_, writeBatchLen_);
+  if (written != writeBatchLen_) {
     return false;
   }
-  rowCount_++;
-  remainingCapacityBytes_ -= len; // safe: isFull() above already ensured
-                                  // remainingCapacityBytes_ >= kMaxCsvRowLength >= len
-  // No periodic flush()/sync() here anymore — see StoredRecordDownloader.cpp's
+  writeBatchLen_ = 0;
+  // No periodic flush()/sync() here — see StoredRecordDownloader.cpp's
   // ScopedCsvFlush, which unconditionally flushes once the whole download
   // session ends (success or failure), for what actually guarantees every
   // appended row is durable/visible. A periodic mid-download flush used to
   // exist to bound how much an ESP32 crash mid-download could cost — flush()
   // (like close(), see appendFile_'s own comment) commits a directory
   // metadata update that can trigger metadata-block compaction, easily
-  // O(log file size) or worse, so paying it every couple hundred rows across
-  // tens of thousands of datums added up to real, measurable time on boards
-  // without PSRAM (FileCsvBuffer, not RamCsvBuffer, is what's actually in
-  // use there). That crash-safety trade-off isn't worth as much as it used
-  // to be now that a crash/reboot mid-download is already an accepted,
-  // ordinary case (see FileCsvBuffer::begin()'s own comment): the next
-  // attach just re-downloads everything fresh from the still-attached
-  // PO-400 either way, whether zero rows or most of them made it into this
-  // buffer beforehand.
+  // O(log file size) or worse, so paying it periodically across tens of
+  // thousands of datums added up to real, measurable time on boards without
+  // PSRAM (FileCsvBuffer, not RamCsvBuffer, is what's actually in use
+  // there). That crash-safety trade-off isn't worth as much as it used to
+  // be now that a crash/reboot mid-download is already an accepted,
+  // ordinary case (see begin()'s own comment): the next attach just
+  // re-downloads everything fresh from the still-attached PO-400 either
+  // way, whether zero rows or most of them made it into this buffer
+  // beforehand.
   return true;
 }
 
 void FileCsvBuffer::flush() {
+  flushWriteBatchToFile();
   if (appendFile_) {
     appendFile_.flush();
   }
@@ -99,10 +123,12 @@ void FileCsvBuffer::flush() {
 
 size_t FileCsvBuffer::sizeBytes() const {
   // Defense in depth: a separately-opened read handle only sees what's
-  // actually been synced to LittleFS, not whatever's sitting in
-  // appendFile_'s own buffered-but-unflushed writes (see its header
-  // comment). Callers are expected to have already called flush() — this
-  // just avoids returning a stale (too-small) size if one hasn't.
+  // actually been written+synced to LittleFS, not whatever's sitting
+  // staged in writeBatch_ or buffered-but-unflushed in appendFile_ itself
+  // (see their own header comments). Callers are expected to have already
+  // called flush() — this just avoids returning a stale (too-small) size
+  // if one hasn't.
+  flushWriteBatchToFile();
   if (appendFile_) {
     appendFile_.flush();
   }
@@ -125,6 +151,7 @@ void FileCsvBuffer::forEachChunk(size_t chunkSize,
     return;
   }
   // See sizeBytes()'s comment — same reasoning.
+  flushWriteBatchToFile();
   if (appendFile_) {
     appendFile_.flush();
   }
@@ -151,6 +178,9 @@ void FileCsvBuffer::clear() {
   if (appendFile_) {
     appendFile_.close();
   }
+  // Discards anything staged but not yet written to appendFile_ — safe,
+  // since the file itself is about to be removed anyway.
+  writeBatchLen_ = 0;
   LittleFS.remove(kBufferPath);
   File f = LittleFS.open(kBufferPath, "w");
   if (f) {
