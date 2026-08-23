@@ -47,25 +47,48 @@ private fun percentile95(values: List<Int>): Int? {
 const val SPO2_EVENT_THRESHOLD_PERCENT = 94
 
 /**
- * Number of separate desaturation events: maximal contiguous runs of consecutive readings with
- * SpO2 below [SPO2_EVENT_THRESHOLD_PERCENT]. This counts run *starts*, not total below-threshold
- * readings — e.g. SpO2 dipping to 90, recovering to 96, then dipping to 92 again is 2 events, not
- * one long one and not a raw count of below-threshold samples. [values] must already be in
- * chronological order (same requirement as [percentile95]'s input, satisfied by [readings] being
- * sorted ascending by timestamp — see ReadingDao's `ORDER BY timestampEpochSec ASC`), since unlike
- * percentile95 the result genuinely depends on sequence, not just the multiset of values. Null
- * (not 0) when there's no data at all, consistent with every other field in [ReadingStats].
+ * Two dips below [SPO2_EVENT_THRESHOLD_PERCENT] separated by a recovery shorter than this count
+ * as one continuous event, not two — see [countSpo2Events]. A brief single-sample bounce back
+ * above threshold (sensor noise, a momentary good reading mid-desaturation) shouldn't fragment
+ * one real episode into several.
  */
-private fun countSpo2Events(values: List<Int>): Int? {
-    if (values.isEmpty()) return null
+internal const val EVENT_MERGE_GAP_SECONDS = 5L
+
+/**
+ * Number of separate desaturation events: maximal runs of readings with SpO2 below
+ * [SPO2_EVENT_THRESHOLD_PERCENT], where a recovery above threshold shorter than
+ * [EVENT_MERGE_GAP_SECONDS] doesn't end the event — the next dip merges into the same one instead
+ * of starting a new one. E.g. SpO2 dipping to 90, recovering to 96 for 2 seconds, then dipping to
+ * 92 again is 1 event; the same recovery lasting 10 seconds would be 2. [readings] must already be
+ * in chronological order (see ReadingDao's `ORDER BY timestampEpochSec ASC`) — unlike
+ * [percentile95], this genuinely depends on sequence (and now timing), not just the multiset of
+ * SpO2 values. Null (not 0) when there's no data at all, consistent with every other field in
+ * [ReadingStats].
+ */
+// internal, not private, so GraphViewModelEventsTest can exercise this directly — the merge-gap
+// timing logic is exactly the kind of thing worth a real unit test rather than trusting by eye.
+internal fun countSpo2Events(readings: List<ReadingEntity>): Int? {
+    if (readings.isEmpty()) return null
     var eventCount = 0
     var inEvent = false
-    for (value in values) {
-        val belowThreshold = value < SPO2_EVENT_THRESHOLD_PERCENT
-        if (belowThreshold && !inEvent) {
-            eventCount++
+    // Epoch second of the most recent below-threshold reading seen so far — once a run ends,
+    // this is left holding that run's own last (i.e. most recent) below-threshold timestamp,
+    // which is exactly what the next run's gap needs to be measured from.
+    var lastBelowThresholdEpochSec: Long? = null
+    for (reading in readings) {
+        val belowThreshold = reading.spo2 < SPO2_EVENT_THRESHOLD_PERCENT
+        if (belowThreshold) {
+            if (!inEvent) {
+                val gapSeconds = lastBelowThresholdEpochSec?.let { reading.timestampEpochSec - it }
+                if (gapSeconds == null || gapSeconds >= EVENT_MERGE_GAP_SECONDS) {
+                    eventCount++
+                }
+                inEvent = true
+            }
+            lastBelowThresholdEpochSec = reading.timestampEpochSec
+        } else {
+            inEvent = false
         }
-        inEvent = belowThreshold
     }
     return eventCount
 }
@@ -108,7 +131,7 @@ class GraphViewModel(
             readingsRepository.statsForRange(range).copy(
                 p95Spo2 = percentile95(currentReadings.map { it.spo2 }),
                 p95Pulse = percentile95(currentReadings.map { it.pulse }),
-                spo2EventCount = countSpo2Events(currentReadings.map { it.spo2 }),
+                spo2EventCount = countSpo2Events(currentReadings),
             )
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), EMPTY_STATS)
