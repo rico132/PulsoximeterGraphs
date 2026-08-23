@@ -17,9 +17,22 @@ constexpr uint32_t kMaxBootAttempts = 3;
 // when it returns true (see that function's own `if (!verifyRollbackLater())` guard) — so
 // OtaRollbackGuard::begin()/confirmHealthy() below become the only things that ever call
 // esp_ota_mark_app_valid_cancel_rollback()/esp_ota_mark_app_invalid_rollback_and_reboot() for
-// this firmware. Deliberately a free function, not a class member: it overrides a weak C++
-// symbol resolved at link time, which only works with a matching signature at global scope.
-bool verifyRollbackLater() { return true; }
+// this firmware. Deliberately a free function, not a class member: it overrides a weak symbol
+// resolved at link time, which only works with a matching name and linkage at global scope.
+//
+// extern "C" is load-bearing, not decorative: esp32-hal-misc.c is a plain .c file, so its weak
+// `bool verifyRollbackLater()` has C linkage — the plain, unmangled symbol name
+// `verifyRollbackLater`. Without extern "C" here, this .cpp definition would instead get a
+// mangled C++ symbol (e.g. `_Z18verifyRollbackLaterv`), which the linker treats as a completely
+// unrelated, unused symbol rather than a strong override of the weak one — leaving Arduino's own
+// default (`return false`) silently in effect. That's exactly the bug this comment is here to
+// prevent regressing: it shipped once, verified by `nm` on the built ELF still showing
+// `verifyRollbackLater` as a weak (W) symbol — i.e. this override was never linked in at all —
+// which meant OtaRollbackGuard was completely inert: Arduino's own initArduino() ran its full
+// default logic before setup() ever started, immediately calling
+// esp_ota_mark_app_valid_cancel_rollback() on every OTA boot regardless of whether this firmware
+// ever proved itself healthy.
+extern "C" bool verifyRollbackLater() { return true; }
 
 void OtaRollbackGuard::begin() {
   const esp_partition_t *running = esp_ota_get_running_partition();
