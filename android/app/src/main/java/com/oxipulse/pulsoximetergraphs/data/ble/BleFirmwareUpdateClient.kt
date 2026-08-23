@@ -204,7 +204,19 @@ class BleFirmwareUpdateClient(private val context: Context) {
     @SuppressLint("MissingPermission")
     private fun connect(address: String) {
         log("Found device, connecting to $address")
-        _updateState.value = UpdateState.Connecting
+        // Shared by both startUpdate() (mode == UPDATE) and checkDeviceVersion() (mode ==
+        // CHECK_VERSION) — see this class's own doc. Only UPDATE has a "Connecting" state to
+        // report; VersionCheckState has no equivalent granular step, its Checking already covers
+        // the whole scan-through-read span. Writing UpdateState.Connecting unconditionally here
+        // used to leak into a plain version check: _updateState would get stuck on Connecting
+        // once the check concluded (nothing resets it back to Idle the way fail()/success do for
+        // whichever state is actually live for the current mode — see fail()'s own doc), which
+        // left the Settings screen's "Download and install" button permanently disabled (it's
+        // gated on updateState) after every "Check for update" tap, until the user hit Cancel
+        // (whose handler explicitly resets UpdateState to Idle).
+        if (mode == Mode.UPDATE) {
+            _updateState.value = UpdateState.Connecting
+        }
         val adapter = bluetoothAdapter ?: return fail("Bluetooth adapter unavailable")
         val device = adapter.getRemoteDevice(address)
         bluetoothGatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
