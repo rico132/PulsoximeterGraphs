@@ -6,6 +6,7 @@
 
 #include <LittleFS.h>
 
+#include "CsvRowFormatter.h"
 #include "ICsvBuffer.h"
 
 class FileCsvBuffer : public ICsvBuffer {
@@ -56,4 +57,9 @@ private:
   // single datum does to the task watchdog.
   size_t remainingCapacityBytes_ = 0;
   void refreshRemainingCapacity();
+  // Reused across every appendRow() call for this buffer's whole lifetime —
+  // see CsvRowFormatter's own header comment for why that matters (it's
+  // what lets consecutive rows within one record skip re-deriving the
+  // whole calendar breakdown from scratch).
+  CsvRowFormatter csvRowFormatter_;
 };

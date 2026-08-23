@@ -1,7 +1,5 @@
 #include "RamCsvBuffer.h"
 
-#include <ctime>
-#include <cstdio>
 #include <cstring>
 
 #include <Arduino.h>
@@ -15,26 +13,6 @@ namespace {
 // to eyeball what's actually coming off the device without pulling the BLE
 // dump, e.g. while chasing a link-health issue.
 constexpr uint32_t kDebugRowsToPrint = 10;
-
-// Formats one CSV row per PROTOCOL.md: "YYYY-MM-DD, HH:MM:SS, <spo2>, <pulse>\r\n".
-// No timezone conversion is applied — the epoch value came from the phone's
-// SET_TIME and is rendered via gmtime() as-is; PROTOCOL.md documents that no
-// timezone information is carried by this format at all.
-size_t formatCsvRow(int64_t epochSeconds, uint8_t spo2, uint8_t pulseRate,
-                    char *buf, size_t bufSize) {
-  const time_t t = static_cast<time_t>(epochSeconds);
-  struct tm tmVal;
-  gmtime_r(&t, &tmVal);
-  const int written = snprintf(
-      buf, bufSize, "%04d-%02d-%02d, %02d:%02d:%02d, %d, %d\r\n",
-      tmVal.tm_year + 1900, tmVal.tm_mon + 1, tmVal.tm_mday, tmVal.tm_hour,
-      tmVal.tm_min, tmVal.tm_sec, spo2, pulseRate);
-  if (written < 0) {
-    return 0;
-  }
-  return static_cast<size_t>(written) < bufSize ? static_cast<size_t>(written)
-                                                : bufSize - 1;
-}
 } // namespace
 
 RamCsvBuffer::RamCsvBuffer() = default;
@@ -83,8 +61,8 @@ bool RamCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
     return false;
   }
   char row[Config::kMaxCsvRowLength];
-  const size_t len = formatCsvRow(epochSeconds, spo2, pulseRate, row,
-                                  sizeof(row));
+  const size_t len = csvRowFormatter_.format(epochSeconds, spo2, pulseRate,
+                                             row, sizeof(row));
   if (writeOffset_ + len > arenaCapacity_) {
     // Should not happen given the cap sizing, but guard against it rather
     // than overrun the arena.
@@ -100,10 +78,13 @@ bool RamCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
     // usbTask. Ten consecutive blocking Serial writes with no pacing in
     // between is exactly the UART TX-ring-buffer-starvation hazard already
     // chased down (and fixed) throughout StoredRecordDownloader.cpp — this
-    // call site just lived in a different file and was missed. `row` is
-    // formatCsvRow()'s snprintf() output, so it's already a valid
-    // null-terminated C string (including its own trailing "\r\n"); no
-    // separate Serial.write() needed.
+    // call site just lived in a different file and was missed. Unlike the
+    // old snprintf()-based formatter, CsvRowFormatter::format() doesn't
+    // null-terminate `row` (it returns a length instead, precisely so the
+    // hot append path above never pays for a byte the CSV data itself
+    // doesn't need) — explicitly terminate it here, only for this debug
+    // path, since %s below needs it.
+    row[len] = '\0';
     LOCKED_ROM_PRINTF("CsvBuffer: row %u: %s", rowCount_, row);
   }
   return true;

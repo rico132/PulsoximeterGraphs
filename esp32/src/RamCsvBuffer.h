@@ -6,6 +6,7 @@
 #pragma once
 
 #include "Config.h"
+#include "CsvRowFormatter.h"
 #include "ICsvBuffer.h"
 
 class RamCsvBuffer : public ICsvBuffer {
@@ -37,4 +38,9 @@ private:
   size_t arenaCapacity_ = 0;
   size_t writeOffset_ = 0;
   uint32_t rowCount_ = 0;
+  // Reused across every appendRow() call for this buffer's whole lifetime —
+  // see CsvRowFormatter's own header comment for why that matters (it's
+  // what lets consecutive rows within one record skip re-deriving the
+  // whole calendar breakdown from scratch).
+  CsvRowFormatter csvRowFormatter_;
 };

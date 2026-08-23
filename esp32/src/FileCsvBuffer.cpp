@@ -1,8 +1,5 @@
 #include "FileCsvBuffer.h"
 
-#include <ctime>
-#include <cstdio>
-
 #include <Arduino.h>
 #include <LittleFS.h>
 
@@ -21,25 +18,6 @@ constexpr uint32_t kDebugRowsToPrint = 10;
 // paying flush()'s full metadata-commit cost (same underlying cost as
 // close(), see appendFile_'s own comment in the header) on every row.
 constexpr uint32_t kFlushEveryNRows = 200;
-
-// Duplicated from RamCsvBuffer.cpp rather than shared, deliberately: it's a
-// ~10-line formatter and the two buffers otherwise share nothing, so a
-// shared header would only add indirection for this one function.
-size_t formatCsvRow(int64_t epochSeconds, uint8_t spo2, uint8_t pulseRate,
-                    char *buf, size_t bufSize) {
-  const time_t t = static_cast<time_t>(epochSeconds);
-  struct tm tmVal;
-  gmtime_r(&t, &tmVal);
-  const int written = snprintf(
-      buf, bufSize, "%04d-%02d-%02d, %02d:%02d:%02d, %d, %d\r\n",
-      tmVal.tm_year + 1900, tmVal.tm_mon + 1, tmVal.tm_mday, tmVal.tm_hour,
-      tmVal.tm_min, tmVal.tm_sec, spo2, pulseRate);
-  if (written < 0) {
-    return 0;
-  }
-  return static_cast<size_t>(written) < bufSize ? static_cast<size_t>(written)
-                                                : bufSize - 1;
-}
 } // namespace
 
 FileCsvBuffer::FileCsvBuffer() = default;
@@ -85,8 +63,8 @@ bool FileCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
     return false;
   }
   char row[Config::kMaxCsvRowLength];
-  const size_t len = formatCsvRow(epochSeconds, spo2, pulseRate, row,
-                                  sizeof(row));
+  const size_t len = csvRowFormatter_.format(epochSeconds, spo2, pulseRate,
+                                             row, sizeof(row));
   // Kept open across calls rather than reopened every row — see
   // appendFile_'s own comment in the header for the full reasoning. Real
   // hardware confirmed the open+write+close-per-row version could not get
@@ -119,9 +97,12 @@ bool FileCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
   if (rowCount_ <= kDebugRowsToPrint) {
     // esp_rom_printf, not Serial — same reasoning as RamCsvBuffer::appendRow():
     // called back-to-back, once per datum, right after a stored-record
-    // decode finishes, on usbTask. `row` is formatCsvRow()'s snprintf()
-    // output, so it's already a valid null-terminated C string (including
-    // its own trailing "\r\n").
+    // decode finishes, on usbTask. Unlike the old snprintf()-based
+    // formatter, CsvRowFormatter::format() doesn't null-terminate `row` (it
+    // returns a length instead, precisely so the hot append path above
+    // never pays for a byte the CSV data itself doesn't need) — explicitly
+    // terminate it here, only for this debug path, since %s below needs it.
+    row[len] = '\0';
     LOCKED_ROM_PRINTF("CsvBuffer: row %u: %s", rowCount_, row);
   }
   return true;
