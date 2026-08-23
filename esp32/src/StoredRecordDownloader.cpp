@@ -363,12 +363,10 @@ private:
 // Flushes `buffer` on every exit path from downloadAndMaybeDelete() —
 // success, a mid-loop failure, or an early return from the initial
 // handshake — so whatever was appended before returning is guaranteed
-// durable/visible to a later BLE dump. FileCsvBuffer only syncs its kept-
-// open LittleFS handle periodically during appendRow() (see its own
-// comment for why), so without this, rows appended after the last periodic
-// sync — including, worst case, an entire short record — would sit
-// unflushed until the *next* download session happened to cross another
-// kFlushEveryNRows boundary. A no-op for RamCsvBuffer.
+// durable/visible to a later BLE dump. FileCsvBuffer's kept-open LittleFS
+// handle is never synced mid-appendRow() at all (removed — see its own
+// comment for why), so without this, nothing appended this session would
+// ever become durable/visible. A no-op for RamCsvBuffer.
 class ScopedCsvFlush {
 public:
   explicit ScopedCsvFlush(ICsvBuffer &buffer) : buffer_(buffer) {}

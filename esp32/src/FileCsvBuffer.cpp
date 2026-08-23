@@ -5,14 +5,6 @@
 
 #include "Config.h"
 
-namespace {
-// How often appendRow() syncs its kept-open file handle, in rows. Bounds
-// how much a mid-download crash could lose to unsynced writes without
-// paying flush()'s full metadata-commit cost (same underlying cost as
-// close(), see appendFile_'s own comment in the header) on every row.
-constexpr uint32_t kFlushEveryNRows = 200;
-} // namespace
-
 FileCsvBuffer::FileCsvBuffer() = default;
 FileCsvBuffer::~FileCsvBuffer() = default;
 
@@ -80,13 +72,22 @@ bool FileCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
   rowCount_++;
   remainingCapacityBytes_ -= len; // safe: isFull() above already ensured
                                   // remainingCapacityBytes_ >= kMaxCsvRowLength >= len
-  // Periodic sync, not per-row — see kFlushEveryNRows' comment. flush()
-  // (called unconditionally once the whole download session ends, from
-  // StoredRecordDownloader's ScopedCsvFlush) is what actually guarantees
-  // every row is durable/visible; this just bounds the gap in between.
-  if (rowCount_ % kFlushEveryNRows == 0) {
-    appendFile_.flush();
-  }
+  // No periodic flush()/sync() here anymore — see StoredRecordDownloader.cpp's
+  // ScopedCsvFlush, which unconditionally flushes once the whole download
+  // session ends (success or failure), for what actually guarantees every
+  // appended row is durable/visible. A periodic mid-download flush used to
+  // exist to bound how much an ESP32 crash mid-download could cost — flush()
+  // (like close(), see appendFile_'s own comment) commits a directory
+  // metadata update that can trigger metadata-block compaction, easily
+  // O(log file size) or worse, so paying it every couple hundred rows across
+  // tens of thousands of datums added up to real, measurable time on boards
+  // without PSRAM (FileCsvBuffer, not RamCsvBuffer, is what's actually in
+  // use there). That crash-safety trade-off isn't worth as much as it used
+  // to be now that a crash/reboot mid-download is already an accepted,
+  // ordinary case (see FileCsvBuffer::begin()'s own comment): the next
+  // attach just re-downloads everything fresh from the still-attached
+  // PO-400 either way, whether zero rows or most of them made it into this
+  // buffer beforehand.
   return true;
 }
 
