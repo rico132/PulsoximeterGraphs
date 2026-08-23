@@ -997,6 +997,13 @@ bool StoredRecordDownloader::performInitialHandshake() {
 bool StoredRecordDownloader::downloadAndMaybeDelete() {
   ScopedFlag inProgress(downloadInProgress_);
   ScopedCsvFlush csvFlush(csvBuffer_);
+  // A fresh download cycle is starting (natural attach or BLE-triggered, either way) — whatever
+  // ends up in the buffer by the time this returns hasn't been read out over BLE yet. See
+  // bufferReadSinceLastDownload()'s own comment for what this gates. Reset unconditionally, even
+  // on a failed attempt below: if this attempt fails outright, the buffer's actual content is
+  // unchanged from before this call, and the very next REQUEST_DATA marking it read again (see
+  // markBufferRead()) naturally corrects this back to true regardless.
+  bufferReadSinceLastDownload_ = false;
   if (!performInitialHandshake()) {
     Serial.println(
         "StoredRecordDownloader: initial handshake failed; device may "

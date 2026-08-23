@@ -190,6 +190,21 @@ public:
   // record as each one finishes downloading and gets appended.
   bool downloadInProgress() const { return downloadInProgress_; }
 
+  // Whether the CSV buffer has actually been streamed out over BLE (a completed REQUEST_DATA
+  // dump — see BleGattServer::requestDataDump()'s markBufferRead() call) since the last time a
+  // download finished, natural attach or BLE-triggered alike. requestDataDump() only re-triggers
+  // a fresh USB download when this is true: right after ANY download, the buffer is already as
+  // fresh as it can be, so re-triggering yet another one before this one has even been read out
+  // once would just waste USB airtime re-fetching data nothing has actually claimed yet.
+  bool bufferReadSinceLastDownload() const { return bufferReadSinceLastDownload_; }
+
+  // Called by BleGattServer::requestDataDump() once it has actually streamed the buffer's
+  // current contents out over BLE — regardless of the resulting byte count (even an empty dump
+  // still means "I looked, there was nothing new"), and regardless of whether the phone goes on
+  // to confirm it with CLEAR_BUFFER. Marks this download cycle's data as spent, so the next
+  // REQUEST_DATA knows a fresh one is worth asking for first.
+  void markBufferRead() { bufferReadSinceLastDownload_ = true; }
+
   // Clears the persisted "already downloaded this device-pairing" ledger
   // (see isAutoRecordCommitted()'s comment) — call whenever the CSV buffer
   // itself is wiped (BleGattServer's CLEAR_BUFFER handler), since a record
@@ -276,6 +291,7 @@ private:
   Preferences preferences_;
   bool testModeEnabled_ = true;
   volatile bool downloadInProgress_ = false;
+  volatile bool bufferReadSinceLastDownload_ = false;
 };
 
 #endif // ARDUINO

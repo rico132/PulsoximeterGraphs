@@ -188,20 +188,28 @@ void BleGattServer::requestDataDump() {
     return;
   }
 
-  // Every REQUEST_DATA asks the still-attached device for a truly fresh
-  // download rather than trusting whatever's already sitting in the buffer
-  // from an earlier attach/session — forgets which records were already
-  // committed (see resetCommittedRecords()'s own comment; their rows may
-  // well have already been cleared out of the buffer by an earlier
-  // CLEAR_BUFFER) and fires the same attach callback a real unplug/replug
-  // would, without requiring one. The phone dedupes against its own
-  // database instead (see ReadingsRepository.importCsv), so re-sending
-  // everything the device still has every time is safe — simpler, and far
-  // less fragile, than this firmware trying to track "what's actually new
-  // since last time" itself. Skipped if a download is already happening
-  // (e.g. a real attach raced this) rather than triggering a redundant
-  // second one on top of it.
-  if (!storedRecordDownloader_.downloadInProgress()) {
+  // Re-trigger a fresh USB download only if this device-pairing's buffer has
+  // actually been read out over BLE at least once since the last one (natural
+  // attach or BLE-triggered alike) — see
+  // StoredRecordDownloader::bufferReadSinceLastDownload()'s own comment. A
+  // download already happening (e.g. a real attach raced this) or a buffer
+  // nothing has claimed yet both mean the current content is already as
+  // fresh as it can be, so triggering another one on top would just waste
+  // USB airtime re-fetching data nothing has actually consumed. The other
+  // two ways new data ever makes it into the buffer — a fresh physical
+  // attach, or the ESP32 restarting with the PO-400 already plugged in —
+  // are both handled entirely by UsbHidOxHost's own attach detection,
+  // independently of REQUEST_DATA or this flag.
+  if (!storedRecordDownloader_.downloadInProgress() &&
+      storedRecordDownloader_.bufferReadSinceLastDownload()) {
+    // Forgets which records were already committed (see
+    // resetCommittedRecords()'s own comment; their rows may well have
+    // already been cleared out of the buffer by an earlier CLEAR_BUFFER) and
+    // fires the same attach callback a real unplug/replug would, without
+    // requiring one. The phone dedupes against its own database instead
+    // (see ReadingsRepository.importCsv), so re-sending everything the
+    // device still has is safe — simpler, and far less fragile, than this
+    // firmware trying to track "what's actually new since last time" itself.
     storedRecordDownloader_.resetCommittedRecords();
     usbHost_.triggerAttachCallback();
     // triggerAttachCallback() only signals usbTask (a separate FreeRTOS
@@ -280,6 +288,11 @@ void BleGattServer::requestDataDump() {
     }
     totalBytesSent += len;
   });
+  // The buffer has now actually been read out, regardless of totalBytesSent (even an empty
+  // buffer still means "checked, nothing there") and regardless of whether the phone stays
+  // connected long enough to receive all of it — see bufferReadSinceLastDownload()'s own comment
+  // for what this unlocks for the *next* REQUEST_DATA.
+  storedRecordDownloader_.markBufferRead();
 
   if (connected_) {
     const uint8_t terminator = Config::kEndOfTransferByte;

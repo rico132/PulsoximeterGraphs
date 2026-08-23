@@ -42,7 +42,7 @@ ESP32 = peripheral/server. Phone = central/client. Advertised device name: `Puls
 
 | Opcode | Name | Payload | Meaning |
 |---|---|---|---|
-| `0x01` | `REQUEST_DATA` | none | Ask the ESP32 to re-download everything the still-attached PO-400 currently has (as if it had just been plugged in again) and stream all of it over the Data characteristic — see "Recommended sync sequence" below for why re-sending everything every time is deliberate, not a fixed-size incremental dump. |
+| `0x01` | `REQUEST_DATA` | none | Ask the ESP32 to stream its currently-buffered CSV rows over the Data characteristic. If the buffer has already been read out by an earlier `REQUEST_DATA` since the last download, this first re-downloads everything the still-attached PO-400 currently has (as if it had just been plugged in again) before streaming — see "Recommended sync sequence" below for why re-sending everything is deliberate, not a fixed-size incremental dump. A buffer nothing has read yet (freshly downloaded at boot, or by a real attach/re-attach) is streamed as-is, with no redundant extra download first. |
 | `0x02` | `SET_TIME` | 8 bytes, little-endian Unix epoch seconds | Phone pushes its current clock to the ESP32 (which has no RTC/NTP). Sent on every connection. |
 | `0x03` | `CLEAR_BUFFER` | none | Phone confirms it has durably stored the data it just received; ESP32 may discard its buffered copy. Must only be sent **after** a successful local insert. |
 | `0x04` | `SET_TEST_MODE` | 1 byte, `0x00` or `0x01` | When `0x01` (on), the ESP32 never deletes downloaded stored records from the PO-400. Persisted in NVS. **Defaults to `0x01` (on/non-destructive)** until explicitly turned off. |
@@ -82,10 +82,10 @@ compatible and the common case needs no header at all.
 
 1. Connect, discover services, request MTU 503.
 2. Write `SET_TIME` (always, every connection).
-3. Write `REQUEST_DATA`. The ESP32 re-downloads everything the PO-400 currently has over USB
-   before streaming any of it — see `REQUEST_DATA`'s own table entry — which can take a while
-   (the ESP32 waits up to 5 minutes internally); size any client-side inactivity timeout
-   accordingly, and re-arm it on every Data notification, not just once at the start.
+3. Write `REQUEST_DATA`. This may first re-download everything the PO-400 currently has over USB
+   before streaming any of it — see `REQUEST_DATA`'s own table entry for exactly when — which can
+   take a while (the ESP32 waits up to 5 minutes internally); size any client-side inactivity
+   timeout accordingly, and re-arm it on every Data notification, not just once at the start.
 4. Reassemble Data notifications until the `0x00` terminator; parse the CSV blob.
 5. **Drop any row whose timestamp already exists locally before inserting the rest** — every
    `REQUEST_DATA` returns the PO-400's *entire* current stored history, not just what's new
