@@ -98,6 +98,7 @@ import com.patrykandpatrick.vico.compose.common.Position
 import com.patrykandpatrick.vico.compose.common.ProvideVicoTheme
 import com.patrykandpatrick.vico.compose.m3.common.rememberM3VicoTheme
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlin.math.floor
@@ -241,12 +242,12 @@ fun GraphScreen(
         // Dragging a selection (below) replaces this with a narrower selectedRange rather than
         // trying to re-decimate this same list on the fly.
         val plottedReadings = remember(readings) { decimateKeepingExtremes(readings) }
-        // Same "does this selection cross a day boundary" check rememberTimeAxisFormatter makes
-        // per-chart (see its own doc) — computed once more here purely to size the shared item
+        // Same "does this need a date label" check rememberTimeAxisFormatter makes per-chart (see
+        // needsDateLabel's own doc) — computed once more here purely to size the shared item
         // placer's label spacing to match the (possibly longer, date-including) labels it'll
         // place, not to duplicate the formatting decision itself.
         val zone = remember { ZoneId.systemDefault() }
-        val multiDayLabels = remember(plottedReadings, zone) { spansMultipleDays(plottedReadings, zone) }
+        val multiDayLabels = remember(plottedReadings, zone) { needsDateLabel(plottedReadings, zone) }
         // Shared between both charts' bottom axes so they pick the exact same tick indices —
         // see the parameter doc on rememberSharedTimeAxisItemPlacer for why leaving each chart
         // to compute its own (Vico's default) caused SpO2 and Pulse to show different times for
@@ -507,15 +508,27 @@ private fun StatsTableRow(
 // formatter below maps each index back to that reading's real timestamp for display.
 /**
  * Whether [readings] (assumed sorted ascending by timestamp — see ReadingDao's `ORDER BY
- * timestampEpochSec ASC`) covers more than one local calendar date, comparing only the first and
- * last reading rather than scanning the whole list — sufficient for a sorted list, and O(1)
+ * timestampEpochSec ASC`) contains anything that isn't from today, comparing only the first and
+ * last reading against [zone]'s current date rather than scanning the whole list — sufficient for
+ * a sorted list (every date in between necessarily falls within [firstDate, lastDate]), and O(1)
  * instead of O(n) against what can be a many-thousand-row selection.
+ *
+ * Deliberately checked against "today" rather than "does [readings] itself span more than one
+ * date": drag-to-zoom (see DragToZoomOverlay/GraphViewModel.setRange) narrows the plotted list to
+ * whatever the drag selected, which — even when the *original* selection was many days wide —
+ * almost always lands within a single calendar day once zoomed in. A plain first-vs-last-date
+ * comparison on that narrowed list would then read as "single day" and drop the date label, even
+ * though the day being viewed might be a week ago rather than today — leaving no way to tell which
+ * day a zoomed-in chart is actually showing. Anchoring to "today" instead means the date only ever
+ * disappears once the user has zoomed all the way down to (or started from) data that's
+ * unambiguously today, regardless of how far they've zoomed in to get there.
  */
-private fun spansMultipleDays(readings: List<ReadingEntity>, zone: ZoneId): Boolean {
-    if (readings.size < 2) return false
+private fun needsDateLabel(readings: List<ReadingEntity>, zone: ZoneId): Boolean {
+    if (readings.isEmpty()) return false
+    val today = LocalDate.now(zone)
     val firstDate = Instant.ofEpochSecond(readings.first().timestampEpochSec).atZone(zone).toLocalDate()
     val lastDate = Instant.ofEpochSecond(readings.last().timestampEpochSec).atZone(zone).toLocalDate()
-    return firstDate != lastDate
+    return firstDate != today || lastDate != today
 }
 
 private val TIME_ONLY_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
@@ -538,7 +551,7 @@ private val DATE_AND_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPat
 private fun rememberTimeAxisFormatter(readings: List<ReadingEntity>): CartesianValueFormatter {
     val zone = ZoneId.systemDefault()
     return remember(readings, zone) {
-        val formatter = if (spansMultipleDays(readings, zone)) DATE_AND_TIME_FORMATTER else TIME_ONLY_FORMATTER
+        val formatter = if (needsDateLabel(readings, zone)) DATE_AND_TIME_FORMATTER else TIME_ONLY_FORMATTER
         CartesianValueFormatter { _, value, _ ->
             // Vico's contract forbids ever returning a blank string here — it throws if we do
             // (see the crash this guards against). That's harder to guarantee than it looks:
