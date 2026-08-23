@@ -197,6 +197,14 @@ constexpr bool kDefaultTestMode = true; // default ON — never destroy real dat
 constexpr const char *kPrefsKeyCommittedAutoEpochs = "auto_committed";
 constexpr const char *kPrefsKeyCommittedManualEpoch = "manual_committed";
 
+// See OtaRollbackGuard's own doc. Counts consecutive boots of a not-yet-confirmed
+// (ESP_OTA_IMG_PENDING_VERIFY) OTA image that never reached confirmHealthy() — reset to 0 on
+// either a successful confirm or a rollback. Persisted (not just in-RAM) specifically because
+// the failure mode this guards against is a firmware that crashes/hangs *during* setup(), which
+// means each failed attempt is its own fresh boot with no surviving in-RAM state — only NVS
+// survives across that.
+constexpr const char *kPrefsKeyOtaBootAttempts = "ota_boot_try";
+
 // BLE pairing PIN — see BleGattServer::begin()'s NimBLEDevice::setSecurityAuth()
 // call and the Control/Data/Status characteristics' *_ENC/*_AUTHEN
 // properties: without pairing, literally anyone within BLE range could

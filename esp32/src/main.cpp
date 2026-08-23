@@ -31,6 +31,7 @@
 #include "FileCsvBuffer.h"
 #include "ICsvBuffer.h"
 #include "OtaManager.h"
+#include "OtaRollbackGuard.h"
 #include "RamCsvBuffer.h"
 #include "StoredRecordDownloader.h"
 #include "UsbHidOxHost.h"
@@ -47,6 +48,7 @@ UsbHidOxHost g_usbHost;
 // reference to it before it points anywhere valid.
 StoredRecordDownloader *g_storedRecordDownloader = nullptr;
 OtaManager g_otaManager;
+OtaRollbackGuard g_otaRollbackGuard;
 BleGattServer *g_bleGattServer = nullptr;
 
 // Two independent reasons usbTask needs to wake up and do USB work — an
@@ -141,6 +143,10 @@ void pollSerialDebugCommands() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+  // Before anything else that could itself crash or hang setup() (Serial.begin() above never
+  // does) — see OtaRollbackGuard's own doc. A firmware stuck failing to boot rolls itself back
+  // to the last known-good image right here, rebooting before ever reaching the line below.
+  g_otaRollbackGuard.begin();
   Serial.println("PulsoxRelay firmware starting.");
   // Config::kFirmwareVersion is a compile-time constant baked into this exact binary's .rodata
   // (see its own comment) — CI passes -D FIRMWARE_VERSION="<release tag>" per build, so this is
@@ -210,6 +216,10 @@ void setup() {
       []() { xEventGroupSetBits(g_usbTaskEvents, kUsbDeletePendingBit); });
 
   Serial.println("PulsoxRelay firmware ready.");
+  // Last thing in setup(), now that every subsystem above has initialized without crashing or
+  // hanging the watchdog — see OtaRollbackGuard's own doc. A no-op unless this boot followed an
+  // OTA update that hasn't confirmed itself healthy yet.
+  g_otaRollbackGuard.confirmHealthy();
 }
 
 void loop() {
