@@ -65,30 +65,17 @@ bool FileCsvBuffer::begin() {
   if (!LittleFS.begin(/*formatOnFail=*/true)) {
     return false;
   }
-  if (!LittleFS.exists(kBufferPath)) {
-    File f = LittleFS.open(kBufferPath, "w");
-    if (!f) {
-      return false;
-    }
-    f.close();
-  }
-  rowCount_ = 0;
-  // Recover the row count from whatever is already on disk (e.g. after a
-  // reboot with un-synced data still buffered) by counting "\r\n" line
-  // terminators rather than trusting any separately-persisted counter.
-  File f = LittleFS.open(kBufferPath, "r");
-  if (f) {
-    int prev = -1;
-    while (f.available()) {
-      const int c = f.read();
-      if (prev == '\r' && c == '\n') {
-        rowCount_++;
-      }
-      prev = c;
-    }
-    f.close();
-  }
-  refreshRemainingCapacity();
+  // Deliberately starts every boot from an empty buffer rather than
+  // recovering whatever CSV rows happened to still be on disk from before a
+  // reboot: unlike a mid-download crash (recovered from by simply retrying
+  // the USB download, since test mode keeps every record on the device —
+  // see StoredRecordDownloader::begin()'s matching resetCommittedRecords()
+  // call), health data sitting durably in flash across a reboot is no
+  // longer something this firmware wants to do, now that a REQUEST_DATA
+  // that finds nothing buffered yet will itself trigger a fresh re-download
+  // from the still-attached PO-400 (see BleGattServer::requestDataDump()) —
+  // nothing is actually lost, only re-fetched.
+  clear();
   return true;
 }
 

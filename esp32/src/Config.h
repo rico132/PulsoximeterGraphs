@@ -158,12 +158,22 @@ constexpr bool kDefaultTestMode = true; // default ON — never destroy real dat
 // startEpoch alone for Manual (only one Manual "slot" exists on the device
 // at a time) — see StoredRecordDownloader's isAutoRecordCommitted()/
 // isManualRecordCommitted() comments. Persisted (not just in-RAM) because a
-// mid-download failure or task-watchdog reboot forces the entire
-// enumerate+download loop to restart from scratch on the next attach;
-// without this, every such retry re-decodes AND re-appends every record
+// real replug, or an ESP32-triggered resync (see BleGattServer::
+// requestDataDump()), forces the entire enumerate+download loop to restart
+// from scratch on the next attach — all within the *same* power-on session
+// — without this, every such retry re-decodes AND re-appends every record
 // that had already succeeded, burning through the buffer's capacity with
 // duplicates of the same data instead of just picking up where it left off.
-// Reset (both keys) whenever the phone's CLEAR_BUFFER wipes the buffer
+// Deliberately NOT meant to survive an actual reboot, though: health data
+// sitting durably in flash across a power cycle isn't something this
+// firmware wants, now that a REQUEST_DATA finding nothing buffered yet will
+// itself trigger a fresh re-download rather than silently returning
+// nothing — StoredRecordDownloader::begin() resets both keys on every boot,
+// in lockstep with the CSV buffer itself also starting empty every boot
+// (see FileCsvBuffer::begin()'s comment); a mid-download crash/watchdog
+// reboot now simply means the next attach re-downloads everything from
+// scratch, same as any other post-reboot attach, rather than resuming.
+// Also reset (both keys) whenever the phone's CLEAR_BUFFER wipes the buffer
 // itself — see BleGattServer's handler — since a previously-committed
 // record's rows no longer exist to skip re-downloading.
 constexpr const char *kPrefsKeyCommittedAutoEpochs = "auto_committed";

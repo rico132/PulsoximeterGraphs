@@ -556,6 +556,14 @@ void StoredRecordDownloader::begin() {
   preferences_.begin(Config::kPrefsNamespace, /*readOnly=*/false);
   testModeEnabled_ = preferences_.getBool(Config::kPrefsKeyTestMode,
                                          Config::kDefaultTestMode);
+  // The CSV buffer itself is now always empty at boot (see FileCsvBuffer::
+  // begin()'s comment — RamCsvBuffer is inherently volatile and was always
+  // empty at boot anyway) — but the committed-records ledger below lives in
+  // NVS, which *does* survive a reboot. Left unreset, it would wrongly tell
+  // the next download "record #N is already committed" and skip
+  // re-appending rows that, post-reboot, the (now-empty) buffer doesn't
+  // actually have — keep both in sync by resetting this here too.
+  resetCommittedRecords();
 }
 
 bool StoredRecordDownloader::testModeEnabled() const {

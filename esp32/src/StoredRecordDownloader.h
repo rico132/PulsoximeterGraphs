@@ -272,14 +272,20 @@ private:
                           const std::vector<uint8_t> &spo2,
                           const std::vector<uint8_t> &pr);
 
-  // Both check+mark pairs persist to NVS (via preferences_) — see
-  // Config::kPrefsKeyCommittedAutoEpochs'/kPrefsKeyCommittedManualEpoch's
-  // comment for why this needs to survive a reboot, not just an in-RAM
-  // session. Auto is keyed by (recordIndex, startEpoch) rather than
-  // recordIndex alone so that an index the device reuses for a genuinely
-  // new record (only possible once test mode is off and old records get
-  // deleted) is correctly treated as "not yet committed" rather than
-  // wrongly skipped.
+  // Both check+mark pairs persist to NVS (via preferences_) — needed to
+  // survive multiple attach/download retries *within one power-on session*
+  // (a real replug, or an ESP32-triggered resync — see
+  // BleGattServer::requestDataDump()) without re-appending a record's rows
+  // to the buffer twice. Deliberately NOT meant to survive an actual reboot
+  // any more, though: begin() now calls resetCommittedRecords() on every
+  // boot, in lockstep with the CSV buffer itself also starting empty every
+  // boot (see FileCsvBuffer::begin()'s comment) — leaving this ledger
+  // populated while the buffer it describes was wiped would wrongly skip
+  // re-appending rows the buffer no longer actually has. Auto is keyed by
+  // (recordIndex, startEpoch) rather than recordIndex alone so that an
+  // index the device reuses for a genuinely new record (only possible once
+  // test mode is off and old records get deleted) is correctly treated as
+  // "not yet committed" rather than wrongly skipped.
   bool isAutoRecordCommitted(uint8_t recordIndex, int64_t startEpoch);
   void markAutoRecordCommitted(uint8_t recordIndex, int64_t startEpoch);
   bool isManualRecordCommitted(int64_t startEpoch);
