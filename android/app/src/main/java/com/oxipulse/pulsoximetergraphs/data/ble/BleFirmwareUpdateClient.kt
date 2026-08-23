@@ -334,6 +334,15 @@ class BleFirmwareUpdateClient(private val context: Context) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 log("Connected (status $status)")
                 gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                // See BleGattClient's identical call for why: ~doubles raw over-air bitrate when
+                // both sides support it, falls back silently to 1M otherwise. A firmware image is
+                // one to a few hundred KB sent in ~500-byte chunks, so this matters here at least
+                // as much as it does for a CSV download.
+                gatt.setPreferredPhy(
+                    BluetoothDevice.PHY_LE_2M_MASK,
+                    BluetoothDevice.PHY_LE_2M_MASK,
+                    BluetoothDevice.PHY_OPTION_NO_PREFERRED,
+                )
                 refreshGattCache(gatt)
                 ensureBondedThenDiscoverServices(gatt)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
