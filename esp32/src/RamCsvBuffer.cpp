@@ -1,19 +1,7 @@
 #include "RamCsvBuffer.h"
 
-#include <cstring>
-
 #include <Arduino.h>
 #include <esp_heap_caps.h>
-
-#include "RomPrintfLock.h"
-
-namespace {
-// How many of the very first rows received from the PO-400 (live-stream or
-// stored-record, whichever arrives first) get echoed to Serial — a quick way
-// to eyeball what's actually coming off the device without pulling the BLE
-// dump, e.g. while chasing a link-health issue.
-constexpr uint32_t kDebugRowsToPrint = 10;
-} // namespace
 
 RamCsvBuffer::RamCsvBuffer() = default;
 
@@ -60,33 +48,20 @@ bool RamCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
   if (!arena_ || isFull()) {
     return false;
   }
-  char row[Config::kMaxCsvRowLength];
-  const size_t len = csvRowFormatter_.format(epochSeconds, spo2, pulseRate,
-                                             row, sizeof(row));
-  if (writeOffset_ + len > arenaCapacity_) {
-    // Should not happen given the cap sizing, but guard against it rather
-    // than overrun the arena.
-    return false;
-  }
-  memcpy(arena_ + writeOffset_, row, len);
+  // Formatted directly into its final place in the arena rather than into a
+  // stack buffer and then memcpy()'d over — isFull() just confirmed at
+  // least kMaxCsvRowLength bytes are free here, which CsvRowFormatter never
+  // exceeds, so there's nothing left for a separate bounds check on the
+  // result to actually catch; skipping the intermediate copy removes a
+  // redundant full-row copy from what's the hottest per-datum loop in the
+  // firmware (StoredRecordDownloader::appendDecodedRecord(), called once
+  // per datum — thousands of times per stored record).
+  const size_t len = csvRowFormatter_.format(
+      epochSeconds, spo2, pulseRate,
+      reinterpret_cast<char *>(arena_ + writeOffset_),
+      Config::kMaxCsvRowLength);
   writeOffset_ += len;
   rowCount_++;
-  if (rowCount_ <= kDebugRowsToPrint) {
-    // esp_rom_printf, not Serial: appendRow() is called back-to-back, once
-    // per datum, right after a stored-record decode finishes — e.g. from
-    // StoredRecordDownloader::appendDecodedRecord()'s tight loop, on
-    // usbTask. Ten consecutive blocking Serial writes with no pacing in
-    // between is exactly the UART TX-ring-buffer-starvation hazard already
-    // chased down (and fixed) throughout StoredRecordDownloader.cpp — this
-    // call site just lived in a different file and was missed. Unlike the
-    // old snprintf()-based formatter, CsvRowFormatter::format() doesn't
-    // null-terminate `row` (it returns a length instead, precisely so the
-    // hot append path above never pays for a byte the CSV data itself
-    // doesn't need) — explicitly terminate it here, only for this debug
-    // path, since %s below needs it.
-    row[len] = '\0';
-    LOCKED_ROM_PRINTF("CsvBuffer: row %u: %s", rowCount_, row);
-  }
   return true;
 }
 

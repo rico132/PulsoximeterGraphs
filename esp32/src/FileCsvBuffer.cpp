@@ -4,15 +4,8 @@
 #include <LittleFS.h>
 
 #include "Config.h"
-#include "RomPrintfLock.h"
 
 namespace {
-// How many of the very first rows received from the PO-400 (live-stream or
-// stored-record, whichever arrives first) get echoed to Serial — a quick way
-// to eyeball what's actually coming off the device without pulling the BLE
-// dump, e.g. while chasing a link-health issue.
-constexpr uint32_t kDebugRowsToPrint = 10;
-
 // How often appendRow() syncs its kept-open file handle, in rows. Bounds
 // how much a mid-download crash could lose to unsynced writes without
 // paying flush()'s full metadata-commit cost (same underlying cost as
@@ -93,17 +86,6 @@ bool FileCsvBuffer::appendRow(int64_t epochSeconds, uint8_t spo2,
   // every row is durable/visible; this just bounds the gap in between.
   if (rowCount_ % kFlushEveryNRows == 0) {
     appendFile_.flush();
-  }
-  if (rowCount_ <= kDebugRowsToPrint) {
-    // esp_rom_printf, not Serial — same reasoning as RamCsvBuffer::appendRow():
-    // called back-to-back, once per datum, right after a stored-record
-    // decode finishes, on usbTask. Unlike the old snprintf()-based
-    // formatter, CsvRowFormatter::format() doesn't null-terminate `row` (it
-    // returns a length instead, precisely so the hot append path above
-    // never pays for a byte the CSV data itself doesn't need) — explicitly
-    // terminate it here, only for this debug path, since %s below needs it.
-    row[len] = '\0';
-    LOCKED_ROM_PRINTF("CsvBuffer: row %u: %s", rowCount_, row);
   }
   return true;
 }
