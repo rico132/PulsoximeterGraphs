@@ -58,7 +58,7 @@ object GithubReleaseChecker {
     // .github/workflows/android-release.yml. Board-specific rather than a single generic name
     // so both esp32-s3-usb-otg and esp32-s3-devkitc-1 images can be attached to the same
     // release without ambiguity about which is which.
-    private const val ASSET_NAME_PREFIX = "firmware-esp32-s3-usb-otg"
+    private const val ASSET_NAME_PREFIX = "firmware-esp32-s3-devkitc-1"
 
     private val json = Json { ignoreUnknownKeys = true }
 

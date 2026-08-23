@@ -127,8 +127,8 @@ see `BleGattServer::ServerCallbacks::onDisconnect`.
 
 ### Firmware release asset
 
-`.github/workflows/android-release.yml` builds the ESP32 firmware (env `esp32-s3-usb-otg`) with
-`-D FIRMWARE_VERSION="<release tag>"` and attaches the resulting `firmware-esp32-s3-usb-otg.bin`
+`.github/workflows/android-release.yml` builds the ESP32 firmware (env `esp32-s3-devkitc-1`) with
+`-D FIRMWARE_VERSION="<release tag>"` and attaches the resulting `firmware-esp32-s3-devkitc-1.bin`
 to the same GitHub release it already publishes the signed APK to on every push to `main` — one
 release, two assets. The Android app's "Check for update" (Settings → Device) reads the latest
 release's tag and firmware asset via GitHub's REST API, compares the tag against the connected

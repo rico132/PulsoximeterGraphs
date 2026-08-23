@@ -131,9 +131,9 @@ jobs:
       - name: Install PlatformIO
         run: pip install --upgrade platformio
 
-      # esp32-s3-usb-otg is the primary/documented hardware target (see esp32/platformio.ini) —
+      # esp32-s3-devkitc-1 is the primary/documented hardware target (see esp32/platformio.ini) —
       # the one the Android app's "Check for update" flow looks for (see PROTOCOL.md's "Firmware
-      # release asset" section). esp32-s3-devkitc-1 is a valid alternate build target for anyone
+      # release asset" section). esp32-s3-usb-otg is a valid alternate build target for anyone
       # building from source, but isn't published here to keep exactly one unambiguous asset for
       # the app to pick up automatically.
       #
@@ -147,20 +147,20 @@ jobs:
         # var is the actual supported override mechanism.
         env:
           PLATFORMIO_BUILD_FLAGS: -D FIRMWARE_VERSION=\"${{ needs.compute-version.outputs.version }}\"
-        run: pio run -e esp32-s3-usb-otg -d esp32
+        run: pio run -e esp32-s3-devkitc-1 -d esp32
 
       - name: Rename firmware for release
         id: firmware
         run: |
-          name="firmware-esp32-s3-usb-otg-${{ needs.compute-version.outputs.version }}.bin"
-          mv esp32/.pio/build/esp32-s3-usb-otg/firmware.bin "esp32/.pio/build/esp32-s3-usb-otg/${name}"
+          name="firmware-esp32-s3-devkitc-1-${{ needs.compute-version.outputs.version }}.bin"
+          mv esp32/.pio/build/esp32-s3-devkitc-1/firmware.bin "esp32/.pio/build/esp32-s3-devkitc-1/${name}"
           echo "name=${name}" >> "$GITHUB_OUTPUT"
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
           name: firmware
-          path: esp32/.pio/build/esp32-s3-usb-otg/${{ steps.firmware.outputs.name }}
+          path: esp32/.pio/build/esp32-s3-devkitc-1/${{ steps.firmware.outputs.name }}
           retention-days: 1
 
   release:
