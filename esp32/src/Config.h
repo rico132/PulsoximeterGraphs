@@ -84,8 +84,10 @@ enum ControlOpcode : uint8_t {
   kOpSetTime = 0x02,
   kOpClearBuffer = 0x03,
   kOpSetTestMode = 0x04,
-  kOpSetWifiCredentials = 0x05,
-  kOpEnterOtaMode = 0x06,
+  // 0x05 (SET_WIFI_CREDENTIALS) and 0x06 (ENTER_OTA_MODE) used to drive the WiFi/ArduinoOTA
+  // update path (WiFiManager captive portal + ArduinoOTA, see the removed OtaManager) — retired
+  // now that BLE OTA below is the only firmware-update path, but deliberately left unassigned
+  // rather than reused, so old PROTOCOL.md revisions/logs referencing them aren't misleading.
   // Payload: [size:u32 LE][expectedMd5Hex:32 ASCII bytes]. Begins receiving a new firmware
   // image into the *inactive* OTA partition — see BleFirmwareUpdater::begin(). Refused (see
   // its own status result) while a USB stored-record download is in progress, or while an
@@ -150,13 +152,13 @@ constexpr uint32_t kApproxBytesPerRow = 30; // typical row size, for the plan's 
 // for headroom so a single row is never assumed to fit in less than this.
 constexpr uint32_t kMaxCsvRowLength = 40;
 // Reserved, not handed to RamCsvBuffer's PSRAM arena, so other subsystems
-// that might still allocate PSRAM later in setup() (NimBLE, WiFiManager,
-// OTA, ...) — all of which init *after* RamCsvBuffer::begin() in main.cpp —
-// aren't starved by this buffer having already claimed nearly all of it.
+// that might still allocate PSRAM later in setup() (NimBLE, ...) — all of
+// which init *after* RamCsvBuffer::begin() in main.cpp — aren't starved by
+// this buffer having already claimed nearly all of it.
 constexpr size_t kPsramArenaSafetyMarginBytes = 512 * 1024;
 // Reserved, not handed to FileCsvBuffer's row budget, for LittleFS's own
 // metadata/wear-leveling overhead and any other files sharing the same
-// littlefs partition (WiFiManager config, OTA staging, ...).
+// littlefs partition.
 constexpr size_t kFilesystemFreeSpaceSafetyMarginBytes = 64 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -213,28 +215,14 @@ constexpr const char *kPrefsKeyOtaBootAttempts = "ota_boot_try";
 // in here: if this repo is ever shared, a hardcoded PIN committed to source
 // stops being a secret at all. Instead BleGattServer generates a random one
 // on first boot (or after an NVS wipe), persists it under this key, and
-// prints it to Serial every boot so it stays retrievable. Same
-// serial-only-provisioning boundary as kPrefsKeyOtaPassword below, and for
-// the same reason: this must never be settable via any BLE opcode, or a
-// not-yet-paired attacker could simply set their own known PIN — see
-// BleGattServer::regeneratePairingPasskey(), reachable only via main.cpp's
-// bare `blepin` serial debug signal (no argument: a replacement PIN is
-// always randomly generated, never operator-chosen, same as first boot).
+// prints it to Serial every boot so it stays retrievable. Deliberately
+// never settable via any BLE opcode, for the same reason as everything in
+// the BLE firmware update section below: a not-yet-paired attacker could
+// simply set their own known PIN — see BleGattServer::regeneratePairingPasskey(),
+// reachable only via main.cpp's bare `blepin` serial debug signal (no
+// argument: a replacement PIN is always randomly generated, never
+// operator-chosen, same as first boot).
 constexpr const char *kPrefsKeyBlePasskey = "ble_passkey";
-
-// ---------------------------------------------------------------------------
-// OTA / WiFi
-// ---------------------------------------------------------------------------
-constexpr const char *kOtaSetupApName = "PulsoxRelay-Setup";
-constexpr const char *kOtaHostname = "pulsoxrelay";
-constexpr uint32_t kOtaIdleTimeoutMs = 10UL * 60UL * 1000UL; // 10 minutes
-constexpr const char *kPrefsKeyOtaPassword = "ota_pass";
-// No default password baked in: OtaManager treats an empty/unset stored
-// password as "OTA password not yet provisioned" and refuses ArduinoOTA
-// begin() in that state. Per the plan's licensing/security note, the OTA
-// password must only ever be set via a physically-attached serial/USB debug
-// command, never over BLE, so a compromised phone link alone can't push
-// firmware.
 
 // ---------------------------------------------------------------------------
 // BLE firmware update (OTA over BLE) — PROTOCOL.md §"BLE firmware update"

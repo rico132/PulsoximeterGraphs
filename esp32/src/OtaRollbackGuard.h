@@ -14,8 +14,8 @@
 // decision entirely to the explicit calls below instead of Arduino's own immediate one:
 //  - begin() (called once, as the very first thing in setup(), before any subsystem that could
 //    itself crash or hang) checks whether the running partition is still
-//    ESP_OTA_IMG_PENDING_VERIFY — i.e. this boot is the first one after a BLE/ArduinoOTA update
-//    flipped the boot partition to a new image (a normal boot of an already-confirmed image, or
+//    ESP_OTA_IMG_PENDING_VERIFY — i.e. this boot is the first one after a BLE OTA update flipped
+//    the boot partition to a new image (a normal boot of an already-confirmed image, or
 //    a dev build flashed directly over USB with no OTA rollback state at all, is a no-op here).
 //    If pending, it increments a persisted "consecutive unconfirmed boot" counter; once that
 //    exceeds kMaxBootAttempts, it concludes the new image can't even complete a boot and

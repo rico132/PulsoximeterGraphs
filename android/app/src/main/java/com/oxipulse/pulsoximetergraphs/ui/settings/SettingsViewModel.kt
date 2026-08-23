@@ -66,11 +66,6 @@ class SettingsViewModel(
 
     fun setTestMode(enabled: Boolean) = bleGattClient.writeTestMode(enabled)
 
-    fun setWifiCredentials(ssid: String, password: String) =
-        bleGattClient.writeWifiCredentials(ssid, password)
-
-    fun enterOtaMode() = bleGattClient.enterOtaMode()
-
     fun isDeviceConnected(): Boolean = when (syncState.value) {
         is BleGattClient.SyncState.Success,
         is BleGattClient.SyncState.ReceivingData,

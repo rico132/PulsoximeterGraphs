@@ -18,9 +18,8 @@
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
-    <!-- ENTER_OTA_MODE / SET_WIFI_CREDENTIALS don't require network access from the phone
-         side (the ESP32 does the WiFi work), but checking GitHub for a firmware update and
-         downloading it (see GithubReleaseChecker) does, over plain internet, not BLE. -->
+    <!-- The BLE link itself needs no network permission, but checking GitHub for a firmware
+         update and downloading it (see GithubReleaseChecker) does, over plain internet. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 

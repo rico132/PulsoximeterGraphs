@@ -43,11 +43,9 @@ object BleConstants {
     /** Payload: 1 byte, 0x00/0x01. Defaults to ON (0x01) on the ESP32 side. */
     const val OPCODE_SET_TEST_MODE: Byte = 0x04
 
-    /** Payload: `[ssidLen:u8][ssid bytes][passLen:u8][pass bytes]`. */
-    const val OPCODE_SET_WIFI_CREDENTIALS: Byte = 0x05
-
-    /** No payload — ESP32 brings up WiFi and starts ArduinoOTA. */
-    const val OPCODE_ENTER_OTA_MODE: Byte = 0x06
+    // 0x05 (SET_WIFI_CREDENTIALS) and 0x06 (ENTER_OTA_MODE) used to drive the now-removed
+    // WiFi/ArduinoOTA update path — retired now that BLE OTA below is the only firmware-update
+    // path, deliberately left unassigned rather than reused (see Config.h's matching comment).
 
     /**
      * Payload: `[size:u32 LE][expectedMd5Hex:32 ASCII bytes]`. Begins receiving a new firmware

@@ -50,10 +50,9 @@ uint32_t loadOrGenerateBlePasskey(Preferences &preferences) {
 
 BleGattServer::BleGattServer(ICsvBuffer &csvBuffer, ClockSync &clockSync,
                              StoredRecordDownloader &storedRecordDownloader,
-                             OtaManager &otaManager, UsbHidOxHost &usbHost)
+                             UsbHidOxHost &usbHost)
     : csvBuffer_(csvBuffer), clockSync_(clockSync),
-      storedRecordDownloader_(storedRecordDownloader),
-      otaManager_(otaManager), usbHost_(usbHost) {}
+      storedRecordDownloader_(storedRecordDownloader), usbHost_(usbHost) {}
 
 void BleGattServer::ServerCallbacks::onConnect(NimBLEServer * /*server*/,
                                                NimBLEConnInfo &connInfo) {
@@ -288,38 +287,6 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
                    "%s.\n",
                    data[1] != 0 ? "ON" : "OFF");
     }
-    break;
-
-  case Config::kOpSetWifiCredentials: {
-    if (length < 2) {
-      break;
-    }
-    size_t pos = 1;
-    const uint8_t ssidLen = data[pos++];
-    if (pos + ssidLen > length) {
-      break;
-    }
-    std::string ssid(reinterpret_cast<const char *>(data + pos), ssidLen);
-    pos += ssidLen;
-    if (pos >= length) {
-      break;
-    }
-    const uint8_t passLen = data[pos++];
-    if (pos + passLen > length) {
-      break;
-    }
-    std::string pass(reinterpret_cast<const char *>(data + pos), passLen);
-    // Deliberately never log the password — only the SSID and its length.
-    Serial.printf("BleGattServer: SET_WIFI_CREDENTIALS received, ssid='%s' "
-                 "(password %u bytes).\n",
-                 ssid.c_str(), passLen);
-    otaManager_.setWifiCredentials(ssid, pass);
-    break;
-  }
-
-  case Config::kOpEnterOtaMode:
-    Serial.println("BleGattServer: ENTER_OTA_MODE received.");
-    otaManager_.enterOtaMode();
     break;
 
   case Config::kOpStartFirmwareUpdate:

@@ -767,31 +767,6 @@ class BleGattClient(
         _testModeEnabled.value = enabled
     }
 
-    /** Writes SET_WIFI_CREDENTIALS: `[ssidLen][ssid][passLen][pass]`, both ASCII/UTF-8. */
-    fun writeWifiCredentials(ssid: String, password: String) {
-        val gatt = bluetoothGatt ?: return
-        val ssidBytes = ssid.toByteArray(Charsets.UTF_8)
-        val passBytes = password.toByteArray(Charsets.UTF_8)
-        require(ssidBytes.size <= 255) { "SSID too long" }
-        require(passBytes.size <= 255) { "Password too long" }
-        val payload = ByteArray(1 + 1 + ssidBytes.size + 1 + passBytes.size)
-        var i = 0
-        payload[i++] = BleConstants.OPCODE_SET_WIFI_CREDENTIALS
-        payload[i++] = ssidBytes.size.toByte()
-        ssidBytes.copyInto(payload, i); i += ssidBytes.size
-        payload[i++] = passBytes.size.toByte()
-        passBytes.copyInto(payload, i)
-        lastControlWrite = ControlWrite.DEVICE_SETTING
-        writeControl(gatt, payload)
-    }
-
-    /** Writes ENTER_OTA_MODE (no payload). */
-    fun enterOtaMode() {
-        val gatt = bluetoothGatt ?: return
-        lastControlWrite = ControlWrite.DEVICE_SETTING
-        writeControl(gatt, byteArrayOf(BleConstants.OPCODE_ENTER_OTA_MODE))
-    }
-
     @Suppress("DEPRECATION")
     @SuppressLint("MissingPermission")
     private fun writeControl(gatt: BluetoothGatt, payload: ByteArray) {

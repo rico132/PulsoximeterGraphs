@@ -43,7 +43,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.oxipulse.pulsoximetergraphs.data.ble.BleFirmwareUpdateClient
@@ -127,7 +126,7 @@ fun SettingsScreen(
     }
 }
 
-private val SETTINGS_TABS = listOf("Config", "OTA", "BLE Log", "Import")
+private val SETTINGS_TABS = listOf("Config", "Device", "BLE Log", "Import")
 
 @Composable
 private fun ConfigTab(
@@ -180,10 +179,6 @@ private fun ThresholdNumberField(label: String, value: Int, onValueChange: (Int)
 
 @Composable
 private fun DeviceSection(viewModel: SettingsViewModel, testModeEnabled: Boolean?) {
-    val connected = viewModel.isDeviceConnected()
-    var ssid by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
-
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Device", style = MaterialTheme.typography.titleMedium)
 
@@ -205,55 +200,6 @@ private fun DeviceSection(viewModel: SettingsViewModel, testModeEnabled: Boolean
                         onCheckedChange = { viewModel.setTestMode(it) },
                     )
                 }
-
-                HorizontalDivider()
-
-                Text("WiFi credentials (for OTA)")
-                OutlinedTextField(
-                    value = ssid,
-                    onValueChange = { ssid = it },
-                    label = { Text("SSID") },
-                    enabled = connected,
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it },
-                    label = { Text("Password") },
-                    enabled = connected,
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Button(
-                    onClick = { viewModel.setWifiCredentials(ssid, password) },
-                    enabled = connected && ssid.isNotBlank(),
-                ) {
-                    Text("Send WiFi credentials")
-                }
-
-                HorizontalDivider()
-
-                Text(
-                    "Bringing the ESP32 into OTA mode brings up WiFi (using stored " +
-                        "credentials, or a captive-portal AP if none are stored yet) so new " +
-                        "firmware can be flashed with `pio run -t upload --upload-port <ip>`.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                Button(
-                    onClick = { viewModel.enterOtaMode() },
-                    enabled = connected,
-                ) {
-                    Text("Enter OTA mode")
-                }
-
-                if (!connected) {
-                    Text(
-                        "Connect to the device (via a BLE sync) to enable these controls.",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
             }
         }
 
@@ -262,10 +208,9 @@ private fun DeviceSection(viewModel: SettingsViewModel, testModeEnabled: Boolean
 }
 
 /**
- * Firmware update over BLE — a from-scratch alternative to the WiFi/ArduinoOTA card above,
- * requiring no WiFi credentials at all: checks this repo's latest GitHub release for a firmware
- * asset, downloads it, and pushes it straight to the ESP32 over the same BLE link already used
- * for syncing (see [BleFirmwareUpdateClient] and PROTOCOL.md §"BLE firmware update"). Does not
+ * Firmware update over BLE: checks this repo's latest GitHub release for a firmware asset,
+ * downloads it, and pushes it straight to the ESP32 over the same BLE link already used for
+ * syncing (see [BleFirmwareUpdateClient] and PROTOCOL.md §"BLE firmware update"). Does not
  * require [DeviceSection]'s own `connected` (an active CSV sync) — it scans for and connects to
  * the device itself, independently, the moment "Check for update" is tapped.
  */

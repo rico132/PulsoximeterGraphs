@@ -11,7 +11,6 @@
 #include "BleFirmwareUpdater.h"
 #include "ClockSync.h"
 #include "ICsvBuffer.h"
-#include "OtaManager.h"
 #include "StoredRecordDownloader.h"
 #include "UsbHidOxHost.h"
 
@@ -19,14 +18,13 @@ class BleGattServer {
 public:
   BleGattServer(ICsvBuffer &csvBuffer, ClockSync &clockSync,
                StoredRecordDownloader &storedRecordDownloader,
-               OtaManager &otaManager, UsbHidOxHost &usbHost);
+               UsbHidOxHost &usbHost);
 
   void begin();
 
   // Generates a fresh random BLE pairing PIN and persists it to NVS — called
   // only from main.cpp's bare `blepin` serial debug signal, deliberately
-  // never reachable via any BLE opcode (same reasoning as
-  // OtaManager::setOtaPasswordFromSerial: a not-yet-paired attacker must
+  // never reachable via any BLE opcode (a not-yet-paired attacker must
   // never be able to set their own known PIN). No specific PIN can be
   // requested — same as the very first boot's provisioning, the value is
   // always randomly generated, never operator-chosen, so it can't be a
@@ -98,7 +96,6 @@ private:
   ICsvBuffer &csvBuffer_;
   ClockSync &clockSync_;
   StoredRecordDownloader &storedRecordDownloader_;
-  OtaManager &otaManager_;
   UsbHidOxHost &usbHost_;
   Preferences preferences_;
   BleFirmwareUpdater firmwareUpdater_;

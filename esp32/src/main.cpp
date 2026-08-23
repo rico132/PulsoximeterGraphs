@@ -13,8 +13,8 @@
 // since the device's single interrupt endpoint is used either for that
 // command/response exchange or for unsolicited live streaming, never both
 // at once — see StoredRecordDownloader's initial-handshake comment). loop()
-// stays idle except for pumping OtaManager's WiFi-idle timeout and a tiny
-// serial debug command for provisioning secrets.
+// stays idle except for a tiny serial debug command for regenerating the
+// BLE pairing PIN.
 //
 // IMPORTANT: hardware-in-the-loop validation still required. This firmware
 // has not been run against a physical PO-400 or ESP32-S3-USB-OTG board in
@@ -30,7 +30,6 @@
 #include "Config.h"
 #include "FileCsvBuffer.h"
 #include "ICsvBuffer.h"
-#include "OtaManager.h"
 #include "OtaRollbackGuard.h"
 #include "RamCsvBuffer.h"
 #include "StoredRecordDownloader.h"
@@ -47,7 +46,6 @@ UsbHidOxHost g_usbHost;
 // Constructed in setup(), once g_csvBuffer is known, to avoid binding a
 // reference to it before it points anywhere valid.
 StoredRecordDownloader *g_storedRecordDownloader = nullptr;
-OtaManager g_otaManager;
 OtaRollbackGuard g_otaRollbackGuard;
 BleGattServer *g_bleGattServer = nullptr;
 
@@ -112,23 +110,19 @@ void usbTask(void * /*param*/) {
   }
 }
 
-// Minimal serial debug commands for provisioning secrets. Per the plan's
-// security note (OTA password) and Config::kPrefsKeyBlePasskey's own comment
-// (BLE pairing PIN), both are deliberately ONLY settable this way — never
-// reachable via any BLE opcode, so a compromised phone/BLE link alone can
-// never push firmware or set its own known pairing PIN. Usage: type
-// `otapass <password>` then Enter, or a bare `blepin` (no argument — the new
-// PIN is always randomly generated, never operator-chosen, same as the very
-// first boot's own provisioning) then Enter.
+// Minimal serial debug command for regenerating the BLE pairing PIN. Per
+// Config::kPrefsKeyBlePasskey's own comment, this is deliberately ONLY
+// settable this way — never reachable via any BLE opcode, so a compromised
+// phone/BLE link alone can never set its own known pairing PIN. Usage: type
+// a bare `blepin` (no argument — the new PIN is always randomly generated,
+// never operator-chosen, same as the very first boot's own provisioning)
+// then Enter.
 void pollSerialDebugCommands() {
   static String line;
   while (Serial.available() > 0) {
     const char c = static_cast<char>(Serial.read());
     if (c == '\n' || c == '\r') {
-      if (line.startsWith("otapass ")) {
-        g_otaManager.setOtaPasswordFromSerial(
-            std::string(line.substring(8).c_str()));
-      } else if (line == "blepin") {
+      if (line == "blepin") {
         g_bleGattServer->regeneratePairingPasskey();
       }
       line = "";
@@ -184,11 +178,8 @@ void setup() {
   g_storedRecordDownloader = &storedRecordDownloader;
   g_storedRecordDownloader->begin();
 
-  g_otaManager.begin();
-
   static BleGattServer bleGattServer(*g_csvBuffer, g_clockSync,
-                                     *g_storedRecordDownloader, g_otaManager,
-                                     g_usbHost);
+                                     *g_storedRecordDownloader, g_usbHost);
   g_bleGattServer = &bleGattServer;
   g_bleGattServer->begin();
 
@@ -223,7 +214,6 @@ void setup() {
 }
 
 void loop() {
-  g_otaManager.loop();
   pollSerialDebugCommands();
   delay(10);
 }

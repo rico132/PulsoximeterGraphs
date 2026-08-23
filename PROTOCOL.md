@@ -57,8 +57,7 @@ subsequent reboot/power cycle unchanged), and prints it to its serial log on eve
 regenerated at any time by sending a bare `blepin` (no argument — a replacement PIN is always
 randomly generated, never operator-chosen, exactly like first-boot provisioning) over the serial
 debug console — deliberately never reachable via any BLE opcode, so a not-yet-paired attacker can
-never set their own known PIN (same reasoning as `SET_WIFI_CREDENTIALS`'s OTA password, which is
-serial-only for the identical reason). Regenerating the PIN only affects *future* pairings; phones
+never set their own known PIN. Regenerating the PIN only affects *future* pairings; phones
 already bonded are unaffected, since the PIN is only used during the initial pairing handshake.
 
 Once bonded, a phone reconnects automatically without re-pairing (the link's encryption keys are
@@ -72,20 +71,22 @@ cached by both sides) — the PIN only needs to be entered once per phone.
 | `0x02` | `SET_TIME` | 8 bytes, little-endian Unix epoch seconds | Phone pushes its current clock to the ESP32 (which has no RTC/NTP). Sent on every connection. |
 | `0x03` | `CLEAR_BUFFER` | none | Phone confirms it has durably stored the data it just received; ESP32 may discard its buffered copy, and (only with test mode off) deletes the matching records from the PO-400 itself. Must only be sent **after** a successful local insert. |
 | `0x04` | `SET_TEST_MODE` | 1 byte, `0x00` or `0x01` | When `0x01` (on), the ESP32 never deletes downloaded stored records from the PO-400. Persisted in NVS. **Defaults to `0x01` (on/non-destructive)** until explicitly turned off. |
-| `0x05` | `SET_WIFI_CREDENTIALS` | `[ssidLen:u8][ssid bytes][passLen:u8][pass bytes]` | Configure WiFi STA credentials for OTA, stored via WiFiManager's NVS storage. |
-| `0x06` | `ENTER_OTA_MODE` | none | Ask the ESP32 to bring up WiFi (using stored credentials, or a captive portal if none stored) and start `ArduinoOTA`, so a `pio run -t upload --upload-port <ip>` can flash new firmware. WiFi auto-tears-down after an idle timeout. |
 | `0x07` | `START_FIRMWARE_UPDATE` | `[size:u32 LE][expectedMd5Hex:32 ASCII bytes]` | Begin receiving a new firmware image into the ESP32's *inactive* OTA partition — see "BLE firmware update" below. Refused (result reported immediately, see the Status characteristic below) if a USB stored-record download is in progress, or an update is already under way. |
 | `0x08` | `FINISH_FIRMWARE_UPDATE` | none | Sent once exactly `size` bytes have been written to the Firmware characteristic. Verifies size + MD5 and, **only on success**, switches the boot partition to the new image and reboots. |
 | `0x09` | `ABORT_FIRMWARE_UPDATE` | none | Discards an in-progress firmware update without touching the boot partition. |
 
+`0x05` and `0x06` used to be `SET_WIFI_CREDENTIALS`/`ENTER_OTA_MODE`, driving a WiFiManager +
+`ArduinoOTA` WiFi update path — removed now that BLE firmware update below is the only
+firmware-update mechanism. Deliberately left unassigned rather than reused.
+
 ### BLE firmware update (OTA over BLE)
 
-An alternative to `ENTER_OTA_MODE`'s WiFi/`ArduinoOTA` path above, requiring no WiFi credentials
-at all: the phone downloads a firmware image (see "Firmware release asset" below) and pushes it
-directly over the same BLE link already used for CSV syncs. Uses the exact same dual-partition
-OTA mechanism `ArduinoOTA` already relies on (`app0`/`app1` in `esp32/partitions_8MB.csv`, via
-Arduino-ESP32's `Update` library/`esp_ota_*`): the image is written entirely into the *inactive*
-partition while the current firmware keeps running from the active one, and the boot partition is
+The phone downloads a firmware image (see "Firmware release asset" below) and pushes it directly
+over the same BLE link already used for CSV syncs — no WiFi credentials or separate network of
+any kind involved. Uses ESP32's dual-partition OTA mechanism (`app0`/`app1` in
+`esp32/partitions_8MB.csv`, via Arduino-ESP32's `Update` library/`esp_ota_*`): the image is
+written entirely into the *inactive* partition while the current firmware keeps running from the
+active one, and the boot partition is
 flipped to the new image **only if `Update::end()` considers the write completely valid** (right
 size, matching MD5) — a failed or abandoned update leaves the currently-running, already-proven-
 bootable firmware completely untouched.

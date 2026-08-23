@@ -11,12 +11,12 @@ FileCsvBuffer::~FileCsvBuffer() = default;
 void FileCsvBuffer::refreshRemainingCapacity() {
   // Actual free space on the partition, minus a safety margin for
   // LittleFS's own metadata/wear-leveling overhead and any other files
-  // sharing it (WiFiManager config, OTA staging, ...) — not a fixed
-  // compile-time row count. A hardcoded cap previously left hundreds of KB
-  // of real free space unused while still silently discarding rows once
-  // hit; see appendRow()'s own "CSV buffer full" comment for why that
-  // matters, and Config::kFilesystemFreeSpaceSafetyMarginBytes' comment for
-  // the margin itself.
+  // sharing it — not a fixed compile-time row count. A hardcoded cap
+  // previously left hundreds of KB of real free space unused while still
+  // silently discarding rows once hit; see appendRow()'s own "CSV buffer
+  // full" comment for why that matters, and
+  // Config::kFilesystemFreeSpaceSafetyMarginBytes' comment for the margin
+  // itself.
   const size_t totalBytes = LittleFS.totalBytes();
   const size_t usedBytes = LittleFS.usedBytes();
   const size_t margin = Config::kFilesystemFreeSpaceSafetyMarginBytes;

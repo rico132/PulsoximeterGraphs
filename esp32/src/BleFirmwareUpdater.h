@@ -1,8 +1,8 @@
 // BleFirmwareUpdater.h — thin wrapper around Arduino-ESP32's Update library (esp_ota_* under
-// the hood) driven entirely from BLE writes, so a phone can flash new firmware without WiFi
-// (see OtaManager for the existing WiFi/ArduinoOTA path this is an alternative to, not a
-// replacement for). Uses the exact same dual-partition OTA mechanism ArduinoOTA already relies
-// on (see partitions_8MB.csv's app0/app1 slots): a new image is written entirely into the
+// the hood) driven entirely from BLE writes, so a phone can flash new firmware without WiFi or
+// USB — this is the device's only firmware-update mechanism (a prior WiFiManager/ArduinoOTA
+// path has been removed). Uses ESP32's dual-partition OTA mechanism (see partitions_8MB.csv's
+// app0/app1 slots): a new image is written entirely into the
 // *inactive* partition while the current firmware keeps running from the active one, and
 // Update::end()'s own success check is what flips esp_ota_set_boot_partition() to the new
 // image — never before, and never at all if verification fails. A device stuck on a bad image

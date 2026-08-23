@@ -14,8 +14,8 @@ RamCsvBuffer::~RamCsvBuffer() {
 bool RamCsvBuffer::begin() {
   // Use as much of the largest free PSRAM block as is actually available,
   // minus a safety margin reserved for whatever else might still need to
-  // allocate PSRAM later (NimBLE, WiFiManager, OTA — all of which begin()
-  // after this call in main.cpp's setup()) — rather than a fixed
+  // allocate PSRAM later (NimBLE, which begins() after this call in
+  // main.cpp's setup()) — rather than a fixed
   // compile-time size. A hardcoded cap previously left hundreds of KB of
   // real free space unused while still silently discarding rows once hit;
   // see Config::kPsramArenaSafetyMarginBytes' comment for the margin
