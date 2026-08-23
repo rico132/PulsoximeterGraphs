@@ -39,6 +39,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -188,9 +189,19 @@ private fun DeviceSection(viewModel: SettingsViewModel, testModeEnabled: Boolean
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Column {
+                    // weight(1f) is load-bearing, not decorative: without it, this Column (an
+                    // unweighted child in a Row with a fixed-size Switch alongside it) was free
+                    // to claim the *entire* row width for its own two lines of text, leaving no
+                    // guaranteed space for the Switch at all — it got laid out past the Card's
+                    // right edge, clipped there (so part of it looked cut off), and, being
+                    // positioned outside the Card's own clip bounds, mostly or entirely outside
+                    // its tappable area too (so it couldn't actually be toggled). Weighting this
+                    // Column instead reserves the Switch's fixed width first and constrains the
+                    // text to whatever's left, which is exactly what keeps it on-screen and
+                    // tappable regardless of how long the description text is.
+                    Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
                         Text("Test mode")
                         Text(
                             "When on, the ESP32 never deletes downloaded stored records.",
