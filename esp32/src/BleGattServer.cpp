@@ -176,25 +176,6 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
     otaManager_.enterOtaMode();
     break;
 
-  case Config::kOpResyncFromDevice:
-    if (storedRecordDownloader_.downloadInProgress()) {
-      // Already effectively doing this (e.g. a real attach is mid-download,
-      // or an earlier RESYNC_FROM_DEVICE this same connection already
-      // kicked it off) — triggering a second overlapping run would just
-      // waste USB airtime re-enumerating records the first run either
-      // already re-committed or is about to.
-      Serial.println("BleGattServer: RESYNC_FROM_DEVICE received while a "
-                     "download is already in progress — ignoring.");
-      break;
-    }
-    Serial.println(
-        "BleGattServer: RESYNC_FROM_DEVICE received — forgetting which "
-        "records were already committed and re-triggering a fresh USB "
-        "download from the still-attached device.");
-    storedRecordDownloader_.resetCommittedRecords();
-    usbHost_.triggerAttachCallback();
-    break;
-
   default:
     Serial.printf("BleGattServer: unknown control opcode 0x%02X ignored.\n",
                  opcode);
@@ -205,6 +186,31 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
 void BleGattServer::requestDataDump() {
   if (!connected_ || !dataChar_ || !server_) {
     return;
+  }
+
+  // Every REQUEST_DATA asks the still-attached device for a truly fresh
+  // download rather than trusting whatever's already sitting in the buffer
+  // from an earlier attach/session — forgets which records were already
+  // committed (see resetCommittedRecords()'s own comment; their rows may
+  // well have already been cleared out of the buffer by an earlier
+  // CLEAR_BUFFER) and fires the same attach callback a real unplug/replug
+  // would, without requiring one. The phone dedupes against its own
+  // database instead (see ReadingsRepository.importCsv), so re-sending
+  // everything the device still has every time is safe — simpler, and far
+  // less fragile, than this firmware trying to track "what's actually new
+  // since last time" itself. Skipped if a download is already happening
+  // (e.g. a real attach raced this) rather than triggering a redundant
+  // second one on top of it.
+  if (!storedRecordDownloader_.downloadInProgress()) {
+    storedRecordDownloader_.resetCommittedRecords();
+    usbHost_.triggerAttachCallback();
+    // triggerAttachCallback() only signals usbTask (a separate FreeRTOS
+    // task) to start — briefly yield so it actually gets to wake up and
+    // flip downloadInProgress() to true before the check just below, or
+    // this would instead see "nothing in progress yet" and fall straight
+    // through to dumping whatever was in the buffer *before* this trigger,
+    // missing everything the fresh download is about to add.
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 
   // If a USB stored-record download is still in progress, wait for it

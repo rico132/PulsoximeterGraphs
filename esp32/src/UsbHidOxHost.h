@@ -81,12 +81,16 @@ public:
 
   // Fires the same callback a real USB attach event would, without requiring
   // the PO-400 to actually be unplugged and replugged — used by
-  // BleGattServer's RESYNC_FROM_DEVICE opcode so a phone that's lost its own
-  // local copy (e.g. app data cleared) can ask for a fresh full re-download
-  // of whatever the device still has. Safe to call even with nothing
-  // attached: the resulting downloadAndMaybeDelete() run will simply fail on
-  // its first USB exchange, exactly as it would for a real attach callback
-  // firing spuriously, and is reported as a failure the same way.
+  // BleGattServer::requestDataDump() so every REQUEST_DATA re-downloads
+  // fresh from the still-attached device instead of trusting whatever was
+  // already sitting in the relay buffer (the phone dedupes against its own
+  // database — see ReadingsRepository.importCsv on the Android side — so
+  // this is also what lets a phone recover after its own local copy is
+  // lost, e.g. app data cleared, with no separate "resync" action needed).
+  // Safe to call even with nothing attached: the resulting
+  // downloadAndMaybeDelete() run will simply fail on its first USB
+  // exchange, exactly as it would for a real attach callback firing
+  // spuriously, and is reported as a failure the same way.
   void triggerAttachCallback() {
     if (attachCallback_) {
       attachCallback_();

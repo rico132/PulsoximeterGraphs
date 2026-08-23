@@ -16,9 +16,23 @@ import kotlinx.coroutines.withContext
 class ReadingsRepository(private val readingDao: ReadingDao) {
 
     /**
-     * Parses [csvText] with [CsvParser] and inserts every valid row (REPLACE-dedup'd by
-     * timestamp). Returns the parse result so callers (e.g. [com.oxipulse.pulsoximetergraphs.data.ble.BleGattClient])
-     * know it's safe to proceed (e.g. write CLEAR_BUFFER) only once this suspend call returns.
+     * Parses [csvText] with [CsvParser], drops any row whose timestamp is already in the
+     * database, and inserts the rest. Returns [CsvParser.ParseResult] with [readings][CsvParser
+     * .ParseResult.readings] narrowed down to only what was actually newly inserted — so callers
+     * (e.g. [com.oxipulse.pulsoximetergraphs.data.ble.BleGattClient]) report "N rows synced" for
+     * rows genuinely new to this database, not the size of whatever CSV happened to arrive.
+     * [skippedRowCount][CsvParser.ParseResult.skippedRowCount]/[totalDataRowCount][CsvParser
+     * .ParseResult.totalDataRowCount] are untouched — they describe the raw CSV's own parse
+     * quality (malformed rows), a separate concern from which *valid* rows were already known.
+     *
+     * The explicit pre-check (rather than just letting [ReadingDao.insertAll]'s
+     * REPLACE-on-conflict silently overwrite duplicates, which would still leave the database
+     * itself correct) matters because every BLE sync now re-sends the ESP32's *entire* stored
+     * history on every `REQUEST_DATA` (see PROTOCOL.md) rather than just what changed since the
+     * last sync — without this, "rows synced" would report the device's whole history's size on
+     * every single sync instead of what's actually new since last time.
+     *
+     * Callers must still only proceed (e.g. write CLEAR_BUFFER) once this suspend call returns.
      */
     suspend fun importCsv(csvText: String): CsvParser.ParseResult {
         // CsvParser.parse is plain CPU-bound work (regex split + date/time parsing per row), so
@@ -26,10 +40,20 @@ class ReadingsRepository(private val readingDao: ReadingDao) {
         // file would otherwise freeze the UI for the whole parse instead of just showing a
         // progress state.
         val result = withContext(Dispatchers.Default) { CsvParser.parse(csvText) }
-        if (result.readings.isNotEmpty()) {
-            readingDao.insertAll(result.readings)
+        if (result.readings.isEmpty()) {
+            return result
         }
-        return result
+        val newReadings = withContext(Dispatchers.Default) {
+            val existing = readingDao.existingTimestampsInRange(
+                result.readings.minOf { it.timestampEpochSec },
+                result.readings.maxOf { it.timestampEpochSec },
+            ).toHashSet()
+            result.readings.filterNot { it.timestampEpochSec in existing }
+        }
+        if (newReadings.isNotEmpty()) {
+            readingDao.insertAll(newReadings)
+        }
+        return result.copy(readings = newReadings)
     }
 
     fun observeRange(range: ClosedRange<Instant>): Flow<List<ReadingEntity>> =

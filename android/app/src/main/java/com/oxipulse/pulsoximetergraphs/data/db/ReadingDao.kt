@@ -31,4 +31,22 @@ interface ReadingDao {
 
     @Query("SELECT COUNT(*) FROM readings")
     suspend fun count(): Int
+
+    /**
+     * Every already-stored timestamp within `[startEpochSec, endEpochSec]` — used by
+     * [com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository.importCsv] to drop
+     * incoming rows that already exist rather than relying on [insertAll]'s REPLACE conflict
+     * strategy to silently overwrite them, so a re-sync's "N rows synced" count reflects rows
+     * actually new to this database, not every row the ESP32 happened to resend. A single range
+     * scan against this table's own primary-key index, rather than one query per incoming
+     * timestamp — immune to SQLite's ~999-bound-parameter ceiling that a plain
+     * `WHERE timestampEpochSec IN (:allIncomingTimestamps)` would hit once a resync's CSV spans
+     * more rows than that (see PROTOCOL.md: every `REQUEST_DATA` now resends the device's entire
+     * history, not just what's new).
+     */
+    @Query(
+        "SELECT timestampEpochSec FROM readings " +
+            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec"
+    )
+    suspend fun existingTimestampsInRange(startEpochSec: Long, endEpochSec: Long): List<Long>
 }

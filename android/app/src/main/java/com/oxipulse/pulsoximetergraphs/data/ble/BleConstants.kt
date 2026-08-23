@@ -42,15 +42,6 @@ object BleConstants {
     /** No payload — ESP32 brings up WiFi and starts ArduinoOTA. */
     const val OPCODE_ENTER_OTA_MODE: Byte = 0x06
 
-    /**
-     * No payload — forgets which stored records this device-pairing already delivered and
-     * re-downloads everything fresh from the still-attached PO-400 over USB, into the ESP32's
-     * own relay buffer only (never touches the PO-400's own onboard storage). For recovering
-     * after this app's own local copy is lost (e.g. app data cleared) — see [BleGattClient
-     * .resyncFromDevice].
-     */
-    const val OPCODE_RESYNC_FROM_DEVICE: Byte = 0x07
-
     /** End-of-transfer marker on the Data characteristic: exactly one 0x00 byte. */
     val DATA_TERMINATOR: ByteArray = byteArrayOf(0x00)
 

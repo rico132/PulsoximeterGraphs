@@ -42,13 +42,12 @@ ESP32 = peripheral/server. Phone = central/client. Advertised device name: `Puls
 
 | Opcode | Name | Payload | Meaning |
 |---|---|---|---|
-| `0x01` | `REQUEST_DATA` | none | Ask the ESP32 to stream all currently-buffered CSV rows over the Data characteristic. |
+| `0x01` | `REQUEST_DATA` | none | Ask the ESP32 to re-download everything the still-attached PO-400 currently has (as if it had just been plugged in again) and stream all of it over the Data characteristic — see "Recommended sync sequence" below for why re-sending everything every time is deliberate, not a fixed-size incremental dump. |
 | `0x02` | `SET_TIME` | 8 bytes, little-endian Unix epoch seconds | Phone pushes its current clock to the ESP32 (which has no RTC/NTP). Sent on every connection. |
 | `0x03` | `CLEAR_BUFFER` | none | Phone confirms it has durably stored the data it just received; ESP32 may discard its buffered copy. Must only be sent **after** a successful local insert. |
 | `0x04` | `SET_TEST_MODE` | 1 byte, `0x00` or `0x01` | When `0x01` (on), the ESP32 never deletes downloaded stored records from the PO-400. Persisted in NVS. **Defaults to `0x01` (on/non-destructive)** until explicitly turned off. |
 | `0x05` | `SET_WIFI_CREDENTIALS` | `[ssidLen:u8][ssid bytes][passLen:u8][pass bytes]` | Configure WiFi STA credentials for OTA, stored via WiFiManager's NVS storage. |
 | `0x06` | `ENTER_OTA_MODE` | none | Ask the ESP32 to bring up WiFi (using stored credentials, or a captive portal if none stored) and start `ArduinoOTA`, so a `pio run -t upload --upload-port <ip>` can flash new firmware. WiFi auto-tears-down after an idle timeout. |
-| `0x07` | `RESYNC_FROM_DEVICE` | none | Forget which stored records this device-pairing already delivered and re-download everything fresh from the still-attached PO-400, as if it had just been plugged in again — without physically unplugging it. For recovering after the phone's own local copy is lost (e.g. app data cleared): CLEAR_BUFFER's crash-safety guarantee only covers "the phone hasn't confirmed receipt yet", not "the phone later discarded its own already-confirmed copy" — by then the ESP32's relay buffer is correctly already empty, so a plain `REQUEST_DATA` alone returns nothing. Only re-downloads (via USB) into the ESP32's own relay buffer; never deletes anything from the PO-400 itself. |
 
 ### Data characteristic (notify)
 
@@ -83,12 +82,25 @@ compatible and the common case needs no header at all.
 
 1. Connect, discover services, request MTU 503.
 2. Write `SET_TIME` (always, every connection).
-3. Write `REQUEST_DATA`.
+3. Write `REQUEST_DATA`. The ESP32 re-downloads everything the PO-400 currently has over USB
+   before streaming any of it — see `REQUEST_DATA`'s own table entry — which can take a while
+   (the ESP32 waits up to 5 minutes internally); size any client-side inactivity timeout
+   accordingly, and re-arm it on every Data notification, not just once at the start.
 4. Reassemble Data notifications until the `0x00` terminator; parse the CSV blob.
-5. Only after the local insert succeeds, write `CLEAR_BUFFER`.
+5. **Drop any row whose timestamp already exists locally before inserting the rest** — every
+   `REQUEST_DATA` returns the PO-400's *entire* current stored history, not just what's new
+   since the last sync (the ESP32 keeps no notion of "already delivered" across syncs at all;
+   test mode, on by default, is what keeps that history sitting on the device in the first
+   place). Deduplicating here, not on the ESP32, is deliberate: it's the phone's own database
+   that authoritatively knows what it already has, including after e.g. the app's local data
+   being cleared and needing everything back — a case the ESP32 alone has no way to detect.
+6. Only after the local insert succeeds, write `CLEAR_BUFFER`.
 
 This ordering is what makes the protocol crash-safe: if the phone dies mid-insert, the
-ESP32 still has the data next time.
+ESP32 still has the data next time. `CLEAR_BUFFER` itself is a pure housekeeping step — it lets
+the ESP32 reclaim buffer space now that this transfer is confirmed durably stored — not a
+"never send this again" marker; the very next `REQUEST_DATA`, from this or any other phone,
+will include everything the PO-400 still has regardless of what's already been cleared before.
 
 ## Threshold config defaults
 
