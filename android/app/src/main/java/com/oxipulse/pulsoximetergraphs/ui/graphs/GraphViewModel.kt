@@ -26,7 +26,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 private val EMPTY_STATS = ReadingStats(
-    minSpo2 = null, maxSpo2 = null, avgSpo2 = null, p95Spo2 = null,
+    minSpo2 = null, maxSpo2 = null, avgSpo2 = null, p95Spo2 = null, spo2EventCount = null,
     minPulse = null, maxPulse = null, avgPulse = null, p95Pulse = null,
 )
 
@@ -41,6 +41,33 @@ private fun percentile95(values: List<Int>): Int? {
     val sorted = values.sorted()
     val index = (ceil(sorted.size * 0.95).toInt() - 1).coerceIn(0, sorted.size - 1)
     return sorted[index]
+}
+
+/** A desaturation "event" is defined against this SpO2 percentage — see [countSpo2Events]. */
+const val SPO2_EVENT_THRESHOLD_PERCENT = 94
+
+/**
+ * Number of separate desaturation events: maximal contiguous runs of consecutive readings with
+ * SpO2 below [SPO2_EVENT_THRESHOLD_PERCENT]. This counts run *starts*, not total below-threshold
+ * readings — e.g. SpO2 dipping to 90, recovering to 96, then dipping to 92 again is 2 events, not
+ * one long one and not a raw count of below-threshold samples. [values] must already be in
+ * chronological order (same requirement as [percentile95]'s input, satisfied by [readings] being
+ * sorted ascending by timestamp — see ReadingDao's `ORDER BY timestampEpochSec ASC`), since unlike
+ * percentile95 the result genuinely depends on sequence, not just the multiset of values. Null
+ * (not 0) when there's no data at all, consistent with every other field in [ReadingStats].
+ */
+private fun countSpo2Events(values: List<Int>): Int? {
+    if (values.isEmpty()) return null
+    var eventCount = 0
+    var inEvent = false
+    for (value in values) {
+        val belowThreshold = value < SPO2_EVENT_THRESHOLD_PERCENT
+        if (belowThreshold && !inEvent) {
+            eventCount++
+        }
+        inEvent = belowThreshold
+    }
+    return eventCount
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -68,10 +95,11 @@ class GraphViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     /**
-     * min/max/avg come from the DAO's SQL aggregate query; p95Spo2/p95Pulse are computed in
-     * Kotlin from [readings] itself (the same, already-loaded rows for this exact range) rather
-     * than by the query, since percentile support isn't reliably available across the SQLite
-     * versions this app's supported Android versions ship with — see ReadingStats's own doc.
+     * min/max/avg come from the DAO's SQL aggregate query; p95Spo2/p95Pulse/spo2EventCount are
+     * computed in Kotlin from [readings] itself (the same, already-loaded rows for this exact
+     * range) rather than by the query, since percentile support isn't reliably available across
+     * the SQLite versions this app's supported Android versions ship with, and event counting
+     * needs sequence order anyway — see ReadingStats's own doc.
      */
     val stats: StateFlow<ReadingStats> = combine(selectedRange, readings) { range, currentReadings ->
         range to currentReadings
@@ -80,6 +108,7 @@ class GraphViewModel(
             readingsRepository.statsForRange(range).copy(
                 p95Spo2 = percentile95(currentReadings.map { it.spo2 }),
                 p95Pulse = percentile95(currentReadings.map { it.pulse }),
+                spo2EventCount = countSpo2Events(currentReadings.map { it.spo2 }),
             )
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), EMPTY_STATS)

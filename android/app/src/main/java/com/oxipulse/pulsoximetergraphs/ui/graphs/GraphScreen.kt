@@ -429,6 +429,8 @@ private fun StatsPanel(range: ClosedRange<Instant>, stats: ReadingStats) {
             HorizontalDivider()
             Text("Stats", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             StatsTable(stats)
+            HorizontalDivider()
+            EventsRow(stats)
         }
     }
 }
@@ -467,6 +469,29 @@ private fun StatsTable(stats: ReadingStats) {
             max = stats.maxPulse?.toString() ?: "–",
             avg = stats.avgPulse?.let { "%.1f".format(it) } ?: "–",
             p95 = stats.p95Pulse?.toString() ?: "–",
+        )
+    }
+}
+
+/**
+ * A single desaturation-event count, shown as its own row rather than folded into [StatsTable]:
+ * it's one number, not a min/max/avg/p95 tuple, so it doesn't fit that table's fixed 4-column
+ * shape — see [countSpo2Events]'s own doc for exactly what counts as one event.
+ */
+@Composable
+private fun EventsRow(stats: ReadingStats) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(
+            "Events (SpO2 < $SPO2_EVENT_THRESHOLD_PERCENT%)",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Text(
+            stats.spo2EventCount?.toString() ?: "–",
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Bold,
         )
     }
 }
