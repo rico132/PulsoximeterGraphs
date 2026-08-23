@@ -3,14 +3,18 @@
 // setup() constructs everything and starts two FreeRTOS tasks: the BLE send
 // task (started inside BleGattServer::begin(), dedicated to the REQUEST_DATA
 // dump so it never blocks the NimBLE write callback) and the USB task below
-// (owns the PO-400 lifecycle: on every attach, download+maybe-delete any
-// stored records — that's the only thing the PO-400's USB link is used for;
-// there is no live-measurement mode, since the device's single interrupt
-// endpoint is used either for that command/response exchange or for
-// unsolicited live streaming, never both at once — see
-// StoredRecordDownloader's initial-handshake comment). loop() stays idle
-// except for pumping OtaManager's WiFi-idle timeout and a tiny serial debug
-// command for provisioning the OTA password.
+// — the only task allowed to talk to the PO-400 over USB at all, woken by
+// either of two independent signals (see g_usbTaskEvents): a fresh attach,
+// which downloads any stored records into the CSV buffer, or the phone
+// confirming (CLEAR_BUFFER) it has durably received everything currently in
+// that buffer, which deletes the matching records from the device — but
+// only once, and only if, test mode is off (Config::kDefaultTestMode's own
+// "never destroy real data" default). There is no live-measurement mode,
+// since the device's single interrupt endpoint is used either for that
+// command/response exchange or for unsolicited live streaming, never both
+// at once — see StoredRecordDownloader's initial-handshake comment). loop()
+// stays idle except for pumping OtaManager's WiFi-idle timeout and a tiny
+// serial debug command for provisioning secrets.
 //
 // IMPORTANT: hardware-in-the-loop validation still required. This firmware
 // has not been run against a physical PO-400 or ESP32-S3-USB-OTG board in
@@ -19,6 +23,7 @@
 
 #include <Arduino.h>
 #include <esp_task_wdt.h>
+#include <freertos/event_groups.h>
 
 #include "BleGattServer.h"
 #include "ClockSync.h"
@@ -44,45 +49,63 @@ StoredRecordDownloader *g_storedRecordDownloader = nullptr;
 OtaManager g_otaManager;
 BleGattServer *g_bleGattServer = nullptr;
 
-SemaphoreHandle_t g_usbAttachSignal = nullptr;
+// Two independent reasons usbTask needs to wake up and do USB work — an
+// EventGroup rather than a plain binary semaphore because either can fire
+// (and need handling) on its own, and both must run on this one task, since
+// it's the only one allowed to talk to the PO-400 over USB at all (a
+// download and a delete running concurrently on separate tasks would race
+// over the same USB interface).
+EventGroupHandle_t g_usbTaskEvents = nullptr;
+constexpr EventBits_t kUsbAttachBit = BIT0;
+constexpr EventBits_t kUsbDeletePendingBit = BIT1;
 
 void usbTask(void * /*param*/) {
   for (;;) {
-    if (xSemaphoreTake(g_usbAttachSignal, portMAX_DELAY) != pdTRUE) {
-      continue;
-    }
-    Serial.println("UsbTask: PO-400 attached.");
+    const EventBits_t bits = xEventGroupWaitBits(
+        g_usbTaskEvents, kUsbAttachBit | kUsbDeletePendingBit,
+        /*clearOnExit=*/pdTRUE, /*waitForAllBits=*/pdFALSE, portMAX_DELAY);
 
-    // Stored-record download (Auto/Manual) is the only thing this task
-    // does per attach — feeds the same ICsvBuffer, per the plan's
-    // "Stored-record download" section. Whatever the outcome, this task
-    // then just waits for the next attach signal (see onDetach() below for
-    // the actual "unplugged" log line — there's no wait-for-detach loop
-    // here since there's nothing left to do while the device stays
-    // attached).
-    //
-    // Subscribed to the task watchdog only for this call's duration — not
-    // during the idle wait above, not during the (separate-task) BLE dump
-    // afterward, both of which previously caused false-positive reboots
-    // when this was subscribed for usbTask's whole lifetime. Real hardware
-    // has shown a rare, still-unexplained hang inside
-    // UsbHidOxHost::readReport()'s otherwise-3s-bounded wait — not a
-    // scheduling/Serial/BLE issue (all ruled out); most likely a fault in
-    // the underlying "beta" usb_host.h driver itself, per its own header's
-    // warning. Test mode keeps every record on the device, so a reboot
-    // here is safe: the next attach just retries the whole download fresh,
-    // which empirically does eventually succeed.
-    esp_task_wdt_add(nullptr);
-    const bool downloadOk = g_storedRecordDownloader->downloadAndMaybeDelete();
-    esp_task_wdt_delete(nullptr);
-    if (!downloadOk) {
-      Serial.println(
-          "UsbTask: stored-record download failed or device detached "
-          "during it.");
-    } else {
-      Serial.println(
-          "UsbTask: stored-record download complete; nothing more to do "
-          "until the device is unplugged.");
+    if (bits & kUsbAttachBit) {
+      Serial.println("UsbTask: PO-400 attached.");
+
+      // Stored-record download (Auto/Manual) is the only thing this task
+      // does per attach — feeds the same ICsvBuffer, per the plan's
+      // "Stored-record download" section. Whatever the outcome, this task
+      // then just waits for the next signal (see onDetach() below for the
+      // actual "unplugged" log line — there's no wait-for-detach loop here
+      // since there's nothing left to do while the device stays attached).
+      //
+      // Subscribed to the task watchdog only for this call's duration — not
+      // during the idle wait above, not during the (separate-task) BLE dump
+      // afterward, both of which previously caused false-positive reboots
+      // when this was subscribed for usbTask's whole lifetime. Real
+      // hardware has shown a rare, still-unexplained hang inside
+      // UsbHidOxHost::readReport()'s otherwise-3s-bounded wait — not a
+      // scheduling/Serial/BLE issue (all ruled out); most likely a fault in
+      // the underlying "beta" usb_host.h driver itself, per its own
+      // header's warning. Test mode keeps every record on the device, so a
+      // reboot here is safe: the next attach just retries the whole
+      // download fresh, which empirically does eventually succeed.
+      esp_task_wdt_add(nullptr);
+      const bool downloadOk = g_storedRecordDownloader->downloadAndMaybeDelete();
+      esp_task_wdt_delete(nullptr);
+      if (!downloadOk) {
+        Serial.println(
+            "UsbTask: stored-record download failed or device detached "
+            "during it.");
+      } else {
+        Serial.println(
+            "UsbTask: stored-record download complete; nothing more to do "
+            "until the device is unplugged.");
+      }
+    }
+
+    if (bits & kUsbDeletePendingBit) {
+      // See StoredRecordDownloader::deleteConfirmedRecords()'s own comment
+      // — a no-op unless test mode is off and something's actually pending.
+      esp_task_wdt_add(nullptr);
+      g_storedRecordDownloader->deleteConfirmedRecords();
+      esp_task_wdt_delete(nullptr);
     }
   }
 }
@@ -155,7 +178,7 @@ void setup() {
   g_bleGattServer = &bleGattServer;
   g_bleGattServer->begin();
 
-  g_usbAttachSignal = xSemaphoreCreateBinary();
+  g_usbTaskEvents = xEventGroupCreate();
   // Pinned to core 1 (Arduino's own loop()/setup() core), deliberately
   // apart from UsbHidOxHost's "usbHostLib" task (core 0, see its own
   // comment) — that task's tight, higher-priority USB event-poll loop
@@ -165,9 +188,18 @@ void setup() {
   xTaskCreatePinnedToCore(usbTask, "usbTask", 8192, nullptr,
                          tskIDLE_PRIORITY + 1, nullptr, 1);
 
-  g_usbHost.onAttach([]() { xSemaphoreGive(g_usbAttachSignal); });
+  g_usbHost.onAttach(
+      []() { xEventGroupSetBits(g_usbTaskEvents, kUsbAttachBit); });
   g_usbHost.onDetach([]() { Serial.println("UsbTask: PO-400 detached."); });
   g_usbHost.begin();
+
+  // See StoredRecordDownloader::onDeleteRequested()'s own comment: wakes
+  // usbTask (the only task allowed to talk to the PO-400 over USB) rather
+  // than deleteConfirmedRecords() running on the NimBLE host thread that
+  // requested it, or only ever running whenever the next real attach
+  // happens to occur.
+  g_storedRecordDownloader->onDeleteRequested(
+      []() { xEventGroupSetBits(g_usbTaskEvents, kUsbDeletePendingBit); });
 
   Serial.println("PulsoxRelay firmware ready.");
 }

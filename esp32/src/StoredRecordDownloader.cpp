@@ -1164,13 +1164,11 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
         "StoredRecordDownloader: all %u Auto record(s) downloaded.\n",
         recordsDownloaded);
 
-    if (!testModeEnabled_) {
-      Serial.println(
-          "StoredRecordDownloader: deleting Auto records from device.");
-      sendExchange(Config::kCmdDeleteRecordsAuto,
-                  sizeof(Config::kCmdDeleteRecordsAuto),
-                  /*writeChecksumLen=*/0, nullptr, 0,
-                  /*readChecksumLen=*/0);
+    // Not deleted here — only marked as now eligible for it. See
+    // deleteConfirmedRecords()'s own comment for why actual deletion waits
+    // for the phone's CLEAR_BUFFER confirmation instead.
+    if (!records.empty()) {
+      pendingAutoDelete_ = true;
     }
   } else {
     uint8_t meta[14] = {0};
@@ -1213,21 +1211,43 @@ bool StoredRecordDownloader::downloadAndMaybeDelete() {
     }
     Serial.println("StoredRecordDownloader: Manual record downloaded.");
 
-    if (!testModeEnabled_) {
-      Serial.println(
-          "StoredRecordDownloader: deleting Manual record from device.");
-      sendExchange(Config::kCmdDeleteRecordManual0,
-                  sizeof(Config::kCmdDeleteRecordManual0),
-                  /*writeChecksumLen=*/0, nullptr, 0,
-                  /*readChecksumLen=*/0);
-      sendExchange(Config::kCmdDeleteRecordManual1,
-                  sizeof(Config::kCmdDeleteRecordManual1),
-                  /*writeChecksumLen=*/0, nullptr, 0,
-                  /*readChecksumLen=*/0);
-    }
+    // Not deleted here — see deleteConfirmedRecords()'s own comment for why
+    // actual deletion waits for the phone's CLEAR_BUFFER confirmation
+    // instead of happening immediately after download.
+    pendingManualDelete_ = true;
   }
 
   return true;
+}
+
+void StoredRecordDownloader::deleteConfirmedRecords() {
+  if (testModeEnabled_) {
+    return; // Config::kDefaultTestMode's own "never destroy real data" default.
+  }
+  if (pendingAutoDelete_) {
+    Serial.println(
+        "StoredRecordDownloader: phone confirmed receipt — deleting Auto "
+        "records from device.");
+    sendExchange(Config::kCmdDeleteRecordsAuto,
+                sizeof(Config::kCmdDeleteRecordsAuto),
+                /*writeChecksumLen=*/0, nullptr, 0,
+                /*readChecksumLen=*/0);
+    pendingAutoDelete_ = false;
+  }
+  if (pendingManualDelete_) {
+    Serial.println(
+        "StoredRecordDownloader: phone confirmed receipt — deleting Manual "
+        "record from device.");
+    sendExchange(Config::kCmdDeleteRecordManual0,
+                sizeof(Config::kCmdDeleteRecordManual0),
+                /*writeChecksumLen=*/0, nullptr, 0,
+                /*readChecksumLen=*/0);
+    sendExchange(Config::kCmdDeleteRecordManual1,
+                sizeof(Config::kCmdDeleteRecordManual1),
+                /*writeChecksumLen=*/0, nullptr, 0,
+                /*readChecksumLen=*/0);
+    pendingManualDelete_ = false;
+  }
 }
 
 #endif // ARDUINO

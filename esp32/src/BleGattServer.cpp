@@ -212,6 +212,14 @@ void BleGattServer::handleControlWrite(const uint8_t *data, size_t length) {
     // rows no longer exist to skip re-downloading now that the buffer
     // itself is empty.
     storedRecordDownloader_.resetCommittedRecords();
+    // The phone has now confirmed durable receipt of everything that was in
+    // the buffer — safe to delete the matching records from the PO-400
+    // itself, but only once actually asked to (deleteConfirmedRecords()
+    // itself no-ops while test mode is on — Config::kDefaultTestMode's own
+    // "never destroy real data" default) and only from usbTask, the one
+    // task allowed to talk to the device over USB — see
+    // StoredRecordDownloader::onDeleteRequested()'s own comment.
+    storedRecordDownloader_.requestDeleteOfConfirmedRecords();
     Serial.println("BleGattServer: CLEAR_BUFFER received — buffer wiped.");
     break;
 

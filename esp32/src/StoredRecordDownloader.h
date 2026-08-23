@@ -216,12 +216,46 @@ public:
   // comment for why this is required), then sends STORED_PRESENT and, if any
   // record(s) are present, downloads and decodes every one of them (Auto or
   // Manual, per the device's reported mode), appending decoded rows to
-  // csvBuffer, then deletes each record from the device unless
-  // testModeEnabled() is true. Safe to call whether or not any records are
-  // actually present (STORED_PRESENT reports that). Returns false only on a
-  // transport-level failure talking to the device (e.g. it was unplugged
-  // mid-download).
+  // csvBuffer. Does NOT delete anything from the device itself — see
+  // deleteConfirmedRecords()'s own comment for why that waits for the
+  // phone's confirmation instead of happening immediately here. Safe to
+  // call whether or not any records are actually present (STORED_PRESENT
+  // reports that). Returns false only on a transport-level failure talking
+  // to the device (e.g. it was unplugged mid-download).
   bool downloadAndMaybeDelete();
+
+  using WorkRequestedCallback = std::function<void()>;
+
+  // Registered by main.cpp to wake usbTask — the one task allowed to talk
+  // to the PO-400 over USB, so it's the only place deleteConfirmedRecords()
+  // below can safely run without racing downloadAndMaybeDelete() over the
+  // same USB interface — rather than deleteConfirmedRecords() only ever
+  // running whenever the next real attach happens to occur (which might be
+  // never, if the device just stays continuously plugged in).
+  void onDeleteRequested(WorkRequestedCallback callback) {
+    deleteRequestedCallback_ = callback;
+  }
+
+  // Called by BleGattServer's CLEAR_BUFFER handler, on the NimBLE host
+  // thread — does no USB work itself (that thread must return quickly),
+  // just fires the onDeleteRequested() callback above to wake usbTask,
+  // which then calls deleteConfirmedRecords() there.
+  void requestDeleteOfConfirmedRecords() {
+    if (deleteRequestedCallback_) {
+      deleteRequestedCallback_();
+    }
+  }
+
+  // The actual USB deletion, run only from usbTask (see onDeleteRequested()
+  // above) once the phone has confirmed durable receipt of everything
+  // currently in the CSV buffer via CLEAR_BUFFER — deliberately not
+  // immediately after downloadAndMaybeDelete() finishes, since "captured
+  // into the ESP32's own relay buffer" and "the phone actually has it" are
+  // two different things (the whole reason CLEAR_BUFFER, not REQUEST_DATA,
+  // is the crash-safety confirmation signal in the first place). A no-op
+  // whenever testModeEnabled() is true (Config::kDefaultTestMode's own
+  // "never destroy real data" default) or nothing is actually pending.
+  void deleteConfirmedRecords();
 
 private:
   // Sends a fixed write command (zero-padded to 64 bytes, checksum appended
@@ -298,6 +332,13 @@ private:
   bool testModeEnabled_ = true;
   volatile bool downloadInProgress_ = false;
   volatile bool bufferReadSinceLastDownload_ = false;
+  // Set by downloadAndMaybeDelete() once Auto/Manual records are confirmed present on the device
+  // and captured into the CSV buffer; cleared by deleteConfirmedRecords() once it actually
+  // deletes them (or left set, harmlessly, if testModeEnabled() keeps it from doing so) — see
+  // deleteConfirmedRecords()'s own comment for the full reasoning.
+  volatile bool pendingAutoDelete_ = false;
+  volatile bool pendingManualDelete_ = false;
+  WorkRequestedCallback deleteRequestedCallback_;
 };
 
 #endif // ARDUINO

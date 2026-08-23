@@ -69,7 +69,7 @@ cached by both sides) — the PIN only needs to be entered once per phone.
 |---|---|---|---|
 | `0x01` | `REQUEST_DATA` | none | Ask the ESP32 to stream its currently-buffered CSV rows over the Data characteristic. If the buffer has already been read out by an earlier `REQUEST_DATA` since the last download, this first re-downloads everything the still-attached PO-400 currently has (as if it had just been plugged in again) before streaming — see "Recommended sync sequence" below for why re-sending everything is deliberate, not a fixed-size incremental dump. A buffer nothing has read yet (freshly downloaded at boot, or by a real attach/re-attach) is streamed as-is, with no redundant extra download first. |
 | `0x02` | `SET_TIME` | 8 bytes, little-endian Unix epoch seconds | Phone pushes its current clock to the ESP32 (which has no RTC/NTP). Sent on every connection. |
-| `0x03` | `CLEAR_BUFFER` | none | Phone confirms it has durably stored the data it just received; ESP32 may discard its buffered copy. Must only be sent **after** a successful local insert. |
+| `0x03` | `CLEAR_BUFFER` | none | Phone confirms it has durably stored the data it just received; ESP32 may discard its buffered copy, and (only with test mode off) deletes the matching records from the PO-400 itself. Must only be sent **after** a successful local insert. |
 | `0x04` | `SET_TEST_MODE` | 1 byte, `0x00` or `0x01` | When `0x01` (on), the ESP32 never deletes downloaded stored records from the PO-400. Persisted in NVS. **Defaults to `0x01` (on/non-destructive)** until explicitly turned off. |
 | `0x05` | `SET_WIFI_CREDENTIALS` | `[ssidLen:u8][ssid bytes][passLen:u8][pass bytes]` | Configure WiFi STA credentials for OTA, stored via WiFiManager's NVS storage. |
 | `0x06` | `ENTER_OTA_MODE` | none | Ask the ESP32 to bring up WiFi (using stored credentials, or a captive portal if none stored) and start `ArduinoOTA`, so a `pio run -t upload --upload-port <ip>` can flash new firmware. WiFi auto-tears-down after an idle timeout. |
@@ -123,10 +123,12 @@ compatible and the common case needs no header at all.
 6. Only after the local insert succeeds, write `CLEAR_BUFFER`.
 
 This ordering is what makes the protocol crash-safe: if the phone dies mid-insert, the
-ESP32 still has the data next time. `CLEAR_BUFFER` itself is a pure housekeeping step — it lets
-the ESP32 reclaim buffer space now that this transfer is confirmed durably stored — not a
-"never send this again" marker; the very next `REQUEST_DATA`, from this or any other phone,
-will include everything the PO-400 still has regardless of what's already been cleared before.
+ESP32 still has the data next time. `CLEAR_BUFFER` lets the ESP32 reclaim buffer space now that
+this transfer is confirmed durably stored, and — only with test mode off — is also what actually
+triggers deleting the matching records from the PO-400 itself (see "PO-400 USB HID protocol"
+below's "Delete" entry); it is not a "never send this again" marker either way: the very next
+`REQUEST_DATA`, from this or any other phone, will include everything the PO-400 still has
+(nothing, if it was just deleted; the same records again, if test mode kept them).
 
 ## Threshold config defaults
 
@@ -190,9 +192,14 @@ packets.
   project's `src/pulseoxdl.c` (`process_nibbles_auto`/`process_nibbles_manual`) for the
   original logic this was ported from.
 - Delete: `DELETE_RECORDS_AUTO` (`0x9d, 0x7f,0x7f,0x7f,0x7f, 0x00,0x00, 0x19`) or
-  `DELETE_RECORD_MANUAL_0`/`DELETE_RECORD_MANUAL_1` (two-exchange sequence). Only sent
-  when test mode is off, and only after the record's datums are already safely appended
-  to the firmware's own CSV buffer.
+  `DELETE_RECORD_MANUAL_0`/`DELETE_RECORD_MANUAL_1` (two-exchange sequence). Only sent when
+  test mode is off, and only once the *phone* confirms durable receipt of the buffer these
+  records were appended to — i.e. in response to `CLEAR_BUFFER`, not immediately after the
+  USB download itself. "Appended to the firmware's own CSV buffer" alone isn't a strong
+  enough guarantee to justify deleting the PO-400's own copy — that buffer could still be
+  lost (a crash, a reboot before BLE ever syncs it out) with nothing else left holding the
+  data. Test mode defaults on specifically so this never actually happens without it being
+  deliberately turned off first.
 
 ## Licensing
 
