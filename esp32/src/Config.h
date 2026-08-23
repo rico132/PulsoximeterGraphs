@@ -181,8 +181,9 @@ constexpr const char *kPrefsKeyCommittedManualEpoch = "manual_committed";
 // serial-only-provisioning boundary as kPrefsKeyOtaPassword below, and for
 // the same reason: this must never be settable via any BLE opcode, or a
 // not-yet-paired attacker could simply set their own known PIN — see
-// BleGattServer::setPairingPasskeyFromSerial(), reachable only via
-// main.cpp's `blepin <6 digits>` serial debug command.
+// BleGattServer::regeneratePairingPasskey(), reachable only via main.cpp's
+// bare `blepin` serial debug signal (no argument: a replacement PIN is
+// always randomly generated, never operator-chosen, same as first boot).
 constexpr const char *kPrefsKeyBlePasskey = "ble_passkey";
 
 // ---------------------------------------------------------------------------

@@ -92,7 +92,9 @@ void usbTask(void * /*param*/) {
 // (BLE pairing PIN), both are deliberately ONLY settable this way — never
 // reachable via any BLE opcode, so a compromised phone/BLE link alone can
 // never push firmware or set its own known pairing PIN. Usage: type
-// `otapass <password>` or `blepin <6 digits>`, then Enter.
+// `otapass <password>` then Enter, or a bare `blepin` (no argument — the new
+// PIN is always randomly generated, never operator-chosen, same as the very
+// first boot's own provisioning) then Enter.
 void pollSerialDebugCommands() {
   static String line;
   while (Serial.available() > 0) {
@@ -101,9 +103,8 @@ void pollSerialDebugCommands() {
       if (line.startsWith("otapass ")) {
         g_otaManager.setOtaPasswordFromSerial(
             std::string(line.substring(8).c_str()));
-      } else if (line.startsWith("blepin ")) {
-        g_bleGattServer->setPairingPasskeyFromSerial(
-            std::string(line.substring(7).c_str()));
+      } else if (line == "blepin") {
+        g_bleGattServer->regeneratePairingPasskey();
       }
       line = "";
     } else {

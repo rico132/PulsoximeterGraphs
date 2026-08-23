@@ -7,32 +7,42 @@
 #include "Config.h"
 
 namespace {
-// Loads the persisted BLE pairing PIN, or — on first boot ever, or after an
-// NVS wipe — generates a fresh random one and persists it. Never a fixed
-// literal baked into source: see Config::kPrefsKeyBlePasskey's own comment
-// for why a hardcoded PIN wouldn't actually be a secret. esp_random() is a
-// real HWRNG on the ESP32, safe to use directly with no seeding needed.
-// Printed to Serial every boot (not just when freshly generated) so it's
-// always retrievable by just power-cycling and watching the log, with no
-// separate "did I ever write this down" bookkeeping required.
+// Generates a fresh random passkey and persists it — shared by first-ever-boot provisioning
+// (loadOrGenerateBlePasskey() below) and the explicit `blepin` serial "regenerate" signal (see
+// BleGattServer::regeneratePairingPasskey()). Never a fixed literal baked into source: see
+// Config::kPrefsKeyBlePasskey's own comment for why a hardcoded PIN wouldn't actually be a
+// secret. esp_random() is a real HWRNG on the ESP32, safe to use directly with no seeding needed.
+uint32_t generateAndStoreNewPasskey(Preferences &preferences) {
+  const uint32_t passkey = esp_random() % 1000000UL; // 000000-999999
+  preferences.putULong(Config::kPrefsKeyBlePasskey, passkey);
+  return passkey;
+}
+
+void printPasskey(uint32_t passkey) {
+  Serial.println("========================================================");
+  Serial.printf("BleGattServer: BLE pairing PIN: %06u\n", passkey);
+  Serial.println(
+      "Enter this PIN when your phone asks to pair with 'PulsoxRelay'. Send "
+      "a bare 'blepin' over serial any time to generate a new one.");
+  Serial.println("========================================================");
+}
+
+// Loads the persisted BLE pairing PIN, generating a fresh one only on first boot ever (or after
+// an NVS wipe) — see generateAndStoreNewPasskey()'s own comment. Printed to Serial every boot
+// (not just when freshly generated) so it's always retrievable by just power-cycling and
+// watching the log, with no separate "did I ever write this down" bookkeeping required.
 uint32_t loadOrGenerateBlePasskey(Preferences &preferences) {
   uint32_t passkey;
   if (preferences.isKey(Config::kPrefsKeyBlePasskey)) {
     passkey = static_cast<uint32_t>(
         preferences.getULong(Config::kPrefsKeyBlePasskey, 0));
   } else {
-    passkey = esp_random() % 1000000UL; // 000000-999999
-    preferences.putULong(Config::kPrefsKeyBlePasskey, passkey);
+    passkey = generateAndStoreNewPasskey(preferences);
     Serial.println(
         "BleGattServer: no BLE pairing PIN was set yet — generated a new "
         "one (see below).");
   }
-  Serial.println("========================================================");
-  Serial.printf("BleGattServer: BLE pairing PIN: %06u\n", passkey);
-  Serial.println(
-      "Enter this PIN when your phone asks to pair with 'PulsoxRelay'. "
-      "Change it any time via the serial debug command: blepin <6 digits>");
-  Serial.println("========================================================");
+  printPasskey(passkey);
   return passkey;
 }
 } // namespace
@@ -382,20 +392,12 @@ void BleGattServer::requestDataDump() {
   }
 }
 
-void BleGattServer::setPairingPasskeyFromSerial(const std::string &pin) {
-  if (pin.length() != 6 ||
-      pin.find_first_not_of("0123456789") != std::string::npos) {
-    Serial.println(
-        "BleGattServer: blepin requires exactly 6 digits (e.g. 'blepin "
-        "482913') — ignoring.");
-    return;
-  }
-  const uint32_t passkey = static_cast<uint32_t>(std::stoul(pin));
-  preferences_.putULong(Config::kPrefsKeyBlePasskey, passkey);
+void BleGattServer::regeneratePairingPasskey() {
+  const uint32_t passkey = generateAndStoreNewPasskey(preferences_);
   NimBLEDevice::setSecurityPasskey(passkey);
-  Serial.printf(
-      "BleGattServer: BLE pairing PIN updated via serial to %06u. Already-"
-      "bonded phones are unaffected; any *new* pairing from now on must "
-      "enter this PIN.\n",
-      passkey);
+  Serial.println("BleGattServer: BLE pairing PIN regenerated via serial signal.");
+  printPasskey(passkey);
+  Serial.println(
+      "BleGattServer: already-bonded phones are unaffected; any *new* "
+      "pairing from now on must enter this PIN.");
 }

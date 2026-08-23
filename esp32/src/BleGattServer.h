@@ -22,15 +22,18 @@ public:
 
   void begin();
 
-  // Sets a new BLE pairing PIN (exactly 6 digits) and persists it to NVS —
-  // called only from main.cpp's serial debug command, deliberately never
-  // reachable via any BLE opcode (same reasoning as
+  // Generates a fresh random BLE pairing PIN and persists it to NVS — called
+  // only from main.cpp's bare `blepin` serial debug signal, deliberately
+  // never reachable via any BLE opcode (same reasoning as
   // OtaManager::setOtaPasswordFromSerial: a not-yet-paired attacker must
-  // never be able to set their own known PIN). Takes effect for the *next*
-  // pairing attempt; devices already bonded are unaffected (the passkey is
-  // only used during the initial pairing handshake, not for already-
-  // established encrypted links) — see Config::kPrefsKeyBlePasskey's comment.
-  void setPairingPasskeyFromSerial(const std::string &pin);
+  // never be able to set their own known PIN). No specific PIN can be
+  // requested — same as the very first boot's provisioning, the value is
+  // always randomly generated, never operator-chosen, so it can't be a
+  // predictable/reused value. Takes effect for the *next* pairing attempt;
+  // devices already bonded are unaffected (the passkey is only used during
+  // the initial pairing handshake, not for already-established encrypted
+  // links) — see Config::kPrefsKeyBlePasskey's comment.
+  void regeneratePairingPasskey();
 
 private:
   // Forwarders rather than direct multiple-inheritance from the NimBLE

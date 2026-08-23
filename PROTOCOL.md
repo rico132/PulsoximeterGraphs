@@ -51,12 +51,14 @@ error).
 
 The PIN itself is **not a fixed value in this document or in source** — a hardcoded literal
 committed to a shared repo would stop being a secret at all. Instead the ESP32 generates a random
-6-digit PIN on first boot (or after an NVS wipe), persists it, and prints it to its serial log on
-every boot. It can be changed at any time via the serial-only `blepin <6 digits>` debug command —
-deliberately never reachable via any BLE opcode, so a not-yet-paired attacker can never set their
-own known PIN (same reasoning as `SET_WIFI_CREDENTIALS`'s OTA password, which is serial-only for
-the identical reason). Changing the PIN only affects *future* pairings; phones already bonded are
-unaffected, since the PIN is only used during the initial pairing handshake.
+6-digit PIN on first boot ever (or after an NVS wipe), persists it in NVS (survives every
+subsequent reboot/power cycle unchanged), and prints it to its serial log on every boot. It can be
+regenerated at any time by sending a bare `blepin` (no argument — a replacement PIN is always
+randomly generated, never operator-chosen, exactly like first-boot provisioning) over the serial
+debug console — deliberately never reachable via any BLE opcode, so a not-yet-paired attacker can
+never set their own known PIN (same reasoning as `SET_WIFI_CREDENTIALS`'s OTA password, which is
+serial-only for the identical reason). Regenerating the PIN only affects *future* pairings; phones
+already bonded are unaffected, since the PIN is only used during the initial pairing handshake.
 
 Once bonded, a phone reconnects automatically without re-pairing (the link's encryption keys are
 cached by both sides) — the PIN only needs to be entered once per phone.
