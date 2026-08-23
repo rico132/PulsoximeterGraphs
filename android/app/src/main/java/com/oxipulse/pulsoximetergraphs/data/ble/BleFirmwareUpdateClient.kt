@@ -298,6 +298,35 @@ class BleFirmwareUpdateClient(private val context: Context) {
         BleDebugLog.add("[fw-update] $message")
     }
 
+    /**
+     * Forces Android to discard whatever GATT attribute table it has cached for this device and
+     * actually re-query the peripheral on the next discoverServices() call, rather than possibly
+     * reusing a stale cache from an earlier connection. `BluetoothGatt.refresh()` isn't public
+     * API — no direct binding exists on the class — but it's a real method present on every
+     * AOSP-derived build; calling it via reflection is the standard, widely-used workaround for
+     * exactly this (Nordic's and Polidea's BLE libraries, and most others, do the same thing).
+     *
+     * Needed here specifically because the Firmware characteristic this class looks for was
+     * added to the ESP32 firmware later than Control/Data/Status, which a phone may already be
+     * bonded with from earlier CSV-sync use (see BleGattClient). Android's GATT cache is keyed
+     * by remote device identity, not by firmware version, and nothing on the ESP32 side emits a
+     * GATT "Service Changed" indication (0x2A05) when its own attribute table grows across a
+     * reflash — so an already-bonded phone can get stuck reusing a service list from before this
+     * characteristic ever existed, even once the ESP32 has since been reflashed with firmware
+     * that adds it. That reads as "Required characteristics not found" despite the ESP32
+     * actually running fully up-to-date firmware. A failed reflection call (e.g. removed on some
+     * future Android release) is treated as a no-op, not fatal — discoverServices() still runs
+     * either way, just without the forced refresh.
+     */
+    @SuppressLint("MissingPermission")
+    private fun refreshGattCache(gatt: BluetoothGatt) {
+        try {
+            gatt.javaClass.getMethod("refresh").invoke(gatt)
+        } catch (e: Exception) {
+            log("GATT cache refresh unavailable: ${e.javaClass.simpleName}")
+        }
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
 
         @SuppressLint("MissingPermission")
@@ -305,6 +334,7 @@ class BleFirmwareUpdateClient(private val context: Context) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 log("Connected (status $status)")
                 gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                refreshGattCache(gatt)
                 ensureBondedThenDiscoverServices(gatt)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 log("Disconnected (status $status)")

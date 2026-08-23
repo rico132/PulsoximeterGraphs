@@ -350,6 +350,26 @@ class BleGattClient(
         BleDebugLog.add(message)
     }
 
+    /**
+     * Forces Android to discard whatever GATT attribute table it has cached for this device and
+     * actually re-query the peripheral on the next discoverServices() call, rather than possibly
+     * reusing a stale cache from an earlier connection — see [BleFirmwareUpdateClient]'s
+     * identical method for the full reasoning (its Firmware characteristic, added to the ESP32
+     * firmware after Control/Data/Status, is exactly the kind of change this cache can otherwise
+     * hide from an already-bonded phone). Nothing this class currently reads has ever changed
+     * shape the same way, but the connect/bond/discover path here is duplicated from that class
+     * (see this class's own header doc) and shares the identical exposure to it, so the fix is
+     * mirrored here too rather than leaving one of the two copies unprotected.
+     */
+    @SuppressLint("MissingPermission")
+    private fun refreshGattCache(gatt: BluetoothGatt) {
+        try {
+            gatt.javaClass.getMethod("refresh").invoke(gatt)
+        } catch (e: Exception) {
+            log("GATT cache refresh unavailable: ${e.javaClass.simpleName}")
+        }
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
 
         @SuppressLint("MissingPermission")
@@ -371,6 +391,7 @@ class BleGattClient(
                     BluetoothDevice.PHY_LE_2M_MASK,
                     BluetoothDevice.PHY_OPTION_NO_PREFERRED,
                 )
+                refreshGattCache(gatt)
                 ensureBondedThenDiscoverServices(gatt)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 log("Disconnected (status $status)")
