@@ -142,6 +142,14 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("PulsoxRelay firmware starting.");
+  // Config::kFirmwareVersion is a compile-time constant baked into this exact binary's .rodata
+  // (see its own comment) — CI passes -D FIRMWARE_VERSION="<release tag>" per build, so this is
+  // already whatever version this running image actually is, no separate bookkeeping needed. A
+  // BLE firmware update writes an entirely new binary (with its own build's version baked in)
+  // into the inactive OTA partition and only flips the boot partition on a verified-good image
+  // (see BleFirmwareUpdater's header comment) — so this line reports the correct version
+  // immediately after an OTA-triggered reboot too, the same way it always does on any boot.
+  Serial.printf("Firmware version: %s\n", Config::kFirmwareVersion);
 
   // 30s: generous margin over normal operation (every observed read/packet
   // is sub-second) so this never false-triggers on legitimate work, while
