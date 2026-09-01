@@ -17,11 +17,17 @@ data class ReadingStats(
     val avgSpo2: Double?,
     val p95Spo2: Int? = null,
     // Number of separate desaturation events (contiguous runs of SpO2 below
-    // SPO2_EVENT_THRESHOLD_PERCENT) — see GraphViewModel.countSpo2Events's own doc for the exact
-    // definition. Null (like the fields above), not 0, when there's no data at all for the range
+    // ThresholdConfig.spo2EventThreshold) — see GraphViewModel.countSpo2Events's own doc for the
+    // exact definition. Null (like the fields above), not 0, when there's no data at all for the range
     // — 0 is a legitimate "no desaturation events occurred" answer once there IS data, so it
     // must stay distinguishable from "we don't know."
     val spo2EventCount: Int? = null,
+    // Rate, not the raw count above: spo2EventCount alone conflates "1 event in a 30-minute
+    // range" with "1 event in a week" as if they meant the same thing. Computed in
+    // GraphViewModel.stats as spo2EventCount divided by the selected range's duration in hours,
+    // so it recomputes automatically whenever either the range or the event count changes. Null
+    // under the same rule as every other field here (no data, or a zero-length range).
+    val spo2EventsPerHour: Double? = null,
     val minPulse: Int?,
     val maxPulse: Int?,
     val avgPulse: Double?,

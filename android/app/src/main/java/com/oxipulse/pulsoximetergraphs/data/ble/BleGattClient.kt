@@ -23,6 +23,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository
+import com.oxipulse.pulsoximetergraphs.data.settings.TestModePreferenceRepository
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -43,12 +44,15 @@ import kotlinx.coroutines.launch
  * 2. Request MTU 503 (falls back gracefully to whatever is negotiated, including the
  *    un-negotiated default of 23 — chunk math always uses the actual negotiated value).
  * 3. Write SET_TIME (every connection).
- * 4. Write REQUEST_DATA.
- * 5. Reassemble Data notifications until the single-0x00-byte terminator.
- * 6. Parse + insert the CSV blob via [ReadingsRepository.importCsv].
- * 7. Only after that insert succeeds, write CLEAR_BUFFER.
+ * 4. Write SET_TEST_MODE with [TestModePreferenceRepository]'s current desired value (every
+ *    connection, same as SET_TIME) — see [writeTestMode]'s own doc for why this lives here
+ *    rather than a separate on-demand connection.
+ * 5. Write REQUEST_DATA.
+ * 6. Reassemble Data notifications until the single-0x00-byte terminator.
+ * 7. Parse + insert the CSV blob via [ReadingsRepository.importCsv].
+ * 8. Only after that insert succeeds, write CLEAR_BUFFER.
  *
- * This ordering is what makes the protocol crash-safe (see PROTOCOL.md): if step 6 never
+ * This ordering is what makes the protocol crash-safe (see PROTOCOL.md): if step 7 never
  * completes, the ESP32 still has the data next time. A [SYNC_TIMEOUT_MS] watchdog guarantees
  * that a stalled connection can't wedge the UI in a "syncing" state forever — it's an
  * *inactivity* timeout, re-armed by [armTimeout] on every write ack and every Data chunk
@@ -58,6 +62,7 @@ import kotlinx.coroutines.launch
 class BleGattClient(
     private val context: Context,
     private val readingsRepository: ReadingsRepository,
+    private val testModePreferenceRepository: TestModePreferenceRepository,
 ) {
 
     sealed interface SyncState {
@@ -118,14 +123,6 @@ class BleGattClient(
 
     private val _syncState = MutableStateFlow<SyncState>(SyncState.Idle)
     val syncState: StateFlow<SyncState> = _syncState.asStateFlow()
-
-    /**
-     * Best-effort local mirror of the ESP32's test-mode flag: the Status characteristic that
-     * would let us read it back is stretch/not-MVP per PROTOCOL.md, so we track only the last
-     * value *this app* has sent. Null until the app has sent (or read) a value this session.
-     */
-    private val _testModeEnabled = MutableStateFlow<Boolean?>(null)
-    val testModeEnabled: StateFlow<Boolean?> = _testModeEnabled.asStateFlow()
 
     private var bluetoothGatt: BluetoothGatt? = null
     private var controlCharacteristic: BluetoothGattCharacteristic? = null
@@ -506,7 +503,8 @@ class BleGattClient(
             }
             armTimeout()
             when (lastControlWrite) {
-                ControlWrite.SET_TIME -> writeRequestData(gatt)
+                ControlWrite.SET_TIME -> writeTestMode(gatt)
+                ControlWrite.SET_TEST_MODE -> writeRequestData(gatt)
                 ControlWrite.REQUEST_DATA -> _syncState.value = SyncState.ReceivingData(0)
                 ControlWrite.CLEAR_BUFFER -> {
                     cancelTimeout()
@@ -810,7 +808,7 @@ class BleGattClient(
         }
     }
 
-    private enum class ControlWrite { SET_TIME, REQUEST_DATA, CLEAR_BUFFER, DEVICE_SETTING }
+    private enum class ControlWrite { SET_TIME, SET_TEST_MODE, REQUEST_DATA, CLEAR_BUFFER }
 
     private var lastControlWrite: ControlWrite? = null
 
@@ -823,6 +821,22 @@ class BleGattClient(
             .array()
         lastControlWrite = ControlWrite.SET_TIME
         writeControl(gatt, payload)
+    }
+
+    /**
+     * Pushes [TestModePreferenceRepository]'s desired value as part of every sync, before
+     * REQUEST_DATA — not a separate on-demand connection (see that repository's own doc for why):
+     * this way, CLEAR_BUFFER later in this exact same connection (which is what actually deletes
+     * records from the PO-400, not the ESP32 itself — see PROTOCOL.md) only ever runs once this
+     * write has been acked. A failed write here fails the whole sync via the same generic
+     * "Write to X failed" handling every other control write already goes through — no special
+     * casing needed, and no CLEAR_BUFFER under an unconfirmed test-mode assumption.
+     */
+    @SuppressLint("MissingPermission")
+    private fun writeTestMode(gatt: BluetoothGatt) {
+        val desired = testModePreferenceRepository.desiredTestMode.value
+        lastControlWrite = ControlWrite.SET_TEST_MODE
+        writeControl(gatt, byteArrayOf(BleConstants.OPCODE_SET_TEST_MODE, if (desired) 0x01 else 0x00))
     }
 
     @SuppressLint("MissingPermission")
@@ -839,14 +853,6 @@ class BleGattClient(
     private fun writeClearBuffer(gatt: BluetoothGatt) {
         lastControlWrite = ControlWrite.CLEAR_BUFFER
         writeControl(gatt, byteArrayOf(BleConstants.OPCODE_CLEAR_BUFFER))
-    }
-
-    /** Writes SET_TEST_MODE. Device-section UI in Settings calls this while connected. */
-    fun writeTestMode(enabled: Boolean) {
-        val gatt = bluetoothGatt ?: return
-        lastControlWrite = ControlWrite.DEVICE_SETTING
-        writeControl(gatt, byteArrayOf(BleConstants.OPCODE_SET_TEST_MODE, if (enabled) 0x01 else 0x00))
-        _testModeEnabled.value = enabled
     }
 
     @Suppress("DEPRECATION")

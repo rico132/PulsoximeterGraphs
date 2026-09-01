@@ -24,6 +24,7 @@ class ThresholdConfigTest {
         assertEquals(45, config.pulseLowRed)
         assertEquals(90, config.pulseHighOrange)
         assertEquals(100, config.pulseHighRed)
+        assertEquals(90, config.spo2EventThreshold)
     }
 
     @Test

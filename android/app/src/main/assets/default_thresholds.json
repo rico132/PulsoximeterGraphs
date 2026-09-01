@@ -4,5 +4,6 @@
   "pulseLowOrange": 50,
   "pulseLowRed": 45,
   "pulseHighOrange": 90,
-  "pulseHighRed": 100
+  "pulseHighRed": 100,
+  "spo2EventThreshold": 90
 }

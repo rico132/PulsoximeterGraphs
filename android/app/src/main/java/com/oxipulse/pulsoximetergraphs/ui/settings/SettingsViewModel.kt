@@ -7,6 +7,7 @@ import com.oxipulse.pulsoximetergraphs.data.ble.BleDebugLog
 import com.oxipulse.pulsoximetergraphs.data.ble.BleFirmwareUpdateClient
 import com.oxipulse.pulsoximetergraphs.data.ble.BleGattClient
 import com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository
+import com.oxipulse.pulsoximetergraphs.data.settings.TestModePreferenceRepository
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdsRepository
 import com.oxipulse.pulsoximetergraphs.data.update.GithubReleaseChecker
@@ -21,10 +22,10 @@ class SettingsViewModel(
     val bleGattClient: BleGattClient,
     val bleFirmwareUpdateClient: BleFirmwareUpdateClient,
     private val readingsRepository: ReadingsRepository,
+    private val testModePreferenceRepository: TestModePreferenceRepository,
 ) : ViewModel() {
 
     val config: StateFlow<ThresholdConfig> = thresholdsRepository.config
-    val testModeEnabled: StateFlow<Boolean?> = bleGattClient.testModeEnabled
     val syncState: StateFlow<BleGattClient.SyncState> = bleGattClient.syncState
     val debugLog: StateFlow<String> = BleDebugLog.entries
 
@@ -34,6 +35,13 @@ class SettingsViewModel(
         bleFirmwareUpdateClient.versionCheckState
     val unpairState: StateFlow<BleFirmwareUpdateClient.UnpairState> =
         bleFirmwareUpdateClient.unpairState
+
+    /**
+     * The user's desired setting, not a live device readout (see
+     * [TestModePreferenceRepository]'s own doc for why one isn't possible) — applied to the ESP32
+     * as part of the next "Sync via BLE", not written immediately when toggled.
+     */
+    val desiredTestMode: StateFlow<Boolean> = testModePreferenceRepository.desiredTestMode
 
     sealed interface FirmwareCheckState {
         data object Idle : FirmwareCheckState
@@ -66,7 +74,12 @@ class SettingsViewModel(
     /** Returns null on success, or a validation-error message. Never persists an invalid config. */
     fun save(newConfig: ThresholdConfig): String? = thresholdsRepository.update(newConfig)
 
-    fun setTestMode(enabled: Boolean) = bleGattClient.writeTestMode(enabled)
+    /**
+     * Just persists the preference locally — see [TestModePreferenceRepository]'s own doc for why
+     * this doesn't write to the ESP32 directly. [BleGattClient] picks it up and writes it as part
+     * of the next sync instead.
+     */
+    fun setDesiredTestMode(enabled: Boolean) = testModePreferenceRepository.setDesiredTestMode(enabled)
 
     fun isDeviceConnected(): Boolean = when (syncState.value) {
         is BleGattClient.SyncState.Success,
@@ -161,6 +174,7 @@ class SettingsViewModel(
             bleGattClient: BleGattClient,
             bleFirmwareUpdateClient: BleFirmwareUpdateClient,
             readingsRepository: ReadingsRepository,
+            testModePreferenceRepository: TestModePreferenceRepository,
         ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T =
@@ -169,6 +183,7 @@ class SettingsViewModel(
                     bleGattClient,
                     bleFirmwareUpdateClient,
                     readingsRepository,
+                    testModePreferenceRepository,
                 ) as T
         }
     }

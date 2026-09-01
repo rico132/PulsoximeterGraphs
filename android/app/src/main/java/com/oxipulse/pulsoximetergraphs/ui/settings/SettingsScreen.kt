@@ -67,10 +67,11 @@ fun SettingsScreen(
             appContainer.bleGattClient,
             appContainer.bleFirmwareUpdateClient,
             appContainer.readingsRepository,
+            appContainer.testModePreferenceRepository,
         ),
     )
     val config by viewModel.config.collectAsState()
-    val testModeEnabled by viewModel.testModeEnabled.collectAsState()
+    val desiredTestMode by viewModel.desiredTestMode.collectAsState()
     val debugLog by viewModel.debugLog.collectAsState()
 
     // Local editable draft, seeded from the persisted config and reset whenever it changes
@@ -120,7 +121,7 @@ fun SettingsScreen(
                             savedMessage = if (error == null) "Saved" else null
                         },
                     )
-                    1 -> DeviceSection(viewModel, testModeEnabled)
+                    1 -> DeviceSection(viewModel, desiredTestMode)
                     2 -> DebugLogSection(debugLog, onClear = viewModel::clearDebugLog)
                     3 -> ImportTab(viewModel)
                 }
@@ -147,6 +148,7 @@ private fun ConfigTab(
     ThresholdNumberField("Pulse low red", draft.pulseLowRed) { onDraftChange(draft.copy(pulseLowRed = it)) }
     ThresholdNumberField("Pulse high orange", draft.pulseHighOrange) { onDraftChange(draft.copy(pulseHighOrange = it)) }
     ThresholdNumberField("Pulse high red", draft.pulseHighRed) { onDraftChange(draft.copy(pulseHighRed = it)) }
+    ThresholdNumberField("Event threshold", draft.spo2EventThreshold) { onDraftChange(draft.copy(spo2EventThreshold = it)) }
 
     val liveError = draft.validate()
     if (liveError != null) {
@@ -181,7 +183,7 @@ private fun ThresholdNumberField(label: String, value: Int, onValueChange: (Int)
 }
 
 @Composable
-private fun DeviceSection(viewModel: SettingsViewModel, testModeEnabled: Boolean?) {
+private fun DeviceSection(viewModel: SettingsViewModel, desiredTestMode: Boolean) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Device", style = MaterialTheme.typography.titleMedium)
 
@@ -204,13 +206,19 @@ private fun DeviceSection(viewModel: SettingsViewModel, testModeEnabled: Boolean
                     Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
                         Text("Test mode")
                         Text(
-                            "When on, the ESP32 never deletes downloaded stored records.",
+                            "When on, the ESP32 never deletes downloaded stored records from " +
+                                "the PO-400. This is a local preference — it's applied to the " +
+                                "device the next time you sync via BLE, not immediately.",
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
+                    // checked binds straight to the persisted preference (see
+                    // TestModePreferenceRepository) — no BLE round trip involved in toggling it
+                    // at all now, so unlike the connect-on-demand approach this replaced, there's
+                    // no async gap between tapping and the thumb moving.
                     Switch(
-                        checked = testModeEnabled ?: true,
-                        onCheckedChange = { viewModel.setTestMode(it) },
+                        checked = desiredTestMode,
+                        onCheckedChange = { viewModel.setDesiredTestMode(it) },
                     )
                 }
             }

@@ -9,6 +9,7 @@ import com.oxipulse.pulsoximetergraphs.data.db.ReadingStats
 import com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdsRepository
+import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.time.ZonedDateTime
@@ -43,31 +44,27 @@ private fun percentile95(values: List<Int>): Int? {
     return sorted[index]
 }
 
-/** A desaturation "event" is defined against this SpO2 percentage — see [countSpo2Events]. */
-const val SPO2_EVENT_THRESHOLD_PERCENT = 94
-
 /**
- * Two dips below [SPO2_EVENT_THRESHOLD_PERCENT] separated by a recovery shorter than this count
- * as one continuous event, not two — see [countSpo2Events]. A brief single-sample bounce back
- * above threshold (sensor noise, a momentary good reading mid-desaturation) shouldn't fragment
- * one real episode into several.
+ * Two dips below the configured [ThresholdConfig.spo2EventThreshold] separated by a recovery
+ * shorter than this count as one continuous event, not two — see [countSpo2Events]. A brief
+ * single-sample bounce back above threshold (sensor noise, a momentary good reading
+ * mid-desaturation) shouldn't fragment one real episode into several.
  */
 internal const val EVENT_MERGE_GAP_SECONDS = 5L
 
 /**
- * Number of separate desaturation events: maximal runs of readings with SpO2 below
- * [SPO2_EVENT_THRESHOLD_PERCENT], where a recovery above threshold shorter than
- * [EVENT_MERGE_GAP_SECONDS] doesn't end the event — the next dip merges into the same one instead
- * of starting a new one. E.g. SpO2 dipping to 90, recovering to 96 for 2 seconds, then dipping to
- * 92 again is 1 event; the same recovery lasting 10 seconds would be 2. [readings] must already be
- * in chronological order (see ReadingDao's `ORDER BY timestampEpochSec ASC`) — unlike
- * [percentile95], this genuinely depends on sequence (and now timing), not just the multiset of
- * SpO2 values. Null (not 0) when there's no data at all, consistent with every other field in
- * [ReadingStats].
+ * Number of separate desaturation events: maximal runs of readings with SpO2 below [threshold],
+ * where a recovery above threshold shorter than [EVENT_MERGE_GAP_SECONDS] doesn't end the event
+ * — the next dip merges into the same one instead of starting a new one. E.g. SpO2 dipping to 90,
+ * recovering to 96 for 2 seconds, then dipping to 92 again is 1 event; the same recovery lasting
+ * 10 seconds would be 2. [readings] must already be in chronological order (see ReadingDao's
+ * `ORDER BY timestampEpochSec ASC`) — unlike [percentile95], this genuinely depends on sequence
+ * (and now timing), not just the multiset of SpO2 values. Null (not 0) when there's no data at
+ * all, consistent with every other field in [ReadingStats].
  */
 // internal, not private, so GraphViewModelEventsTest can exercise this directly — the merge-gap
 // timing logic is exactly the kind of thing worth a real unit test rather than trusting by eye.
-internal fun countSpo2Events(readings: List<ReadingEntity>): Int? {
+internal fun countSpo2Events(readings: List<ReadingEntity>, threshold: Int): Int? {
     if (readings.isEmpty()) return null
     var eventCount = 0
     var inEvent = false
@@ -76,7 +73,7 @@ internal fun countSpo2Events(readings: List<ReadingEntity>): Int? {
     // which is exactly what the next run's gap needs to be measured from.
     var lastBelowThresholdEpochSec: Long? = null
     for (reading in readings) {
-        val belowThreshold = reading.spo2 < SPO2_EVENT_THRESHOLD_PERCENT
+        val belowThreshold = reading.spo2 < threshold
         if (belowThreshold) {
             if (!inEvent) {
                 val gapSeconds = lastBelowThresholdEpochSec?.let { reading.timestampEpochSec - it }
@@ -122,16 +119,30 @@ class GraphViewModel(
      * computed in Kotlin from [readings] itself (the same, already-loaded rows for this exact
      * range) rather than by the query, since percentile support isn't reliably available across
      * the SQLite versions this app's supported Android versions ship with, and event counting
-     * needs sequence order anyway — see ReadingStats's own doc.
+     * needs sequence order anyway — see ReadingStats's own doc. [thresholdConfig] is combined in
+     * too (not just [selectedRange]/[readings]) so that editing spo2EventThreshold in Settings
+     * recomputes spo2EventCount/spo2EventsPerHour immediately, the same way it already recomputes
+     * the chart's threshold bands.
      */
-    val stats: StateFlow<ReadingStats> = combine(selectedRange, readings) { range, currentReadings ->
-        range to currentReadings
-    }
-        .map { (range, currentReadings) ->
+    val stats: StateFlow<ReadingStats> = combine(
+        selectedRange,
+        readings,
+        thresholdConfig,
+    ) { range, currentReadings, config -> Triple(range, currentReadings, config) }
+        .map { (range, currentReadings, config) ->
+            val eventCount = countSpo2Events(currentReadings, config.spo2EventThreshold)
+            // Hours, not seconds/minutes: the whole point of this rate is to read naturally next
+            // to "events" as a per-hour figure (e.g. "24 events over 3 hours" -> "8/hr") regardless
+            // of how long or short the selected range happens to be, rather than showing a raw
+            // count that means something different in a 30-minute range than in a week-long one.
+            val durationHours = Duration.between(range.start, range.endInclusive).toMillis() / 3_600_000.0
             readingsRepository.statsForRange(range).copy(
                 p95Spo2 = percentile95(currentReadings.map { it.spo2 }),
                 p95Pulse = percentile95(currentReadings.map { it.pulse }),
-                spo2EventCount = countSpo2Events(currentReadings),
+                spo2EventCount = eventCount,
+                spo2EventsPerHour = eventCount?.let { count ->
+                    if (durationHours > 0) count / durationHours else null
+                },
             )
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), EMPTY_STATS)

@@ -5,6 +5,7 @@ import com.oxipulse.pulsoximetergraphs.data.ble.BleFirmwareUpdateClient
 import com.oxipulse.pulsoximetergraphs.data.ble.BleGattClient
 import com.oxipulse.pulsoximetergraphs.data.db.AppDatabase
 import com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository
+import com.oxipulse.pulsoximetergraphs.data.settings.TestModePreferenceRepository
 import com.oxipulse.pulsoximetergraphs.data.settings.ThemePreferenceRepository
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdsRepository
 
@@ -27,8 +28,12 @@ class AppContainer(context: Context) {
         ThresholdsRepository(appContext)
     }
 
+    val testModePreferenceRepository: TestModePreferenceRepository by lazy {
+        TestModePreferenceRepository(appContext)
+    }
+
     val bleGattClient: BleGattClient by lazy {
-        BleGattClient(appContext, readingsRepository)
+        BleGattClient(appContext, readingsRepository, testModePreferenceRepository)
     }
 
     val bleFirmwareUpdateClient: BleFirmwareUpdateClient by lazy {

@@ -18,6 +18,11 @@ data class ThresholdConfig(
     val pulseLowRed: Int = 45,
     val pulseHighOrange: Int = 90,
     val pulseHighRed: Int = 100,
+    // SpO2 percentage a desaturation "event" is counted against (see
+    // GraphViewModel.countSpo2Events) -- unrelated to spo2Orange/spo2Red above, which are chart
+    // highlighting bands, not the event-counting cutoff, even though they default to the same
+    // number.
+    val spo2EventThreshold: Int = 90,
 ) {
     /** Returns a human-readable validation error, or null if [this] is valid. */
     fun validate(): String? = when {

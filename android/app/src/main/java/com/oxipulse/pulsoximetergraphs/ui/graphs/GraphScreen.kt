@@ -261,7 +261,7 @@ fun GraphScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            StatsPanel(selectedRange, stats)
+            StatsPanel(selectedRange, stats, thresholdConfig.spo2EventThreshold)
             ChartsCard(
                 readings = plottedReadings,
                 thresholdConfig = thresholdConfig,
@@ -424,7 +424,7 @@ private fun RangeSummary(range: ClosedRange<Instant>) {
  * better as this card's own header than as an unrelated line sitting above it.
  */
 @Composable
-private fun StatsPanel(range: ClosedRange<Instant>, stats: ReadingStats) {
+private fun StatsPanel(range: ClosedRange<Instant>, stats: ReadingStats, eventThreshold: Int) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             RangeSummary(range)
@@ -432,7 +432,7 @@ private fun StatsPanel(range: ClosedRange<Instant>, stats: ReadingStats) {
             Text("Stats", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             StatsTable(stats)
             HorizontalDivider()
-            EventsRow(stats)
+            EventsRow(stats, eventThreshold)
         }
     }
 }
@@ -476,22 +476,25 @@ private fun StatsTable(stats: ReadingStats) {
 }
 
 /**
- * A single desaturation-event count, shown as its own row rather than folded into [StatsTable]:
- * it's one number, not a min/max/avg/p95 tuple, so it doesn't fit that table's fixed 4-column
- * shape — see [countSpo2Events]'s own doc for exactly what counts as one event.
+ * A desaturation-event rate, shown as its own row rather than folded into [StatsTable]: it's one
+ * number, not a min/max/avg/p95 tuple, so it doesn't fit that table's fixed 4-column shape — see
+ * [countSpo2Events]'s own doc for exactly what counts as one event. Shown as events/hour
+ * ([ReadingStats.spo2EventsPerHour]) rather than the raw [ReadingStats.spo2EventCount], since a
+ * bare count means something different in a 30-minute range than in a week-long one — dividing by
+ * the selected range's own duration is what makes it comparable across ranges.
  */
 @Composable
-private fun EventsRow(stats: ReadingStats) {
+private fun EventsRow(stats: ReadingStats, eventThreshold: Int) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Text(
-            "Events (SpO2 < $SPO2_EVENT_THRESHOLD_PERCENT%)",
+            "Events/hour (SpO2 < $eventThreshold%)",
             style = MaterialTheme.typography.bodyMedium,
         )
         Text(
-            stats.spo2EventCount?.toString() ?: "–",
+            stats.spo2EventsPerHour?.let { "%.1f".format(it) } ?: "–",
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.Bold,
         )

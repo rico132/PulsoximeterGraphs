@@ -75,7 +75,7 @@ cached by both sides) — the PIN only needs to be entered once per phone.
 | `0x01` | `REQUEST_DATA` | none | Ask the ESP32 to stream its currently-buffered CSV rows over the Data characteristic. If the buffer has already been read out by an earlier `REQUEST_DATA` since the last download, this first re-downloads everything the still-attached PO-400 currently has (as if it had just been plugged in again) before streaming — see "Recommended sync sequence" below for why re-sending everything is deliberate, not a fixed-size incremental dump. A buffer nothing has read yet (freshly downloaded at boot, or by a real attach/re-attach) is streamed as-is, with no redundant extra download first. |
 | `0x02` | `SET_TIME` | 8 bytes, little-endian Unix epoch seconds | Phone pushes its current clock to the ESP32 (which has no RTC/NTP). Sent on every connection. |
 | `0x03` | `CLEAR_BUFFER` | none | Phone confirms it has durably stored the data it just received; ESP32 may discard its buffered copy, and (only with test mode off) deletes the matching records from the PO-400 itself. Must only be sent **after** a successful local insert. |
-| `0x04` | `SET_TEST_MODE` | 1 byte, `0x00` or `0x01` | When `0x01` (on), the ESP32 never deletes downloaded stored records from the PO-400. Persisted in NVS. **Defaults to `0x01` (on/non-destructive)** until explicitly turned off. |
+| `0x04` | `SET_TEST_MODE` | 1 byte, `0x00` or `0x01` | When `0x01` (on), the ESP32 never deletes downloaded stored records from the PO-400. Persisted in NVS. **Defaults to `0x01` (on/non-destructive)** until explicitly turned off. Sent on every connection (right after `SET_TIME`) by the Android app's own sync — see "Recommended sync sequence" below for why. |
 | `0x07` | `START_FIRMWARE_UPDATE` | `[size:u32 LE][expectedMd5Hex:32 ASCII bytes]` | Begin receiving a new firmware image into the ESP32's *inactive* OTA partition — see "BLE firmware update" below. Refused (result reported immediately, see the Status characteristic below) if a USB stored-record download is in progress, or an update is already under way. |
 | `0x08` | `FINISH_FIRMWARE_UPDATE` | none | Sent once exactly `size` bytes have been written to the Firmware characteristic. Verifies size + MD5 and, **only on success**, switches the boot partition to the new image and reboots. |
 | `0x09` | `ABORT_FIRMWARE_UPDATE` | none | Discards an in-progress firmware update without touching the boot partition. |
@@ -189,22 +189,29 @@ compatible and the common case needs no header at all.
 1. Connect. If not already bonded with this ESP32, pair first (see "BLE pairing" above) — the
    phone's OS handles the PIN-entry dialog natively — then discover services and request MTU 503.
 2. Write `SET_TIME` (always, every connection).
-3. Write `REQUEST_DATA`. This may first re-download everything the PO-400 currently has over USB
+3. Write `SET_TEST_MODE` with the phone's own currently-desired setting (always, every
+   connection, right after `SET_TIME`) — the Android app has no way to read this flag back from
+   the ESP32 (no such read exists), so rather than a separate write triggered straight from its
+   Settings screen, it treats the toggle there as a local preference and pushes it here, as part
+   of the very same connection that will go on to (maybe) write `CLEAR_BUFFER` below. That way a
+   failed `SET_TEST_MODE` write fails the whole sync attempt instead of leaving `CLEAR_BUFFER` to
+   run under an unconfirmed assumption about which mode is actually active.
+4. Write `REQUEST_DATA`. This may first re-download everything the PO-400 currently has over USB
    before streaming any of it — see `REQUEST_DATA`'s own table entry for exactly when — which can
    take a while (the ESP32 waits up to 5 minutes internally); size any client-side inactivity
    timeout accordingly, and re-arm it on every Data notification, not just once at the start.
    Subscribing to the Status characteristic's `STATUS_TAG_USB_DOWNLOAD_STATE` notification (see
    above) lets a client both show that it's this USB wait, not a stalled BLE link, and re-arm its
    own timeout off those notifications too, since no Data notifications go out during this window.
-4. Reassemble Data notifications until the `0x00` terminator; parse the CSV blob.
-5. **Drop any row whose timestamp already exists locally before inserting the rest** — every
+5. Reassemble Data notifications until the `0x00` terminator; parse the CSV blob.
+6. **Drop any row whose timestamp already exists locally before inserting the rest** — every
    `REQUEST_DATA` returns the PO-400's *entire* current stored history, not just what's new
    since the last sync (the ESP32 keeps no notion of "already delivered" across syncs at all;
    test mode, on by default, is what keeps that history sitting on the device in the first
    place). Deduplicating here, not on the ESP32, is deliberate: it's the phone's own database
    that authoritatively knows what it already has, including after e.g. the app's local data
    being cleared and needing everything back — a case the ESP32 alone has no way to detect.
-6. Only after the local insert succeeds, write `CLEAR_BUFFER`.
+7. Only after the local insert succeeds, write `CLEAR_BUFFER`.
 
 This ordering is what makes the protocol crash-safe: if the phone dies mid-insert, the
 ESP32 still has the data next time. `CLEAR_BUFFER` lets the ESP32 reclaim buffer space now that
@@ -225,12 +232,17 @@ Bundled as the Android app's `assets/default_thresholds.json`; not used by the f
   "pulseLowOrange": 50,
   "pulseLowRed": 45,
   "pulseHighOrange": 90,
-  "pulseHighRed": 100
+  "pulseHighRed": 100,
+  "spo2EventThreshold": 90
 }
 ```
 
 Ordering invariant enforced by validation on both read and write:
 `pulseLowRed < pulseLowOrange < pulseHighOrange < pulseHighRed` and `spo2Red < spo2Orange`.
+`spo2EventThreshold` is the SpO2 percentage a desaturation "event" is counted against (see the
+Android app's `GraphViewModel.countSpo2Events`) — unrelated to `spo2Orange`/`spo2Red` above,
+which are chart highlighting bands, not the event-counting cutoff, even though they default to
+the same number.
 
 ## PO-400 USB HID protocol (device side, for firmware reference)
 

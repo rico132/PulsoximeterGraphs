@@ -8,6 +8,9 @@ import org.junit.Test
 /** `pulse` is irrelevant to [countSpo2Events] — always 70, purely to satisfy the constructor. */
 private fun reading(epochSec: Long, spo2: Int) = ReadingEntity(epochSec, spo2, 70)
 
+/** Arbitrary fixed threshold for these tests — [countSpo2Events] no longer hardcodes one itself. */
+private const val THRESHOLD = 94
+
 /**
  * The gap [countSpo2Events] measures is between a run's *last* below-threshold reading and the
  * *next* run's first below-threshold reading — not from whatever above-threshold reading sits in
@@ -18,19 +21,19 @@ class GraphViewModelEventsTest {
 
     @Test
     fun `no readings is null, not zero`() {
-        assertNull(countSpo2Events(emptyList()))
+        assertNull(countSpo2Events(emptyList(), THRESHOLD))
     }
 
     @Test
     fun `no reading below threshold is zero events`() {
         val readings = listOf(reading(0, 96), reading(1, 98), reading(2, 100))
-        assertEquals(0, countSpo2Events(readings))
+        assertEquals(0, countSpo2Events(readings, THRESHOLD))
     }
 
     @Test
     fun `a single dip is one event`() {
         val readings = listOf(reading(0, 96), reading(1, 90), reading(2, 91), reading(3, 96))
-        assertEquals(1, countSpo2Events(readings))
+        assertEquals(1, countSpo2Events(readings, THRESHOLD))
     }
 
     @Test
@@ -40,7 +43,7 @@ class GraphViewModelEventsTest {
             reading(1, 96), // recovers...
             reading(EVENT_MERGE_GAP_SECONDS + 1, 90), // ...for longer than the merge gap
         )
-        assertEquals(2, countSpo2Events(readings))
+        assertEquals(2, countSpo2Events(readings, THRESHOLD))
     }
 
     @Test
@@ -50,7 +53,7 @@ class GraphViewModelEventsTest {
             reading(1, 96), // a brief bounce back above threshold...
             reading(EVENT_MERGE_GAP_SECONDS - 1, 90), // ...shorter than the merge gap
         )
-        assertEquals(1, countSpo2Events(readings))
+        assertEquals(1, countSpo2Events(readings, THRESHOLD))
     }
 
     @Test
@@ -61,7 +64,7 @@ class GraphViewModelEventsTest {
             reading(1, 96),
             reading(EVENT_MERGE_GAP_SECONDS, 90),
         )
-        assertEquals(2, countSpo2Events(readings))
+        assertEquals(2, countSpo2Events(readings, THRESHOLD))
     }
 
     @Test
@@ -73,12 +76,12 @@ class GraphViewModelEventsTest {
             reading(EVENT_MERGE_GAP_SECONDS, 97),
             reading(EVENT_MERGE_GAP_SECONDS * 10, 89), // long gap — a genuinely new event
         )
-        assertEquals(2, countSpo2Events(readings))
+        assertEquals(2, countSpo2Events(readings, THRESHOLD))
     }
 
     @Test
     fun `a run entirely below threshold with no recovery at all is one event`() {
         val readings = listOf(reading(0, 90), reading(1, 88), reading(2, 91), reading(3, 93))
-        assertEquals(1, countSpo2Events(readings))
+        assertEquals(1, countSpo2Events(readings, THRESHOLD))
     }
 }
