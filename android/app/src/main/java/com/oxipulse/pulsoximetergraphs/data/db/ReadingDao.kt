@@ -40,6 +40,35 @@ interface ReadingDao {
     suspend fun rangeOrderedList(startEpochSec: Long, endEpochSec: Long): List<ReadingEntity>
 
     /**
+     * The single earliest/latest reading actually stored within `[startEpochSec, endEpochSec]` —
+     * null if the range has no data at all. Deliberately NOT the same as the range's own
+     * boundaries: a user can select a wider span than the device actually has data for (e.g. an
+     * overnight span picked as 23:00–00:00 that only has readings from 01:00–09:00 in the
+     * middle), and both
+     * [ReadingsRepository.statsForRange][com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository.statsForRange]'s
+     * events/hour rate and
+     * [ReadingsRepository.plottedReadings][com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository.plottedReadings]'s
+     * chart need the *actual data's* span, not the selected span, to be correct — see their own
+     * docs. `ORDER BY ... LIMIT 1` against an indexed column (`timestampEpochSec` is this table's
+     * own primary key) is a single index seek to the first/last matching row, not a full range
+     * scan, so this stays cheap regardless of how many rows fall inside the range.
+     */
+    @Query(
+        "SELECT * FROM readings " +
+            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
+            "ORDER BY timestampEpochSec ASC LIMIT 1"
+    )
+    suspend fun firstInRange(startEpochSec: Long, endEpochSec: Long): ReadingEntity?
+
+    /** See [firstInRange]'s own doc. */
+    @Query(
+        "SELECT * FROM readings " +
+            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
+            "ORDER BY timestampEpochSec DESC LIMIT 1"
+    )
+    suspend fun lastInRange(startEpochSec: Long, endEpochSec: Long): ReadingEntity?
+
+    /**
      * One page of a range, ordered ascending, starting at [afterEpochSec] (inclusive) — keyset
      * pagination (a `WHERE >=` seek against the primary-key index), not `OFFSET`/`LIMIT`, so each
      * page is an equally cheap index seek no matter how far into a huge range it starts, unlike

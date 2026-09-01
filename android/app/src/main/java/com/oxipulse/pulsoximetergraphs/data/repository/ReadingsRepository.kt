@@ -6,7 +6,6 @@ import com.oxipulse.pulsoximetergraphs.data.db.ReadingEntity
 import com.oxipulse.pulsoximetergraphs.data.db.ReadingStats
 import com.oxipulse.pulsoximetergraphs.data.db.Spo2EventCounter
 import com.oxipulse.pulsoximetergraphs.data.db.ValueCount
-import java.time.Duration
 import java.time.Instant
 import kotlin.math.ceil
 import kotlinx.coroutines.Dispatchers
@@ -95,7 +94,16 @@ class ReadingsRepository(private val readingDao: ReadingDao) {
      * is what actually keeps a multi-year range from having to hold millions of those in memory
      * just to render a 500-point chart. The four per-bucket queries can return the same row for
      * more than one extreme (e.g. one reading is both its bucket's min and max pulse, in a
-     * near-flat bucket) — deduplicated by timestamp below.
+     * near-flat bucket).
+     *
+     * [ReadingDao.firstInRange]/[ReadingDao.lastInRange] are always folded in too (deduplicated
+     * along with everything else below), so the *first* and *last* plotted points are always the
+     * exact first/last reading actually in [range] — not just whichever reading happened to hold
+     * an extreme within the first/last time bucket. Without this, the chart's own visible x-axis
+     * could start or end noticeably later/earlier than the selected range itself: e.g. selecting
+     * 01:00–09:00 but the bucket containing 01:00 has its SpO2/pulse extremes at 01:19, so 01:19
+     * — not 01:00 — would be the leftmost thing actually drawn (and labeled) on the chart, reading
+     * as the chart's own timespan disagreeing with what was just selected.
      */
     suspend fun plottedReadings(range: ClosedRange<Instant>, totalCount: Int): List<ReadingEntity> {
         val startEpochSec = range.start.epochSecond
@@ -109,7 +117,11 @@ class ReadingsRepository(private val readingDao: ReadingDao) {
             readingDao.bucketedMaxSpo2(startEpochSec, endEpochSec, bucketCount, spanSeconds) +
             readingDao.bucketedMinPulse(startEpochSec, endEpochSec, bucketCount, spanSeconds) +
             readingDao.bucketedMaxPulse(startEpochSec, endEpochSec, bucketCount, spanSeconds)
-        return extremes.distinctBy { it.timestampEpochSec }.sortedBy { it.timestampEpochSec }
+        val boundary = listOfNotNull(
+            readingDao.firstInRange(startEpochSec, endEpochSec),
+            readingDao.lastInRange(startEpochSec, endEpochSec),
+        )
+        return (extremes + boundary).distinctBy { it.timestampEpochSec }.sortedBy { it.timestampEpochSec }
     }
 
     /**
@@ -127,22 +139,37 @@ class ReadingsRepository(private val readingDao: ReadingDao) {
      *   visit every row (the merge-gap logic depends on exact row-to-row adjacency and timing,
      *   not just the multiset of values), but streaming keeps peak memory to one page at a time
      *   instead of the whole range.
+     *
+     * The events/hour rate is divided by how long [range]'s *data* actually spans — [firstInRange]
+     * to [lastInRange] — not by [range]'s own width. A user can select a wider span than the
+     * device has data for (e.g. an overnight range picked as 23:00–00:00 whose readings only
+     * actually run 01:00–09:00 in the middle); dividing by the selected range's 25 hours there
+     * would understate the true rate by a factor of ~3 compared to dividing by the 8 hours data
+     * was actually recorded across.
      */
     suspend fun statsForRange(range: ClosedRange<Instant>, spo2EventThreshold: Int): ReadingStats {
         val startEpochSec = range.start.epochSecond
         val endEpochSec = range.endInclusive.epochSecond
         val base = readingDao.statsForRange(startEpochSec, endEpochSec)
         val eventCount = countSpo2EventsInRange(range, spo2EventThreshold)
+        val firstReading = readingDao.firstInRange(startEpochSec, endEpochSec)
+        val lastReading = readingDao.lastInRange(startEpochSec, endEpochSec)
         // Hours, not seconds/minutes: the whole point of this rate is to read naturally next to
-        // "events" as a per-hour figure (e.g. "24 events over 3 hours" -> "8/hr") regardless of
-        // how long or short the selected range happens to be, rather than a raw count that means
-        // something different in a 30-minute range than in a week-long one.
-        val durationHours = Duration.between(range.start, range.endInclusive).toMillis() / 3_600_000.0
+        // "events" as a per-hour figure (e.g. "24 events over 3 hours of actual data" -> "8/hr")
+        // regardless of how long the selected range happens to be, rather than a raw count that
+        // means something different depending on how much of the range actually has data.
+        val dataDurationHours = if (firstReading != null && lastReading != null) {
+            (lastReading.timestampEpochSec - firstReading.timestampEpochSec) / 3_600.0
+        } else {
+            null
+        }
         return base.copy(
             p95Spo2 = percentile95FromHistogram(readingDao.spo2Histogram(startEpochSec, endEpochSec)),
             p95Pulse = percentile95FromHistogram(readingDao.pulseHistogram(startEpochSec, endEpochSec)),
             spo2EventCount = eventCount,
-            spo2EventsPerHour = eventCount?.let { count -> if (durationHours > 0) count / durationHours else null },
+            spo2EventsPerHour = eventCount?.let { count ->
+                if (dataDurationHours != null && dataDurationHours > 0) count / dataDurationHours else null
+            },
         )
     }
 

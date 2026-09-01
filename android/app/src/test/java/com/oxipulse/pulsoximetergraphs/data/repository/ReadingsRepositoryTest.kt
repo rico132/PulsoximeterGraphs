@@ -37,6 +37,12 @@ private class FakeReadingDao(seed: List<ReadingEntity> = emptyList()) : ReadingD
     override suspend fun rangeOrderedList(startEpochSec: Long, endEpochSec: Long): List<ReadingEntity> =
         inRange(startEpochSec, endEpochSec)
 
+    override suspend fun firstInRange(startEpochSec: Long, endEpochSec: Long): ReadingEntity? =
+        inRange(startEpochSec, endEpochSec).firstOrNull()
+
+    override suspend fun lastInRange(startEpochSec: Long, endEpochSec: Long): ReadingEntity? =
+        inRange(startEpochSec, endEpochSec).lastOrNull()
+
     override suspend fun pageInRange(afterEpochSec: Long, endEpochSec: Long, limit: Int): List<ReadingEntity> =
         inRange(afterEpochSec, endEpochSec).take(limit)
 
@@ -252,5 +258,61 @@ class ReadingsRepositoryTest {
         val stats = repo.statsForRange(range, spo2EventThreshold = 90)
 
         assertEquals(1, stats.spo2EventCount)
+    }
+
+    @Test
+    fun `statsForRange divides by the actual data span, not the wider selected range`() = runTest {
+        // Exactly the reported scenario: a 25-hour selected range (23:00 the day before through
+        // 00:00 the day after), but the device only actually has 8 hours of data in the middle
+        // (01:00-09:00) with 2 desaturation events in it -- the rate must be 2/8 = 0.25/hr, not
+        // 2/25.
+        val selectedStart = epochOf("2026-08-11", "23:00:00")
+        val selectedEnd = epochOf("2026-08-13", "00:00:00")
+        val dataStart = epochOf("2026-08-12", "01:00:00")
+        val dataEnd = epochOf("2026-08-12", "09:00:00")
+        assertEquals("data must span exactly 8 hours for this test to mean what it says", 8 * 3600L, dataEnd - dataStart)
+
+        val readings = listOf(
+            ReadingEntity(timestampEpochSec = dataStart, spo2 = 85, pulse = 70), // event 1
+            ReadingEntity(timestampEpochSec = dataStart + 3600, spo2 = 98, pulse = 70), // recovers, long gap after
+            ReadingEntity(timestampEpochSec = dataStart + 7200, spo2 = 85, pulse = 70), // event 2
+            ReadingEntity(timestampEpochSec = dataEnd, spo2 = 98, pulse = 70),
+        )
+        val dao = FakeReadingDao(readings)
+        val repo = ReadingsRepository(dao)
+        val range = Instant.ofEpochSecond(selectedStart)..Instant.ofEpochSecond(selectedEnd)
+
+        val stats = repo.statsForRange(range, spo2EventThreshold = 90)
+
+        assertEquals(2, stats.spo2EventCount)
+        assertEquals(0.25, stats.spo2EventsPerHour!!, 1e-9)
+    }
+
+    @Test
+    fun `plottedReadings always includes the exact first and last reading in range`() = runTest {
+        // A wide, sparse range (bucket width ~4800s, well over the 500s offsets below) whose
+        // bucket-local SpO2 extremes don't happen to fall on the range's own first/last reading --
+        // the decimated chart must still start and end exactly at the true boundary readings, not
+        // wherever the nearest bucket's extreme happened to be.
+        val start = 0L
+        val end = 600_000L
+        val boundaryAndSpikes = listOf(
+            ReadingEntity(timestampEpochSec = start, spo2 = 95, pulse = 70), // unremarkable boundary reading
+            ReadingEntity(timestampEpochSec = start + 500, spo2 = 80, pulse = 70), // this bucket's real extreme
+            ReadingEntity(timestampEpochSec = end - 500, spo2 = 100, pulse = 70), // this bucket's real extreme
+            ReadingEntity(timestampEpochSec = end, spo2 = 95, pulse = 70), // unremarkable boundary reading
+        )
+        // Sparse fill (>MAX_PLOTTED_POINTS rows, spaced 1000s apart) just to trigger the decimated
+        // path -- not meant to be realistic sampling density.
+        val sparseFill = (0..600).map { i -> ReadingEntity(timestampEpochSec = (i * 1000L).coerceAtMost(end), spo2 = 95, pulse = 70) }
+        val readings = (boundaryAndSpikes + sparseFill).distinctBy { it.timestampEpochSec }
+        val dao = FakeReadingDao(readings)
+        val repo = ReadingsRepository(dao)
+        val range = Instant.ofEpochSecond(start)..Instant.ofEpochSecond(end)
+
+        val plotted = repo.plottedReadings(range, totalCount = readings.size)
+
+        assertEquals("the very first plotted reading must be the range's true first reading", start, plotted.first().timestampEpochSec)
+        assertEquals("the very last plotted reading must be the range's true last reading", end, plotted.last().timestampEpochSec)
     }
 }
