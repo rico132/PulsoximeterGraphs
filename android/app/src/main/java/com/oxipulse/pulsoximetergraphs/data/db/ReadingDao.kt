@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.RewriteQueriesToDropUnusedColumns
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -13,12 +14,46 @@ interface ReadingDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(readings: List<ReadingEntity>)
 
+    /**
+     * Reactive row count for a range — Room's own invalidation tracking re-emits this whenever
+     * the `readings` table changes (a BLE sync, a CSV import), the same way a
+     * `Flow<List<ReadingEntity>>` query would, but without ever materializing a single
+     * [ReadingEntity]: `COUNT(*)` is answered from the index alone. Used both to decide, in
+     * [com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository.plottedReadings],
+     * whether a range is small enough to return as-is or needs decimating, and as the shared
+     * "something changed, refetch" trigger for that repository's other range queries — see its
+     * own doc for why a plain unbounded `Flow<List<ReadingEntity>>` isn't used for this any more.
+     */
+    @Query("SELECT COUNT(*) FROM readings WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec")
+    fun observeCountInRange(startEpochSec: Long, endEpochSec: Long): Flow<Int>
+
+    /**
+     * Every row in the range, in order — only safe to call once the caller already knows (via
+     * [observeCountInRange]) that the range is small; see
+     * [com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository.plottedReadings].
+     */
     @Query(
         "SELECT * FROM readings " +
             "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
             "ORDER BY timestampEpochSec ASC"
     )
-    fun observeRange(startEpochSec: Long, endEpochSec: Long): Flow<List<ReadingEntity>>
+    suspend fun rangeOrderedList(startEpochSec: Long, endEpochSec: Long): List<ReadingEntity>
+
+    /**
+     * One page of a range, ordered ascending, starting at [afterEpochSec] (inclusive) — keyset
+     * pagination (a `WHERE >=` seek against the primary-key index), not `OFFSET`/`LIMIT`, so each
+     * page is an equally cheap index seek no matter how far into a huge range it starts, unlike
+     * `OFFSET`, which re-scans and discards every prior row on every call. Used by
+     * [com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository] to stream through a
+     * range in bounded-size chunks (e.g. for desaturation-event counting) instead of loading it
+     * all into memory as one `List` — see that repository's own doc.
+     */
+    @Query(
+        "SELECT * FROM readings " +
+            "WHERE timestampEpochSec BETWEEN :afterEpochSec AND :endEpochSec " +
+            "ORDER BY timestampEpochSec ASC LIMIT :limit"
+    )
+    suspend fun pageInRange(afterEpochSec: Long, endEpochSec: Long, limit: Int): List<ReadingEntity>
 
     @Query(
         "SELECT " +
@@ -28,6 +63,104 @@ interface ReadingDao {
             "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec"
     )
     suspend fun statsForRange(startEpochSec: Long, endEpochSec: Long): ReadingStats
+
+    /**
+     * A (value, count) histogram of every SpO2 reading in range, sorted ascending by value —
+     * bounded by the number of *distinct* SpO2 values (SpO2 is a percentage, so at most 101),
+     * never by the row count. [ReadingsRepository][com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository]
+     * computes the 95th percentile from this instead of sorting every raw reading, which is what
+     * keeps that computation cheap across a multi-year range instead of needing an O(n)-memory
+     * sort of every row in it.
+     */
+    @Query(
+        "SELECT spo2 AS value, COUNT(*) AS count FROM readings " +
+            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
+            "GROUP BY spo2 ORDER BY spo2 ASC"
+    )
+    suspend fun spo2Histogram(startEpochSec: Long, endEpochSec: Long): List<ValueCount>
+
+    /** Same as [spo2Histogram], for pulse — bounded by the number of distinct bpm values seen. */
+    @Query(
+        "SELECT pulse AS value, COUNT(*) AS count FROM readings " +
+            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
+            "GROUP BY pulse ORDER BY pulse ASC"
+    )
+    suspend fun pulseHistogram(startEpochSec: Long, endEpochSec: Long): List<ValueCount>
+
+    /**
+     * The four `bucketedXxx` queries below are what
+     * [ReadingsRepository.plottedReadings][com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository.plottedReadings]
+     * decimates a wide range down to for charting: [range] is split into [bucketCount] equal-
+     * duration time buckets (bucket index = `(timestampEpochSec - startEpochSec) * bucketCount /
+     * spanSeconds`), and each query returns, for every non-empty bucket, the single row holding
+     * that bucket's minimum or maximum SpO2/pulse. At most [bucketCount] rows come back — however
+     * many raw readings the range actually contains, memory here is bounded by the bucket count
+     * alone.
+     *
+     * The trick that makes "the whole row containing the min/max" a single aggregate query
+     * without a self-join or a window function: SQLite specifically documents that when a query's
+     * result columns contain exactly one bare `MIN()`/`MAX()` aggregate, every *other* bare
+     * (non-aggregated) column in that result takes its value from the same row that produced the
+     * min/max — see "Bare columns in an aggregate query" in SQLite's own `SELECT` documentation.
+     * `MIN(spo2)`/`MAX(spo2)`/`MIN(pulse)`/`MAX(pulse)` below exist in the query purely to trigger
+     * that behavior for the bare `timestampEpochSec`/`spo2`/`pulse` columns actually wanted;
+     * [RewriteQueriesToDropUnusedColumns] has Room wrap the query so that extra aggregate column
+     * never has to be reflected in [ReadingEntity] itself.
+     */
+    @RewriteQueriesToDropUnusedColumns
+    @Query(
+        "SELECT timestampEpochSec, spo2, pulse, MIN(spo2) FROM readings " +
+            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
+            "GROUP BY ((timestampEpochSec - :startEpochSec) * :bucketCount) / :spanSeconds"
+    )
+    suspend fun bucketedMinSpo2(
+        startEpochSec: Long,
+        endEpochSec: Long,
+        bucketCount: Int,
+        spanSeconds: Long,
+    ): List<ReadingEntity>
+
+    /** See [bucketedMinSpo2]'s own doc. */
+    @RewriteQueriesToDropUnusedColumns
+    @Query(
+        "SELECT timestampEpochSec, spo2, pulse, MAX(spo2) FROM readings " +
+            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
+            "GROUP BY ((timestampEpochSec - :startEpochSec) * :bucketCount) / :spanSeconds"
+    )
+    suspend fun bucketedMaxSpo2(
+        startEpochSec: Long,
+        endEpochSec: Long,
+        bucketCount: Int,
+        spanSeconds: Long,
+    ): List<ReadingEntity>
+
+    /** See [bucketedMinSpo2]'s own doc. */
+    @RewriteQueriesToDropUnusedColumns
+    @Query(
+        "SELECT timestampEpochSec, spo2, pulse, MIN(pulse) FROM readings " +
+            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
+            "GROUP BY ((timestampEpochSec - :startEpochSec) * :bucketCount) / :spanSeconds"
+    )
+    suspend fun bucketedMinPulse(
+        startEpochSec: Long,
+        endEpochSec: Long,
+        bucketCount: Int,
+        spanSeconds: Long,
+    ): List<ReadingEntity>
+
+    /** See [bucketedMinSpo2]'s own doc. */
+    @RewriteQueriesToDropUnusedColumns
+    @Query(
+        "SELECT timestampEpochSec, spo2, pulse, MAX(pulse) FROM readings " +
+            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
+            "GROUP BY ((timestampEpochSec - :startEpochSec) * :bucketCount) / :spanSeconds"
+    )
+    suspend fun bucketedMaxPulse(
+        startEpochSec: Long,
+        endEpochSec: Long,
+        bucketCount: Int,
+        spanSeconds: Long,
+    ): List<ReadingEntity>
 
     @Query("SELECT COUNT(*) FROM readings")
     suspend fun count(): Int

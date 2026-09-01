@@ -238,21 +238,21 @@ fun GraphScreen(
         // to drift out of sync in the first place.
         val sharedZoomState = rememberVicoZoomState(zoomEnabled = false, initialZoom = Zoom.Content)
         val sharedScrollState = rememberVicoScrollState(scrollEnabled = false)
-        // Capped and decimated once for the currently selected range — see decimateKeepingExtremes.
-        // Dragging a selection (below) replaces this with a narrower selectedRange rather than
-        // trying to re-decimate this same list on the fly.
-        val plottedReadings = remember(readings) { decimateKeepingExtremes(readings) }
+        // readings is already capped/decimated by the time it gets here — see
+        // ReadingsRepository.plottedReadings's own doc; this screen no longer does any of that
+        // itself. Dragging a selection (below) replaces this with a narrower selectedRange rather
+        // than trying to re-decimate this same list on the fly.
         // Same "does this need a date label" check rememberTimeAxisFormatter makes per-chart (see
         // needsDateLabel's own doc) — computed once more here purely to size the shared item
         // placer's label spacing to match the (possibly longer, date-including) labels it'll
         // place, not to duplicate the formatting decision itself.
         val zone = remember { ZoneId.systemDefault() }
-        val multiDayLabels = remember(plottedReadings, zone) { needsDateLabel(plottedReadings, zone) }
+        val multiDayLabels = remember(readings, zone) { needsDateLabel(readings, zone) }
         // Shared between both charts' bottom axes so they pick the exact same tick indices —
         // see the parameter doc on rememberSharedTimeAxisItemPlacer for why leaving each chart
         // to compute its own (Vico's default) caused SpO2 and Pulse to show different times for
         // what's supposed to be the same x-position.
-        val timeAxisItemPlacer = rememberSharedTimeAxisItemPlacer(plottedReadings.size, multiDayLabels)
+        val timeAxisItemPlacer = rememberSharedTimeAxisItemPlacer(readings.size, multiDayLabels)
 
         Column(
             modifier = Modifier
@@ -263,7 +263,7 @@ fun GraphScreen(
         ) {
             StatsPanel(selectedRange, stats, thresholdConfig.spo2EventThreshold)
             ChartsCard(
-                readings = plottedReadings,
+                readings = readings,
                 thresholdConfig = thresholdConfig,
                 stats = stats,
                 zoomState = sharedZoomState,
@@ -783,46 +783,6 @@ private fun rememberYAxisItemPlacer(minY: Int?, maxY: Int?): VerticalAxis.ItemPl
             VerticalAxis.ItemPlacer.step()
         }
     }
-
-private const val MAX_PLOTTED_POINTS = 500
-
-/**
- * Vico doesn't cull off-screen points, so line-rendering cost (and pan/zoom smoothness) scales
- * with point count regardless of how zoomed in the user currently is — a big CSV import or a
- * wide, densely-sampled date range could otherwise mean tracing tens of thousands of points on
- * every frame. Cap it by splitting the range into buckets and keeping each bucket's local
- * min/max for *both* SpO2 and pulse (not just picking every Nth reading), so a brief
- * desaturation or a short spike still shows up on the chart instead of silently getting
- * skipped — this is a monitoring app, so hiding a real (if brief) out-of-range reading purely
- * for smoother scrolling isn't an acceptable trade. Both charts must decimate to the exact same
- * indices (computed once, shared) for the pan/zoom sync above to actually line them up.
- */
-private fun decimateKeepingExtremes(readings: List<ReadingEntity>): List<ReadingEntity> {
-    if (readings.size <= MAX_PLOTTED_POINTS) return readings
-    val bucketCount = (MAX_PLOTTED_POINTS / 4).coerceAtLeast(1)
-    val bucketSize = (readings.size + bucketCount - 1) / bucketCount
-    val kept = sortedSetOf<Int>()
-    var bucketStart = 0
-    while (bucketStart < readings.size) {
-        val bucketEnd = (bucketStart + bucketSize).coerceAtMost(readings.size)
-        var minSpo2 = bucketStart
-        var maxSpo2 = bucketStart
-        var minPulse = bucketStart
-        var maxPulse = bucketStart
-        for (i in bucketStart until bucketEnd) {
-            if (readings[i].spo2 < readings[minSpo2].spo2) minSpo2 = i
-            if (readings[i].spo2 > readings[maxSpo2].spo2) maxSpo2 = i
-            if (readings[i].pulse < readings[minPulse].pulse) minPulse = i
-            if (readings[i].pulse > readings[maxPulse].pulse) maxPulse = i
-        }
-        kept += minSpo2
-        kept += maxSpo2
-        kept += minPulse
-        kept += maxPulse
-        bucketStart = bucketEnd
-    }
-    return kept.map { readings[it] }
-}
 
 /** Below this fraction of the chart's width, a drag is treated as an accidental tap/jitter, not a zoom. */
 private const val MIN_DRAG_FRACTION = 0.03f

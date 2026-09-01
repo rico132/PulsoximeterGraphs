@@ -1,6 +1,5 @@
-package com.oxipulse.pulsoximetergraphs.ui.graphs
+package com.oxipulse.pulsoximetergraphs.data.db
 
-import com.oxipulse.pulsoximetergraphs.data.db.ReadingEntity
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -17,7 +16,7 @@ private const val THRESHOLD = 94
  * between. Every test below anchors its timestamps off that last-below-threshold reading (always
  * at epoch 0) to keep that unambiguous.
  */
-class GraphViewModelEventsTest {
+class Spo2EventCountingTest {
 
     @Test
     fun `no readings is null, not zero`() {
@@ -83,5 +82,23 @@ class GraphViewModelEventsTest {
     fun `a run entirely below threshold with no recovery at all is one event`() {
         val readings = listOf(reading(0, 90), reading(1, 88), reading(2, 91), reading(3, 93))
         assertEquals(1, countSpo2Events(readings, THRESHOLD))
+    }
+
+    @Test
+    fun `feeding a Spo2EventCounter in multiple chunks matches feeding it all at once`() {
+        // This is exactly the shape ReadingsRepository.countSpo2EventsInRange relies on: pages
+        // fetched separately from the database but fed into one running counter must produce the
+        // same result as if the whole range had been loaded and counted in one go.
+        val readings = listOf(
+            reading(0, 90),
+            reading(1, 96),
+            reading(EVENT_MERGE_GAP_SECONDS - 1, 91), // merges with the first dip
+            reading(EVENT_MERGE_GAP_SECONDS, 97),
+            reading(EVENT_MERGE_GAP_SECONDS * 10, 89), // long gap — a genuinely new event
+        )
+        val counter = Spo2EventCounter(THRESHOLD)
+        readings.chunked(2).forEach { chunk -> chunk.forEach(counter::accept) }
+
+        assertEquals(countSpo2Events(readings, THRESHOLD), counter.result())
     }
 }
