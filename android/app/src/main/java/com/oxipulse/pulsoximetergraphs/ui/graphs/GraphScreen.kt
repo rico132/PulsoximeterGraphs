@@ -596,20 +596,6 @@ private fun nearestPlottedReading(points: List<PlottedReading>, xValue: Double):
     return points[lo]
 }
 
-/**
- * Splits [points] (assumed sorted ascending by [PlottedReading.xIndex]/timestamp) into
- * consecutive runs sharing the same [PlottedReading.sessionIndex] — each run becomes its own
- * separate Vico series in Spo2ChartContent/PulseChartContent, which is what actually stops the
- * chart drawing a line across a real gap in the data (see [PlottedReading.sessionIndex]'s own
- * doc): Vico never draws a connecting line between two different series, only within one, so a
- * genuinely new run here reads as a real break, not just a wide gap in x-position. `groupBy`
- * (not a manual scan) is enough here specifically because [points] is already sorted — the
- * resulting `LinkedHashMap` preserves each key's first-seen order, so both the map's key order
- * and each value list's element order come out already sorted with no extra work.
- */
-private fun groupBySessions(points: List<PlottedReading>): List<List<PlottedReading>> =
-    points.groupBy { it.sessionIndex }.values.toList()
-
 private val TIME_ONLY_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
 
 // Includes the date on every label once the selected range crosses a day boundary — a gap in the
@@ -1014,20 +1000,23 @@ private fun Spo2ChartContent(
         modelProducer.runTransaction {
             // A series must be non-empty (Vico throws otherwise), so only add one when there's
             // actually data for the selected range — an empty transaction just renders no line.
+            //
+            // Splitting this into one Vico series per real session (see groupBySessions/
+            // PlottedReading.sessionIndex's own docs) — so the chart wouldn't draw a line across
+            // a real gap — was tried and reverted: decompiling Vico 3.2.3 confirmed
+            // LineCartesianLayerModel sorts each series *individually* by x but then simply
+            // concatenates them into its internal `entries` list rather than merging by x, and
+            // both getXDeltaGcd() and the aligned HorizontalAxis.ItemPlacer's label-position math
+            // walk that same list assuming it's globally sorted. With more than one series that
+            // assumption breaks, and it manifested as the bottom axis losing its labels entirely.
+            // Single series, one gapless line, until there's a safe way to verify a fix (e.g. a
+            // custom PointConnector, which doesn't touch this code path) against a real device.
             if (points.isNotEmpty()) {
                 lineModel {
-                    // One Vico series per real session (see groupBySessions's own doc), not one
-                    // series for the whole range — that's what actually stops the line being
-                    // drawn across a real gap in the data, rather than just spacing the two
-                    // sides of it proportionally far apart (which PlottedReading.xIndex alone
-                    // already guarantees, but doesn't by itself prevent a connecting line).
-                    for (session in groupBySessions(points)) {
-                        series(
-                            x = session.map { it.xIndex.toDouble() },
-                            y = session.map { it.reading.spo2.toDouble() },
-                            key = session.first().sessionIndex,
-                        )
-                    }
+                    series(
+                        x = points.map { it.xIndex.toDouble() },
+                        y = points.map { it.reading.spo2.toDouble() },
+                    )
                 }
             }
         }
@@ -1113,16 +1102,14 @@ private fun PulseChartContent(
     val modelProducer = remember { CartesianChartModelProducer() }
     LaunchedEffect(points) {
         modelProducer.runTransaction {
+            // See the matching comment in Spo2ChartContent for why this is one series, not one
+            // per session.
             if (points.isNotEmpty()) {
                 lineModel {
-                    // See the matching comment in Spo2ChartContent.
-                    for (session in groupBySessions(points)) {
-                        series(
-                            x = session.map { it.xIndex.toDouble() },
-                            y = session.map { it.reading.pulse.toDouble() },
-                            key = session.first().sessionIndex,
-                        )
-                    }
+                    series(
+                        x = points.map { it.xIndex.toDouble() },
+                        y = points.map { it.reading.pulse.toDouble() },
+                    )
                 }
             }
         }
