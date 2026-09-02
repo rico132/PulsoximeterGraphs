@@ -45,6 +45,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -53,6 +54,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -253,7 +255,7 @@ fun GraphScreen(
         // see the parameter doc on rememberSharedTimeAxisItemPlacer for why leaving each chart
         // to compute its own (Vico's default) caused SpO2 and Pulse to show different times for
         // what's supposed to be the same x-position.
-        val timeAxisItemPlacer = rememberSharedTimeAxisItemPlacer(readings.size, multiDayLabels)
+        val timeAxisItemPlacer = rememberSharedTimeAxisItemPlacer(readings, multiDayLabels)
 
         Column(
             modifier = Modifier
@@ -677,18 +679,39 @@ private fun rememberTimeAxisLabelComponent() = rememberAxisLabelComponent(lineCo
  * the same x-position "5:45", even though both plot the exact same [PlottedReading] list at the
  * exact same [PlottedReading.xIndex] values. Since both charts already share one x-domain
  * (identical xIndex values — see rememberTimeAxisFormatter above), tick placement here is instead
- * computed from point count alone via an explicit `spacing`, with `addExtremeLabelPadding` off —
- * that flag is what reintroduces a pixel-width-dependent multiplier even with an explicit spacing (see
- * AlignedHorizontalAxisItemPlacer.getLabelValues), so turning it off is what actually makes this
- * deterministic across the two charts rather than just "usually the same."
+ * computed from the x-domain span alone via an explicit `spacing`, with `addExtremeLabelPadding`
+ * off — that flag is what reintroduces a pixel-width-dependent multiplier even with an explicit
+ * spacing (see AlignedHorizontalAxisItemPlacer.getLabelValues), so turning it off is what actually
+ * makes this deterministic across the two charts rather than just "usually the same."
+ *
+ * `spacing` here is in the same units Vico's own `AlignedHorizontalAxisItemPlacer` uses for it —
+ * a multiple of `xStep` (confirmed by decompiling `HorizontalAxisItemPlacersKt.getLabelValues`:
+ * candidate label positions land at `minX + xStep * k * spacing`), **not** a count of plotted
+ * points. An earlier version of this function computed `spacing` straight from `points.size`,
+ * which happened to work back when every plotted point held its own distinct, contiguous
+ * x-index — one plotted point per x-domain unit, so "count of points" and "width of the domain"
+ * were the same number. That stopped being true once
+ * [ReadingsRepository.plottedReadings][com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository.plottedReadings]
+ * started quantizing [PlottedReading.xIndex] onto a small, *fixed*-size bucket grid (its own
+ * `bucketCount`, currently 125) regardless of how many points end up plotted — a heavily
+ * decimated wide range can still plot up to 500 points, all sharing that same ~125-wide x-domain.
+ * Computing `spacing` from `points.size` (up to 500) against a domain that's actually only ~125
+ * wide overestimated the true per-label x-gap several times over, which starved
+ * `getLabelValues`'s scan down to at most one or two candidate positions actually landing inside
+ * the visible range — read as "no x-axis labels," on ranges the earlier multi-series revert had
+ * nothing to do with. Computing `spacing` from the real domain span (`points`' own first/last
+ * [PlottedReading.xIndex], not its length) keeps roughly `targetCount` labels showing regardless
+ * of how many points happen to be plotted.
  */
 @Composable
-private fun rememberSharedTimeAxisItemPlacer(pointCount: Int, multiDay: Boolean): HorizontalAxis.ItemPlacer =
-    remember(pointCount, multiDay) {
+private fun rememberSharedTimeAxisItemPlacer(points: List<PlottedReading>, multiDay: Boolean): HorizontalAxis.ItemPlacer {
+    val domainSpan = if (points.size >= 2) points.last().xIndex - points.first().xIndex else 0L
+    return remember(domainSpan, multiDay) {
         val targetCount = if (multiDay) TARGET_TIME_AXIS_LABEL_COUNT_MULTI_DAY else TARGET_TIME_AXIS_LABEL_COUNT
-        val spacing = (pointCount / targetCount).coerceAtLeast(1)
+        val spacing = (domainSpan / targetCount).coerceAtLeast(1).toInt()
         HorizontalAxis.ItemPlacer.aligned(spacing = { spacing }, addExtremeLabelPadding = false)
     }
+}
 
 /**
  * The Y axis is padded out to the nearest multiple of 5 beyond the actual min/max for the
@@ -833,16 +856,26 @@ private const val MIN_DRAG_FRACTION = 0.03f
  * type's own doc for why those two differ), then [nearestPlottedReading] resolves whatever
  * xIndex that fraction lands on to the closest *real* point, since xIndex can be sparse. This is
  * only accurate because the wrapped chart's own zoom/scroll is disabled (see GraphScreen) — with
- * pan/zoom off, the minimum xIndex always sits at the left edge of this Box and the maximum at
- * the right edge, with no live pan offset to account for. This doesn't correct for the vertical
- * axis's label gutter eating into the left edge of that width, so the mapping is approximate near
- * the edges — acceptable for "roughly select a section," and cheap to redo since every drag is
- * undoable via the toolbar's zoom-out button.
+ * pan/zoom off, the minimum xIndex always sits at the actual left edge of the *plotted area* and
+ * the maximum at its right edge, with no live pan offset to account for.
+ *
+ * [layerBounds] is that plotted area's own bounds within this Box, in the same pixel coordinate
+ * space [content] draws in — reported by [rememberGapAwareInterpolator] from Vico's own
+ * `CartesianDrawingContext.layerBounds` (see that function's own doc). Vico insets the actual
+ * data area from this Box's edges by the vertical axis's label gutter, and that gutter's width
+ * varies per chart (SpO2's "100" vs Pulse's "45" — see rememberSharedTimeAxisItemPlacer's own doc
+ * for the same gutter-width difference biting axis labels) and sits on the *left* — so computing
+ * the drag fraction against this Box's raw width instead of the true plotted-area bounds always
+ * started the mapped selection some pixels to the right of wherever the plot's own left edge
+ * (and hence the leftmost real data point) actually was: the drag looked like it could never
+ * reach the leftmost part of the chart. Falls back to the raw Box width ([widthPx], from
+ * `onSizeChanged`) only for the one frame before Vico's first draw call has reported it.
  */
 @Composable
 private fun DragToZoomOverlay(
     points: List<PlottedReading>,
     onRangeSelected: (ClosedRange<Instant>) -> Unit,
+    layerBounds: Rect?,
     modifier: Modifier = Modifier,
     content: @Composable BoxScope.() -> Unit,
 ) {
@@ -853,8 +886,20 @@ private fun DragToZoomOverlay(
     fun pointAt(x: Float): PlottedReading {
         val minXIndex = points.first().xIndex
         val maxXIndex = points.last().xIndex
-        if (widthPx <= 0f || maxXIndex == minXIndex) return points.first()
-        val fraction = (x / widthPx).coerceIn(0f, 1f)
+        if (maxXIndex == minXIndex) return points.first()
+        val bounds = layerBounds
+        val left: Float
+        val right: Float
+        if (bounds != null && bounds.width > 0f) {
+            left = bounds.left
+            right = bounds.right
+        } else if (widthPx > 0f) {
+            left = 0f
+            right = widthPx
+        } else {
+            return points.first()
+        }
+        val fraction = ((x - left) / (right - left)).coerceIn(0f, 1f)
         val targetXIndex = minXIndex + ((maxXIndex - minXIndex) * fraction).roundToInt()
         return nearestPlottedReading(points, targetXIndex.toDouble())
     }
@@ -970,9 +1015,23 @@ private val CHART_LINE_STROKE = LineCartesianLayer.LineStroke.Continuous(thickne
  * `GraphScreen`'s own doc on disabling both), so there is no legitimate "off-screen" subset to
  * skip in the first place — always drawing everything Vico safely can, rather than trusting
  * either side's index range, isn't a workaround with a downside here, it's just correct.
+ *
+ * [layerBounds] gets [CartesianDrawingContext.layerBounds] written into it on every draw call —
+ * piggybacking on this interpolator rather than adding a separate hook, since this is already
+ * invoked on every draw with a `context` that carries it. That's the plotted area's own bounds,
+ * inset from this chart's edges by (among other things) the vertical axis's label gutter; see
+ * [DragToZoomOverlay]'s own doc for why it needs those bounds rather than just the chart Box's
+ * raw width. Writing plain [androidx.compose.runtime.MutableState] from inside a draw callback is
+ * safe the same way any other draw-driven measurement callback is — it settles once layout is
+ * stable, and only triggers recomposition of whatever actually reads `layerBounds.value`
+ * ([DragToZoomOverlay]), not of this interpolator itself (`remember(points)` above doesn't depend
+ * on it).
  */
 @Composable
-private fun rememberGapAwareInterpolator(points: List<PlottedReading>): LineCartesianLayer.Interpolator =
+private fun rememberGapAwareInterpolator(
+    points: List<PlottedReading>,
+    layerBounds: MutableState<Rect?>,
+): LineCartesianLayer.Interpolator =
     remember(points) {
         object : LineCartesianLayer.Interpolator {
             override val visiblePadding: Int? = null
@@ -983,6 +1042,7 @@ private fun rememberGapAwareInterpolator(points: List<PlottedReading>): LineCart
                 offsets: List<Offset>,
                 visibleIndexRange: IntRange,
             ) {
+                layerBounds.value = context.layerBounds
                 val lastIndex = minOf(offsets.size, points.size) - 1
                 for (index in 0..lastIndex) {
                     val offset = offsets[index]
@@ -1109,10 +1169,11 @@ private fun Spo2ChartContent(
     val bands = rememberSpo2ThresholdBands(thresholdConfig, visibleMinY = minY?.toDouble(), visibleMaxY = maxY?.toDouble())
     val rangeProvider = remember(minY, maxY) { fixedYRange(minY, maxY) }
     val yAxisItemPlacer = rememberYAxisItemPlacer(minY, maxY)
+    val layerBounds = remember { mutableStateOf<Rect?>(null) }
     val spo2Line = LineCartesianLayer.rememberLine(
         fill = LineCartesianLayer.LineFill.single(Fill(spo2Color)),
         stroke = CHART_LINE_STROKE,
-        interpolator = rememberGapAwareInterpolator(points),
+        interpolator = rememberGapAwareInterpolator(points, layerBounds),
     )
     val labelFontSize = MaterialTheme.typography.labelSmall.fontSize
 
@@ -1122,6 +1183,7 @@ private fun Spo2ChartContent(
             DragToZoomOverlay(
                 points = points,
                 onRangeSelected = onRangeSelected,
+                layerBounds = layerBounds.value,
                 modifier = Modifier.fillMaxWidth().height(220.dp),
             ) {
                 CartesianChartHost(
@@ -1200,10 +1262,11 @@ private fun PulseChartContent(
     val bands = rememberPulseThresholdBands(thresholdConfig, visibleMinY = minY?.toDouble(), visibleMaxY = maxY?.toDouble())
     val rangeProvider = remember(minY, maxY) { fixedYRange(minY, maxY) }
     val yAxisItemPlacer = rememberYAxisItemPlacer(minY, maxY)
+    val layerBounds = remember { mutableStateOf<Rect?>(null) }
     val pulseLine = LineCartesianLayer.rememberLine(
         fill = LineCartesianLayer.LineFill.single(Fill(pulseColor)),
         stroke = CHART_LINE_STROKE,
-        interpolator = rememberGapAwareInterpolator(points),
+        interpolator = rememberGapAwareInterpolator(points, layerBounds),
     )
     val labelFontSize = MaterialTheme.typography.labelSmall.fontSize
 
@@ -1213,6 +1276,7 @@ private fun PulseChartContent(
             DragToZoomOverlay(
                 points = points,
                 onRangeSelected = onRangeSelected,
+                layerBounds = layerBounds.value,
                 modifier = Modifier.fillMaxWidth().height(220.dp),
             ) {
                 CartesianChartHost(
