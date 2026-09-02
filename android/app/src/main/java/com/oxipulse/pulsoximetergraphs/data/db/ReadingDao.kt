@@ -69,6 +69,34 @@ interface ReadingDao {
     suspend fun lastInRange(startEpochSec: Long, endEpochSec: Long): ReadingEntity?
 
     /**
+     * The starting timestamp of every real "session" break within `[startEpochSec, endEpochSec]`
+     * — every reading whose gap since the *previous* reading (by timestamp, not by anything
+     * decimation kept) is at least [minGapSeconds]. Used by
+     * [ReadingsRepository.plottedReadings][com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository.plottedReadings]
+     * to split the chart into separate, unconnected line segments at real gaps in the data (the
+     * device plainly wasn't being worn) instead of drawing a straight line across them — see that
+     * function's own doc.
+     *
+     * `LAG(timestampEpochSec) OVER (ORDER BY timestampEpochSec)` genuinely has to visit every row
+     * in range once — there's no way to know about a gap without seeing both readings on either
+     * side of it — but that comparison runs entirely inside SQLite; only the (typically tiny)
+     * subset of rows that actually start a new session after a gap gets returned to the app, so
+     * this stays cheap in application memory even across a multi-year range with millions of
+     * rows. The window function is computed in the inner subquery, before the outer `WHERE`
+     * filters it down, so this is a perfectly ordinary correlated-nothing scan as far as SQLite's
+     * query planner is concerned — no special interaction with `WHERE`/window-function ordering
+     * to worry about.
+     */
+    @Query(
+        "SELECT timestampEpochSec FROM (" +
+            "SELECT timestampEpochSec, " +
+            "timestampEpochSec - LAG(timestampEpochSec) OVER (ORDER BY timestampEpochSec) AS gapSeconds " +
+            "FROM readings WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec" +
+            ") WHERE gapSeconds >= :minGapSeconds ORDER BY timestampEpochSec ASC"
+    )
+    suspend fun sessionBoundaries(startEpochSec: Long, endEpochSec: Long, minGapSeconds: Long): List<Long>
+
+    /**
      * One page of a range, ordered ascending, starting at [afterEpochSec] (inclusive) — keyset
      * pagination (a `WHERE >=` seek against the primary-key index), not `OFFSET`/`LIMIT`, so each
      * page is an equally cheap index seek no matter how far into a huge range it starts, unlike
@@ -119,77 +147,81 @@ interface ReadingDao {
     /**
      * The four `bucketedXxx` queries below are what
      * [ReadingsRepository.plottedReadings][com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository.plottedReadings]
-     * decimates a wide range down to for charting: [range] is split into [bucketCount] equal-
-     * duration time buckets (bucket index = `(timestampEpochSec - startEpochSec) * bucketCount /
-     * spanSeconds`), and each query returns, for every non-empty bucket, the single row holding
-     * that bucket's minimum or maximum SpO2/pulse. At most [bucketCount] rows come back — however
-     * many raw readings the range actually contains, memory here is bounded by the bucket count
-     * alone.
+     * decimates a wide range down to for charting: rows in `[startEpochSec, endEpochSec]`, in
+     * timestamp order, are split into fixed-size buckets of [bucketRowSize] *rows* each (bucket
+     * index = `(ROW_NUMBER() OVER (ORDER BY timestampEpochSec) - 1) / bucketRowSize`) — bucketing
+     * by row count, not by a fixed time width — and each query returns, for every bucket, the
+     * single row holding that bucket's minimum or maximum SpO2/pulse.
+     *
+     * Row-count bucketing (not equal-duration time bucketing, which an earlier version of this
+     * used) is what makes this adapt to however the data is actually distributed: real usage is
+     * often clustered into separate sessions with large real gaps between them (e.g. roughly
+     * nightly, or even more sparsely) — sizing buckets by a fixed *time* width chosen to cover
+     * the whole selected span means every one of those brief, dense sessions can fall entirely
+     * inside a single time bucket together, capping the *entire session* at that one bucket's own
+     * 4 extremes regardless of how much real detail it contains — a year of nightly use could
+     * otherwise decimate down to only as many points as there were sessions. Row-count buckets
+     * instead give each bucket a roughly equal *share of the actual data*, so dense sessions
+     * naturally claim proportionally more of the point budget and sparse ones proportionally
+     * less, regardless of how the real time gaps between them are shaped.
+     * [ReadingsRepository.plottedReadings] separately computes each *kept* reading's on-chart
+     * x-position from its real timestamp relative to the data's overall span — that (not this
+     * selection step) is what keeps the x-axis itself genuinely proportional to elapsed time.
      *
      * The trick that makes "the whole row containing the min/max" a single aggregate query
-     * without a self-join or a window function: SQLite specifically documents that when a query's
-     * result columns contain exactly one bare `MIN()`/`MAX()` aggregate, every *other* bare
-     * (non-aggregated) column in that result takes its value from the same row that produced the
-     * min/max — see "Bare columns in an aggregate query" in SQLite's own `SELECT` documentation.
-     * `MIN(spo2)`/`MAX(spo2)`/`MIN(pulse)`/`MAX(pulse)` below exist in the query purely to trigger
-     * that behavior for the bare `timestampEpochSec`/`spo2`/`pulse` columns actually wanted;
+     * without a self-join: SQLite specifically documents that when a query's result columns
+     * contain exactly one bare `MIN()`/`MAX()` aggregate, every *other* bare (non-aggregated)
+     * column in that result takes its value from the same row that produced the min/max — see
+     * "Bare columns in an aggregate query" in SQLite's own `SELECT` documentation. This still
+     * applies with the source being a subquery (here, the one computing `ROW_NUMBER()`) rather
+     * than a plain table — confirmed directly against SQLite 3.50. `MIN(spo2)`/`MAX(spo2)`/
+     * `MIN(pulse)`/`MAX(pulse)` below exist in the query purely to trigger that behavior for the
+     * bare `timestampEpochSec`/`spo2`/`pulse` columns actually wanted;
      * [RewriteQueriesToDropUnusedColumns] has Room wrap the query so that extra aggregate column
      * never has to be reflected in [ReadingEntity] itself.
      */
     @RewriteQueriesToDropUnusedColumns
     @Query(
-        "SELECT timestampEpochSec, spo2, pulse, MIN(spo2) FROM readings " +
-            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
-            "GROUP BY ((timestampEpochSec - :startEpochSec) * :bucketCount) / :spanSeconds"
+        "SELECT timestampEpochSec, spo2, pulse, MIN(spo2) FROM (" +
+            "SELECT timestampEpochSec, spo2, pulse, " +
+            "(ROW_NUMBER() OVER (ORDER BY timestampEpochSec) - 1) / :bucketRowSize AS bucket " +
+            "FROM readings WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec" +
+            ") GROUP BY bucket"
     )
-    suspend fun bucketedMinSpo2(
-        startEpochSec: Long,
-        endEpochSec: Long,
-        bucketCount: Int,
-        spanSeconds: Long,
-    ): List<ReadingEntity>
+    suspend fun bucketedMinSpo2(startEpochSec: Long, endEpochSec: Long, bucketRowSize: Long): List<ReadingEntity>
 
     /** See [bucketedMinSpo2]'s own doc. */
     @RewriteQueriesToDropUnusedColumns
     @Query(
-        "SELECT timestampEpochSec, spo2, pulse, MAX(spo2) FROM readings " +
-            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
-            "GROUP BY ((timestampEpochSec - :startEpochSec) * :bucketCount) / :spanSeconds"
+        "SELECT timestampEpochSec, spo2, pulse, MAX(spo2) FROM (" +
+            "SELECT timestampEpochSec, spo2, pulse, " +
+            "(ROW_NUMBER() OVER (ORDER BY timestampEpochSec) - 1) / :bucketRowSize AS bucket " +
+            "FROM readings WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec" +
+            ") GROUP BY bucket"
     )
-    suspend fun bucketedMaxSpo2(
-        startEpochSec: Long,
-        endEpochSec: Long,
-        bucketCount: Int,
-        spanSeconds: Long,
-    ): List<ReadingEntity>
+    suspend fun bucketedMaxSpo2(startEpochSec: Long, endEpochSec: Long, bucketRowSize: Long): List<ReadingEntity>
 
     /** See [bucketedMinSpo2]'s own doc. */
     @RewriteQueriesToDropUnusedColumns
     @Query(
-        "SELECT timestampEpochSec, spo2, pulse, MIN(pulse) FROM readings " +
-            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
-            "GROUP BY ((timestampEpochSec - :startEpochSec) * :bucketCount) / :spanSeconds"
+        "SELECT timestampEpochSec, spo2, pulse, MIN(pulse) FROM (" +
+            "SELECT timestampEpochSec, spo2, pulse, " +
+            "(ROW_NUMBER() OVER (ORDER BY timestampEpochSec) - 1) / :bucketRowSize AS bucket " +
+            "FROM readings WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec" +
+            ") GROUP BY bucket"
     )
-    suspend fun bucketedMinPulse(
-        startEpochSec: Long,
-        endEpochSec: Long,
-        bucketCount: Int,
-        spanSeconds: Long,
-    ): List<ReadingEntity>
+    suspend fun bucketedMinPulse(startEpochSec: Long, endEpochSec: Long, bucketRowSize: Long): List<ReadingEntity>
 
     /** See [bucketedMinSpo2]'s own doc. */
     @RewriteQueriesToDropUnusedColumns
     @Query(
-        "SELECT timestampEpochSec, spo2, pulse, MAX(pulse) FROM readings " +
-            "WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec " +
-            "GROUP BY ((timestampEpochSec - :startEpochSec) * :bucketCount) / :spanSeconds"
+        "SELECT timestampEpochSec, spo2, pulse, MAX(pulse) FROM (" +
+            "SELECT timestampEpochSec, spo2, pulse, " +
+            "(ROW_NUMBER() OVER (ORDER BY timestampEpochSec) - 1) / :bucketRowSize AS bucket " +
+            "FROM readings WHERE timestampEpochSec BETWEEN :startEpochSec AND :endEpochSec" +
+            ") GROUP BY bucket"
     )
-    suspend fun bucketedMaxPulse(
-        startEpochSec: Long,
-        endEpochSec: Long,
-        bucketCount: Int,
-        spanSeconds: Long,
-    ): List<ReadingEntity>
+    suspend fun bucketedMaxPulse(startEpochSec: Long, endEpochSec: Long, bucketRowSize: Long): List<ReadingEntity>
 
     @Query("SELECT COUNT(*) FROM readings")
     suspend fun count(): Int

@@ -15,5 +15,12 @@ package com.oxipulse.pulsoximetergraphs.data.db
  * chart — instead of every pair of adjacent points rendering exactly as far apart as any other
  * pair regardless of how much real time actually separates them, which is what a plain "list
  * position as x" scheme gives no way to express.
+ *
+ * [sessionIndex] identifies which real, gap-separated "session" this reading belongs to (see
+ * [ReadingDao.sessionBoundaries]) — 0 for the first session in the plotted range, incrementing by
+ * one at every real gap. GraphScreen draws each distinct [sessionIndex] as its own separate line
+ * segment, so the chart never draws a connecting line across a stretch where the device plainly
+ * wasn't being worn — a wide [xIndex] gap alone only guarantees the *space* is proportionally
+ * wide, not that no line gets drawn through it.
  */
-data class PlottedReading(val xIndex: Long, val reading: ReadingEntity)
+data class PlottedReading(val xIndex: Long, val sessionIndex: Int, val reading: ReadingEntity)

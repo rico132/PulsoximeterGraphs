@@ -44,6 +44,13 @@ private class FakeReadingDao(seed: List<ReadingEntity> = emptyList()) : ReadingD
     override suspend fun lastInRange(startEpochSec: Long, endEpochSec: Long): ReadingEntity? =
         inRange(startEpochSec, endEpochSec).lastOrNull()
 
+    override suspend fun sessionBoundaries(startEpochSec: Long, endEpochSec: Long, minGapSeconds: Long): List<Long> {
+        val sorted = inRange(startEpochSec, endEpochSec)
+        return (1 until sorted.size)
+            .filter { i -> sorted[i].timestampEpochSec - sorted[i - 1].timestampEpochSec >= minGapSeconds }
+            .map { i -> sorted[i].timestampEpochSec }
+    }
+
     override suspend fun pageInRange(afterEpochSec: Long, endEpochSec: Long, limit: Int): List<ReadingEntity> =
         inRange(afterEpochSec, endEpochSec).take(limit)
 
@@ -71,36 +78,33 @@ private class FakeReadingDao(seed: List<ReadingEntity> = emptyList()) : ReadingD
     private fun histogramOf(values: List<Int>): List<ValueCount> =
         values.groupingBy { it }.eachCount().map { (value, count) -> ValueCount(value, count) }.sortedBy { it.value }
 
-    private fun bucketIndex(ts: Long, startEpochSec: Long, bucketCount: Int, spanSeconds: Long): Long =
-        ((ts - startEpochSec) * bucketCount) / spanSeconds
-
     /** Mirrors the SQLite "bare column takes the min/max row's value" trick — see
      * [ReadingDao.bucketedMinSpo2]'s own doc — by keeping the *first* (ascending-timestamp)
      * reading achieving the extreme within each bucket, same as a single-aggregate SQLite query
-     * scanning in primary-key order would. */
+     * scanning in primary-key (ROW_NUMBER ordering) order would. Buckets are consecutive chunks
+     * of [bucketRowSize] rows by rank -- the same grouping `(ROW_NUMBER() - 1) / bucketRowSize`
+     * produces -- not a time-width split; see that query's own doc for why row count, not time. */
     private fun bucketedExtreme(
         startEpochSec: Long,
         endEpochSec: Long,
-        bucketCount: Int,
-        spanSeconds: Long,
+        bucketRowSize: Long,
         moreExtreme: (current: ReadingEntity, candidate: ReadingEntity) -> Boolean,
     ): List<ReadingEntity> =
         inRange(startEpochSec, endEpochSec)
-            .groupBy { bucketIndex(it.timestampEpochSec, startEpochSec, bucketCount, spanSeconds) }
-            .values
+            .chunked(bucketRowSize.toInt())
             .map { bucket -> bucket.reduce { current, candidate -> if (moreExtreme(current, candidate)) candidate else current } }
 
-    override suspend fun bucketedMinSpo2(startEpochSec: Long, endEpochSec: Long, bucketCount: Int, spanSeconds: Long) =
-        bucketedExtreme(startEpochSec, endEpochSec, bucketCount, spanSeconds) { a, b -> b.spo2 < a.spo2 }
+    override suspend fun bucketedMinSpo2(startEpochSec: Long, endEpochSec: Long, bucketRowSize: Long) =
+        bucketedExtreme(startEpochSec, endEpochSec, bucketRowSize) { a, b -> b.spo2 < a.spo2 }
 
-    override suspend fun bucketedMaxSpo2(startEpochSec: Long, endEpochSec: Long, bucketCount: Int, spanSeconds: Long) =
-        bucketedExtreme(startEpochSec, endEpochSec, bucketCount, spanSeconds) { a, b -> b.spo2 > a.spo2 }
+    override suspend fun bucketedMaxSpo2(startEpochSec: Long, endEpochSec: Long, bucketRowSize: Long) =
+        bucketedExtreme(startEpochSec, endEpochSec, bucketRowSize) { a, b -> b.spo2 > a.spo2 }
 
-    override suspend fun bucketedMinPulse(startEpochSec: Long, endEpochSec: Long, bucketCount: Int, spanSeconds: Long) =
-        bucketedExtreme(startEpochSec, endEpochSec, bucketCount, spanSeconds) { a, b -> b.pulse < a.pulse }
+    override suspend fun bucketedMinPulse(startEpochSec: Long, endEpochSec: Long, bucketRowSize: Long) =
+        bucketedExtreme(startEpochSec, endEpochSec, bucketRowSize) { a, b -> b.pulse < a.pulse }
 
-    override suspend fun bucketedMaxPulse(startEpochSec: Long, endEpochSec: Long, bucketCount: Int, spanSeconds: Long) =
-        bucketedExtreme(startEpochSec, endEpochSec, bucketCount, spanSeconds) { a, b -> b.pulse > a.pulse }
+    override suspend fun bucketedMaxPulse(startEpochSec: Long, endEpochSec: Long, bucketRowSize: Long) =
+        bucketedExtreme(startEpochSec, endEpochSec, bucketRowSize) { a, b -> b.pulse > a.pulse }
 
     override suspend fun count(): Int = rows.size
 
@@ -230,20 +234,19 @@ class ReadingsRepositoryTest {
     }
 
     @Test
-    fun `plottedReadings buckets over the actual data span, not a much wider selection`() = runTest {
-        // Exactly the reported regression: a full day selected, but the device was only actually
-        // worn for a few hours in the middle of it -- bucketing over the full day (as opposed to
-        // just where the data is) would waste most of the bucket budget on the data-free portion
-        // of the selection and return far fewer than MAX_PLOTTED_POINTS-worth of points even
-        // though there's plenty of dense real data to show.
+    fun `plottedReadings uses close to the full point budget when a wide selection is mostly empty`() = runTest {
+        // A full day selected, but the device was only actually worn for a few hours in the
+        // middle of it. Row-count bucketing (see ReadingDao.bucketedMinSpo2's own doc) only ever
+        // sees the rows that exist -- the empty 16 hours contribute no rows at all, so they can't
+        // "waste" any of the bucket budget the way a fixed-time-width bucketing scheme would.
         val selectedStart = 0L
         val selectedEnd = 24 * 3600L // a full day
         val dataStart = 3600L // data only from 1:00...
         val dataEnd = dataStart + 8 * 3600L // ...through 9:00 -- a third of the selected day
         // Varying, not flat, spo2/pulse: a flat signal ties on every bucket's own min/max, so
         // (with the fake DAO's first-occurrence tie-break -- see bucketedExtreme's own doc) every
-        // bucket would only ever contribute its single first row regardless of bucketing origin,
-        // which wouldn't actually exercise "how many buckets have data" at all.
+        // bucket would only ever contribute its single first row, which wouldn't actually
+        // exercise "how many buckets have data" at all.
         val readings = (dataStart..dataEnd).map { ts ->
             ReadingEntity(timestampEpochSec = ts, spo2 = 90 + (ts % 10).toInt(), pulse = 60 + (ts % 15).toInt())
         }
@@ -253,16 +256,40 @@ class ReadingsRepositoryTest {
 
         val plotted = repo.plottedReadings(range, totalCount = readings.size)
 
-        // With 125 buckets spread over the full 24h selection, only the ~8h with real data could
-        // ever contribute a bucket -- at most ~42 non-empty buckets, well under the budget.
-        // Bucketing over the actual 8h data span instead lets every one of the 125 buckets fall
-        // inside real data, each contributing up to 4 points -- comfortably above the ~42-bucket
-        // ceiling the bug would have produced, without demanding the full (rarely reached, given
-        // ties within a bucket) theoretical max of 500.
         assertTrue(
-            "expected well above the ~42-point ceiling a bug bucketing over the full day would " +
-                "produce, got ${plotted.size}",
-            plotted.size > 200,
+            "expected close to the full point budget given dense, contiguous real data, got ${plotted.size}",
+            plotted.size > 400,
+        )
+    }
+
+    @Test
+    fun `plottedReadings doesn't collapse each of several sparse sessions into one point`() = runTest {
+        // Exactly the reported regression: selecting "last year" showed only ~12 points, one per
+        // roughly-monthly usage session. A fixed *time*-width bucketing scheme, sized to span the
+        // whole year, let each entire brief session collapse into that one time bucket's own 4
+        // extremes. Row-count bucketing instead gives each session's own rows a share of the
+        // point budget proportional to how many rows it actually has, regardless of how far apart
+        // in time the sessions are.
+        val sessionCount = 12
+        val sessionRowCount = 100
+        val sessionSpacingSeconds = 30L * 24 * 3600 // roughly monthly
+        val sessionDurationSeconds = 3600L // each session is a brief, dense hour
+        val readings = (0 until sessionCount).flatMap { session ->
+            val sessionStart = session * sessionSpacingSeconds
+            (0 until sessionRowCount).map { i ->
+                val ts = sessionStart + i * (sessionDurationSeconds / sessionRowCount)
+                ReadingEntity(timestampEpochSec = ts, spo2 = 90 + (i % 10), pulse = 60 + (i % 15))
+            }
+        }
+        val dao = FakeReadingDao(readings)
+        val repo = ReadingsRepository(dao)
+        val range = Instant.ofEpochSecond(0)..Instant.ofEpochSecond(readings.last().timestampEpochSec)
+
+        val plotted = repo.plottedReadings(range, totalCount = readings.size)
+
+        assertTrue(
+            "expected meaningfully more than ~1 point per session (the bug's ceiling), got ${plotted.size}",
+            plotted.size > sessionCount * 5,
         )
     }
 
@@ -305,6 +332,43 @@ class ReadingsRepositoryTest {
                 "($xIndexGapAcrossClusters) than a typical within-cluster step ($typicalWithinClusterXIndexGap)",
             xIndexGapAcrossClusters > typicalWithinClusterXIndexGap * 5,
         )
+    }
+
+    @Test
+    fun `plottedReadings assigns a different sessionIndex across a real gap, same index within a session`() = runTest {
+        val sessionGap = ReadingsRepository.SESSION_GAP_SECONDS
+        val sessionA = (0L until 10).map { ts -> ReadingEntity(timestampEpochSec = ts, spo2 = 95, pulse = 70) }
+        val sessionBStart = sessionGap + 100
+        val sessionB = (sessionBStart until sessionBStart + 10).map { ts -> ReadingEntity(timestampEpochSec = ts, spo2 = 95, pulse = 70) }
+        val readings = sessionA + sessionB
+        val dao = FakeReadingDao(readings)
+        val repo = ReadingsRepository(dao)
+        val range = Instant.ofEpochSecond(0)..Instant.ofEpochSecond(readings.last().timestampEpochSec)
+
+        val plotted = repo.plottedReadings(range, totalCount = readings.size)
+
+        val sessionIndicesOfA = plotted.filter { it.reading.timestampEpochSec < sessionBStart }.map { it.sessionIndex }.toSet()
+        val sessionIndicesOfB = plotted.filter { it.reading.timestampEpochSec >= sessionBStart }.map { it.sessionIndex }.toSet()
+        assertEquals("every reading within one session must share the same sessionIndex", 1, sessionIndicesOfA.size)
+        assertEquals("every reading within the other session must share the same sessionIndex", 1, sessionIndicesOfB.size)
+        assertTrue("the two sessions must have different sessionIndex values", sessionIndicesOfA != sessionIndicesOfB)
+    }
+
+    @Test
+    fun `plottedReadings keeps one sessionIndex when the gap is under the session threshold`() = runTest {
+        // Just short of SESSION_GAP_SECONDS -- a brief BLE/USB hiccup, not a real new session.
+        val gap = ReadingsRepository.SESSION_GAP_SECONDS - 1
+        val readings = listOf(
+            ReadingEntity(timestampEpochSec = 0, spo2 = 95, pulse = 70),
+            ReadingEntity(timestampEpochSec = gap, spo2 = 96, pulse = 71),
+        )
+        val dao = FakeReadingDao(readings)
+        val repo = ReadingsRepository(dao)
+        val range = Instant.ofEpochSecond(0)..Instant.ofEpochSecond(gap)
+
+        val plotted = repo.plottedReadings(range, totalCount = readings.size)
+
+        assertEquals(setOf(0), plotted.map { it.sessionIndex }.toSet())
     }
 
     @Test

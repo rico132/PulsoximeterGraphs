@@ -80,39 +80,47 @@ class ReadingsRepository(private val readingDao: ReadingDao) {
      * [observeCountInRange]) — passed in rather than queried again here so the caller's own
      * reactive count and this fetch never disagree about which path to take.
      *
-     * Bucketing is always computed against the *actual data's own span* — [ReadingDao.firstInRange]
-     * to [ReadingDao.lastInRange] — not [range]'s own width. A user very often selects a wider
-     * span than the device actually has data for (an obvious example: any predefined "last N
-     * days" quick-select picked while the device was only worn for a few hours somewhere in that
-     * window). Bucketing over the full selected span in that case wastes almost the entire
-     * [MAX_PLOTTED_POINTS] budget on buckets that fall in the data-free portion — GROUP BY simply
-     * emits nothing for an empty bucket, so a span that's mostly empty could end up rendering only
-     * a small fraction of the intended point budget. Bucketing over the data's own span instead
-     * means every bucket falls somewhere data could actually exist.
+     * This is two genuinely separate decisions, deliberately kept independent:
      *
-     * Each returned [PlottedReading.xIndex] is that reading's position among [MAX_PLOTTED_POINTS]
-     * / 4 equal-*duration* time buckets spanning the data (bucket index =
-     * `(timestampEpochSec - firstReadingEpochSec) * bucketCount / dataSpanSeconds`) — not its
-     * position in this returned list. That distinction is what lets the chart's index-based x-axis
-     * (see GraphScreen's own doc on why it's index-based, not raw-timestamp-based) still be
-     * genuinely linear in time: two [PlottedReading]s with a real time gap between them get
-     * [PlottedReading.xIndex] values that skip over the buckets in between, rather than sitting at
-     * the same fixed one-index step apart as any other adjacent pair regardless of how much real
-     * time actually separates them.
+     * 1. **Which readings survive decimation** — [ReadingDao.bucketedMinSpo2] and its three
+     *    siblings bucket rows by *row count*, not by a fixed time width: see those queries' own
+     *    doc for why. A fixed time width chosen to span the whole selection or even the whole
+     *    data range fails badly for real usage, which is often clustered into separate sessions
+     *    (nightly, or sparser) with large real gaps between them — sizing buckets by time lets an
+     *    entire dense session collapse into a single bucket's own 4 extremes, so e.g. a year of
+     *    once-a-month use could decimate down to barely more points than there were sessions.
+     *    Row-count buckets instead give every bucket a roughly equal *share of the actual data*,
+     *    so dense sessions naturally claim proportionally more of the point budget.
+     * 2. **Where a *kept* reading lands on the x-axis** — [PlottedReading.xIndex], computed here
+     *    from each kept reading's real timestamp relative to [ReadingDao.firstInRange]..
+     *    [ReadingDao.lastInRange] (the *data's* own span, not [range]'s width — a user very often
+     *    selects a wider span than the device has data for, e.g. any "last N days" quick-select).
+     *    This is what lets the chart's index-based x-axis (see GraphScreen's own doc on why it's
+     *    index-based, not raw-timestamp-based) still be genuinely linear in time: two
+     *    [PlottedReading]s with a real time gap between them get [PlottedReading.xIndex] values
+     *    that skip over the time in between, rather than sitting at the same fixed one-index step
+     *    apart as any other adjacent pair regardless of how much real time actually separates
+     *    them.
      *
      * When [totalCount] is already at or under [MAX_PLOTTED_POINTS], every raw reading in [range]
-     * is returned (via [ReadingDao.rangeOrderedList]) — no extremes-only decimation, every real
-     * reading shows up — just with [PlottedReading.xIndex] attached using that same bucket formula
-     * (readings can still share an xIndex if several land in the same bucket; Vico renders that as
-     * near-overlapping points, an acceptable rarity next to the alternative of silently pretending
-     * every reading is evenly time-spaced). Above that cap, [range] is decimated exactly as before
-     * — for each bucket, the readings holding that bucket's min/max SpO2 and min/max pulse are
-     * kept (plus [ReadingDao.firstInRange]/[ReadingDao.lastInRange] themselves, so the chart's own
-     * visible edges always exactly match the data's true first/last reading, not merely whichever
-     * reading happened to hold an extreme in the first/last bucket) — computed as SQL aggregate
-     * queries ([ReadingDao.bucketedMinSpo2] and its three siblings) rather than after materializing
-     * every row in the range as a [ReadingEntity], which is what actually keeps a multi-year range
-     * from having to hold millions of those in memory just to render a chart.
+     * is returned (via [ReadingDao.rangeOrderedList]) — no decimation at all, every real reading
+     * shows up — just with [PlottedReading.xIndex] attached using the same time-based formula
+     * (readings can still share an xIndex if several land within the same coarse time bucket;
+     * Vico renders that as near-overlapping points, an acceptable rarity next to the alternative
+     * of silently pretending every reading is evenly time-spaced). Above that cap, [range] is
+     * decimated via the four row-count-bucketed queries — plus [ReadingDao.firstInRange]/
+     * [ReadingDao.lastInRange] themselves folded in, so the chart's own visible edges always
+     * exactly match the data's true first/last reading, not merely whichever reading happened to
+     * hold an extreme in the first/last bucket — computed as SQL aggregate queries rather than
+     * after materializing every row in the range as a [ReadingEntity], which is what actually
+     * keeps a multi-year range from having to hold millions of those in memory just to render a
+     * chart.
+     *
+     * [PlottedReading.sessionIndex] is assigned from [ReadingDao.sessionBoundaries]: a wide
+     * [PlottedReading.xIndex] gap between two adjacent kept readings only guarantees the *space*
+     * between them is proportionally wide (see that property's own doc) — GraphScreen still needs
+     * to know whether to actually draw a connecting line through that space, which is exactly
+     * what a differing [PlottedReading.sessionIndex] tells it not to do.
      */
     suspend fun plottedReadings(range: ClosedRange<Instant>, totalCount: Int): List<PlottedReading> {
         if (totalCount <= 0) return emptyList()
@@ -127,21 +135,38 @@ class ReadingsRepository(private val readingDao: ReadingDao) {
         val rawReadings = if (totalCount <= MAX_PLOTTED_POINTS) {
             readingDao.rangeOrderedList(startEpochSec, endEpochSec)
         } else {
-            val extremes = readingDao.bucketedMinSpo2(dataStartEpochSec, lastReading.timestampEpochSec, bucketCount, dataSpanSeconds) +
-                readingDao.bucketedMaxSpo2(dataStartEpochSec, lastReading.timestampEpochSec, bucketCount, dataSpanSeconds) +
-                readingDao.bucketedMinPulse(dataStartEpochSec, lastReading.timestampEpochSec, bucketCount, dataSpanSeconds) +
-                readingDao.bucketedMaxPulse(dataStartEpochSec, lastReading.timestampEpochSec, bucketCount, dataSpanSeconds)
+            // Roughly bucketCount buckets' worth of rows each, so the four queries together
+            // target ~4 * bucketCount kept rows total (before boundary-folding and dedup) — same
+            // overall point budget as before, now allocated by row count instead of time.
+            val bucketRowSize = ceil(totalCount.toDouble() / bucketCount).toLong().coerceAtLeast(1)
+            val extremes = readingDao.bucketedMinSpo2(startEpochSec, endEpochSec, bucketRowSize) +
+                readingDao.bucketedMaxSpo2(startEpochSec, endEpochSec, bucketRowSize) +
+                readingDao.bucketedMinPulse(startEpochSec, endEpochSec, bucketRowSize) +
+                readingDao.bucketedMaxPulse(startEpochSec, endEpochSec, bucketRowSize)
             (extremes + listOf(firstReading, lastReading)).distinctBy { it.timestampEpochSec }
         }
+        val sorted = rawReadings.sortedBy { it.timestampEpochSec }
 
-        return rawReadings
-            .sortedBy { it.timestampEpochSec }
-            .map { reading ->
-                PlottedReading(
-                    xIndex = ((reading.timestampEpochSec - dataStartEpochSec) * bucketCount) / dataSpanSeconds,
-                    reading = reading,
-                )
+        val sessionBoundaries = readingDao.sessionBoundaries(startEpochSec, endEpochSec, SESSION_GAP_SECONDS)
+        var sessionIndex = 0
+        var nextBoundary = 0
+        return sorted.map { reading ->
+            // A boundary is the *first* timestamp of a new session, so every boundary at or
+            // before this reading's own timestamp means a session break has already happened by
+            // the time we get here — advance past all of them (there can legitimately be more
+            // than one between two consecutively *kept* readings, since decimation itself can
+            // skip over several real, brief sessions' worth of rows between two points that
+            // happen to survive it).
+            while (nextBoundary < sessionBoundaries.size && reading.timestampEpochSec >= sessionBoundaries[nextBoundary]) {
+                sessionIndex++
+                nextBoundary++
             }
+            PlottedReading(
+                xIndex = ((reading.timestampEpochSec - dataStartEpochSec) * bucketCount) / dataSpanSeconds,
+                sessionIndex = sessionIndex,
+                reading = reading,
+            )
+        }
     }
 
     /**
@@ -230,6 +255,14 @@ class ReadingsRepository(private val readingDao: ReadingDao) {
         // finishes in a single page; small enough that even a years-wide range never holds more
         // than a few hundred KB of ReadingEntity objects in memory at once.
         internal const val EVENT_COUNT_PAGE_SIZE = 20_000
+
+        // How long a stretch with no readings at all has to be before it counts as a real break
+        // between wearing sessions (see ReadingDao.sessionBoundaries) rather than a brief BLE/USB
+        // hiccup within one continuous session. Long enough to comfortably tolerate a real-world
+        // reconnection pause; short enough that genuinely separate sessions (an afternoon nap and
+        // that night's sleep, say) still render as visibly distinct on the chart rather than one
+        // connected line spanning the hours in between.
+        internal const val SESSION_GAP_SECONDS = 1_800L
     }
 }
 

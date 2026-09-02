@@ -596,6 +596,20 @@ private fun nearestPlottedReading(points: List<PlottedReading>, xValue: Double):
     return points[lo]
 }
 
+/**
+ * Splits [points] (assumed sorted ascending by [PlottedReading.xIndex]/timestamp) into
+ * consecutive runs sharing the same [PlottedReading.sessionIndex] — each run becomes its own
+ * separate Vico series in Spo2ChartContent/PulseChartContent, which is what actually stops the
+ * chart drawing a line across a real gap in the data (see [PlottedReading.sessionIndex]'s own
+ * doc): Vico never draws a connecting line between two different series, only within one, so a
+ * genuinely new run here reads as a real break, not just a wide gap in x-position. `groupBy`
+ * (not a manual scan) is enough here specifically because [points] is already sorted — the
+ * resulting `LinkedHashMap` preserves each key's first-seen order, so both the map's key order
+ * and each value list's element order come out already sorted with no extra work.
+ */
+private fun groupBySessions(points: List<PlottedReading>): List<List<PlottedReading>> =
+    points.groupBy { it.sessionIndex }.values.toList()
+
 private val TIME_ONLY_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
 
 // Includes the date on every label once the selected range crosses a day boundary — a gap in the
@@ -1002,10 +1016,18 @@ private fun Spo2ChartContent(
             // actually data for the selected range — an empty transaction just renders no line.
             if (points.isNotEmpty()) {
                 lineModel {
-                    series(
-                        x = points.map { it.xIndex.toDouble() },
-                        y = points.map { it.reading.spo2.toDouble() },
-                    )
+                    // One Vico series per real session (see groupBySessions's own doc), not one
+                    // series for the whole range — that's what actually stops the line being
+                    // drawn across a real gap in the data, rather than just spacing the two
+                    // sides of it proportionally far apart (which PlottedReading.xIndex alone
+                    // already guarantees, but doesn't by itself prevent a connecting line).
+                    for (session in groupBySessions(points)) {
+                        series(
+                            x = session.map { it.xIndex.toDouble() },
+                            y = session.map { it.reading.spo2.toDouble() },
+                            key = session.first().sessionIndex,
+                        )
+                    }
                 }
             }
         }
@@ -1093,10 +1115,14 @@ private fun PulseChartContent(
         modelProducer.runTransaction {
             if (points.isNotEmpty()) {
                 lineModel {
-                    series(
-                        x = points.map { it.xIndex.toDouble() },
-                        y = points.map { it.reading.pulse.toDouble() },
-                    )
+                    // See the matching comment in Spo2ChartContent.
+                    for (session in groupBySessions(points)) {
+                        series(
+                            x = session.map { it.xIndex.toDouble() },
+                            y = session.map { it.reading.pulse.toDouble() },
+                            key = session.first().sessionIndex,
+                        )
+                    }
                 }
             }
         }
