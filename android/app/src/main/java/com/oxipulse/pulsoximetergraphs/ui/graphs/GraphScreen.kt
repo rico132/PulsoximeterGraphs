@@ -955,21 +955,38 @@ private val CHART_LINE_STROKE = LineCartesianLayer.LineStroke.Continuous(thickne
  * internal x-order. This interpolator doesn't touch that code path at all — still exactly one
  * series, so [Spo2ChartContent]/[PulseChartContent] and the axis machinery are unaffected;
  * only which pixel segments get an actual line drawn between them changes.
+ *
+ * `visiblePadding` returns null below (skip the padding/windowing computation entirely) and
+ * `interpolate` never trusts `visibleIndexRange`'s own bounds, iterating only indices valid for
+ * both `offsets` and [points] instead — a production crash (`IndexOutOfBoundsException`,
+ * `offsets[offsets.size]`) showed Vico can hand back a `visibleIndexRange` one past the end of
+ * `offsets`. Decompiling `LineCartesianLayer.
+ * collectPointsAndVisibleIndexRange` didn't turn up a self-consistent way for that call alone to
+ * produce it; the more likely cause is a timing gap between this composable's `points` (updated
+ * synchronously on recomposition via `remember(points)`) and the model `LaunchedEffect(points)`
+ * commits asynchronously (`runTransaction` can itself animate a transition — see
+ * `CartesianChartHost`'s `animationSpec`), so a frame drawn mid-transition could reflect a
+ * different point count than `points` currently does. This chart never scrolls or zooms (see
+ * `GraphScreen`'s own doc on disabling both), so there is no legitimate "off-screen" subset to
+ * skip in the first place — always drawing everything Vico safely can, rather than trusting
+ * either side's index range, isn't a workaround with a downside here, it's just correct.
  */
 @Composable
 private fun rememberGapAwareInterpolator(points: List<PlottedReading>): LineCartesianLayer.Interpolator =
     remember(points) {
         object : LineCartesianLayer.Interpolator {
+            override val visiblePadding: Int? = null
+
             override fun interpolate(
                 context: CartesianDrawingContext,
                 path: Path,
                 offsets: List<Offset>,
                 visibleIndexRange: IntRange,
             ) {
-                for (index in visibleIndexRange) {
+                val lastIndex = minOf(offsets.size, points.size) - 1
+                for (index in 0..lastIndex) {
                     val offset = offsets[index]
-                    val isSessionStart = index == visibleIndexRange.first ||
-                        points[index].sessionIndex != points[index - 1].sessionIndex
+                    val isSessionStart = index == 0 || points[index].sessionIndex != points[index - 1].sessionIndex
                     if (isSessionStart) {
                         path.moveTo(offset.x, offset.y)
                     } else {
