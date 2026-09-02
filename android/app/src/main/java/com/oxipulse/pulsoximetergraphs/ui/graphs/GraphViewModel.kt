@@ -4,7 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.oxipulse.pulsoximetergraphs.data.ble.BleGattClient
-import com.oxipulse.pulsoximetergraphs.data.db.ReadingEntity
+import com.oxipulse.pulsoximetergraphs.data.db.PlottedReading
 import com.oxipulse.pulsoximetergraphs.data.db.ReadingStats
 import com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
@@ -65,9 +65,10 @@ class GraphViewModel(
      * many raw readings it contains — see [ReadingsRepository.plottedReadings]'s own doc. This is
      * charting data specifically (decimated, extremes-preserving), not a faithful copy of every
      * reading in range; [stats] below is computed independently, from the *entire* range, for
-     * exactly that reason.
+     * exactly that reason. Each [PlottedReading] carries its own x-axis position alongside the
+     * reading itself — see that type's own doc for why that's not just its position in this list.
      */
-    val readings: StateFlow<List<ReadingEntity>> = combine(
+    val readings: StateFlow<List<PlottedReading>> = combine(
         selectedRange,
         rangeRowCount,
     ) { range, count -> range to count }

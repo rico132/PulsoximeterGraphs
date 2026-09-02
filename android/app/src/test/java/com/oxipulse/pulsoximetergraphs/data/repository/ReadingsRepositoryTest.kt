@@ -1,5 +1,6 @@
 package com.oxipulse.pulsoximetergraphs.data.repository
 
+import com.oxipulse.pulsoximetergraphs.data.db.PlottedReading
 import com.oxipulse.pulsoximetergraphs.data.db.ReadingDao
 import com.oxipulse.pulsoximetergraphs.data.db.ReadingEntity
 import com.oxipulse.pulsoximetergraphs.data.db.ReadingStats
@@ -205,7 +206,7 @@ class ReadingsRepositoryTest {
 
         val plotted = repo.plottedReadings(range, totalCount = readings.size)
 
-        assertEquals(readings, plotted)
+        assertEquals(readings, plotted.map { it.reading })
     }
 
     @Test
@@ -224,7 +225,85 @@ class ReadingsRepositoryTest {
         assertTrue("must not just return everything for a range this large", plotted.size < total)
         assertTrue(
             "the single spike reading must survive decimation",
-            plotted.any { it.timestampEpochSec == spikeAt.toLong() && it.spo2 == 70 },
+            plotted.any { it.reading.timestampEpochSec == spikeAt.toLong() && it.reading.spo2 == 70 },
+        )
+    }
+
+    @Test
+    fun `plottedReadings buckets over the actual data span, not a much wider selection`() = runTest {
+        // Exactly the reported regression: a full day selected, but the device was only actually
+        // worn for a few hours in the middle of it -- bucketing over the full day (as opposed to
+        // just where the data is) would waste most of the bucket budget on the data-free portion
+        // of the selection and return far fewer than MAX_PLOTTED_POINTS-worth of points even
+        // though there's plenty of dense real data to show.
+        val selectedStart = 0L
+        val selectedEnd = 24 * 3600L // a full day
+        val dataStart = 3600L // data only from 1:00...
+        val dataEnd = dataStart + 8 * 3600L // ...through 9:00 -- a third of the selected day
+        // Varying, not flat, spo2/pulse: a flat signal ties on every bucket's own min/max, so
+        // (with the fake DAO's first-occurrence tie-break -- see bucketedExtreme's own doc) every
+        // bucket would only ever contribute its single first row regardless of bucketing origin,
+        // which wouldn't actually exercise "how many buckets have data" at all.
+        val readings = (dataStart..dataEnd).map { ts ->
+            ReadingEntity(timestampEpochSec = ts, spo2 = 90 + (ts % 10).toInt(), pulse = 60 + (ts % 15).toInt())
+        }
+        val dao = FakeReadingDao(readings)
+        val repo = ReadingsRepository(dao)
+        val range = Instant.ofEpochSecond(selectedStart)..Instant.ofEpochSecond(selectedEnd)
+
+        val plotted = repo.plottedReadings(range, totalCount = readings.size)
+
+        // With 125 buckets spread over the full 24h selection, only the ~8h with real data could
+        // ever contribute a bucket -- at most ~42 non-empty buckets, well under the budget.
+        // Bucketing over the actual 8h data span instead lets every one of the 125 buckets fall
+        // inside real data, each contributing up to 4 points -- comfortably above the ~42-bucket
+        // ceiling the bug would have produced, without demanding the full (rarely reached, given
+        // ties within a bucket) theoretical max of 500.
+        assertTrue(
+            "expected well above the ~42-point ceiling a bug bucketing over the full day would " +
+                "produce, got ${plotted.size}",
+            plotted.size > 200,
+        )
+    }
+
+    @Test
+    fun `plottedReadings' xIndex reflects real time gaps, not list position`() = runTest {
+        // Two dense, internally-varied clusters (each spanning enough buckets on its own to have
+        // a well-defined "typical step") with a real gap between them ~10x either cluster's own
+        // span -- adjacent points straddling that gap must end up with xIndex values
+        // proportionally far apart, not merely one bucket apart the way adjacent *list positions*
+        // always are. Row count is kept comfortably above MAX_PLOTTED_POINTS so this exercises the
+        // bucketed path, not the small-range full-fidelity path (which -- see PlottedReading's own
+        // doc -- can legitimately let an entire tight burst share one xIndex; that's a separate,
+        // documented tradeoff this test isn't about).
+        val clusterSpanSeconds = 10_000L
+        val gapSeconds = clusterSpanSeconds * 10
+        fun cluster(startTs: Long) = (startTs..(startTs + clusterSpanSeconds) step 10).map { ts ->
+            ReadingEntity(timestampEpochSec = ts, spo2 = 90 + (ts % 10).toInt(), pulse = 60 + (ts % 15).toInt())
+        }
+        val clusterA = cluster(0L)
+        val gapStart = clusterSpanSeconds
+        val gapEnd = clusterSpanSeconds + gapSeconds
+        val clusterB = cluster(gapEnd)
+        val readings = clusterA + clusterB
+        assertTrue("need >MAX_PLOTTED_POINTS rows to exercise the bucketed path", readings.size > ReadingsRepository.MAX_PLOTTED_POINTS)
+        val dao = FakeReadingDao(readings)
+        val repo = ReadingsRepository(dao)
+        val range = Instant.ofEpochSecond(0)..Instant.ofEpochSecond(readings.last().timestampEpochSec)
+
+        val plotted = repo.plottedReadings(range, totalCount = readings.size).sortedBy { it.xIndex }
+
+        val lastOfA = plotted.last { it.reading.timestampEpochSec < gapStart }
+        val firstOfB = plotted.first { it.reading.timestampEpochSec >= gapEnd }
+        val xIndexGapAcrossClusters = firstOfB.xIndex - lastOfA.xIndex
+        val typicalWithinClusterXIndexGap = plotted
+            .zipWithNext { a, b -> b.xIndex - a.xIndex }
+            .filter { it > 0 }
+            .min()
+        assertTrue(
+            "the real ~${gapSeconds}s gap between clusters must produce a far larger xIndex jump " +
+                "($xIndexGapAcrossClusters) than a typical within-cluster step ($typicalWithinClusterXIndexGap)",
+            xIndexGapAcrossClusters > typicalWithinClusterXIndexGap * 5,
         )
     }
 
@@ -312,7 +391,15 @@ class ReadingsRepositoryTest {
 
         val plotted = repo.plottedReadings(range, totalCount = readings.size)
 
-        assertEquals("the very first plotted reading must be the range's true first reading", start, plotted.first().timestampEpochSec)
-        assertEquals("the very last plotted reading must be the range's true last reading", end, plotted.last().timestampEpochSec)
+        assertEquals(
+            "the very first plotted reading must be the range's true first reading",
+            start,
+            plotted.first().reading.timestampEpochSec,
+        )
+        assertEquals(
+            "the very last plotted reading must be the range's true last reading",
+            end,
+            plotted.last().reading.timestampEpochSec,
+        )
     }
 }

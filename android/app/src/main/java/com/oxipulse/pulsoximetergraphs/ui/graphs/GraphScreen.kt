@@ -65,7 +65,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.oxipulse.pulsoximetergraphs.data.ble.BleGattClient
-import com.oxipulse.pulsoximetergraphs.data.db.ReadingEntity
+import com.oxipulse.pulsoximetergraphs.data.db.PlottedReading
 import com.oxipulse.pulsoximetergraphs.data.db.ReadingStats
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.di.AppContainer
@@ -263,7 +263,7 @@ fun GraphScreen(
         ) {
             StatsPanel(selectedRange, stats, thresholdConfig.spo2EventThreshold)
             ChartsCard(
-                readings = readings,
+                points = readings,
                 thresholdConfig = thresholdConfig,
                 stats = stats,
                 zoomState = sharedZoomState,
@@ -525,25 +525,36 @@ private fun StatsTableRow(
     }
 }
 
-// Plotted by each reading's INDEX in the (already range-filtered) list, not by its raw epoch
-// second. Vico derives its horizontal pixels-per-unit scale from the GCD of consecutive x
-// deltas in the series; real readings are sampled roughly once a second during a session but
-// can have arbitrarily large gaps between sessions, so using raw timestamps as x collapses
-// that GCD to ~1 second while the selected range can span hours or days. That blows up the
-// pixel math ((x - minX) / xStep * xSpacing) — only the very first cluster of points ends up
-// on-screen and the rest is positioned far off-canvas, which looks like the chart ignoring
-// the selected timespan, and makes any gap in the data break the whole chart rather than
-// just leaving a blank stretch. Indices always have a delta of exactly 1, so this GCD issue
-// can't happen regardless of how sparse or gappy the underlying data is — the axis label
-// formatter below maps each index back to that reading's real timestamp for display.
+// Plotted by each reading's xIndex (see PlottedReading's own doc), NOT by its raw epoch second
+// and NOT by its position in this (already range-filtered, already sorted) list. Vico derives
+// its horizontal pixels-per-unit scale from the GCD of consecutive x deltas in the series; real
+// readings are sampled roughly once a second during a session but can have arbitrarily large
+// gaps between sessions, so using raw timestamps as x collapses that GCD to ~1 second while the
+// selected range can span hours or days. That blows up the pixel math
+// ((x - minX) / xStep * xSpacing) — only the very first cluster of points ends up on-screen and
+// the rest is positioned far off-canvas, which looks like the chart ignoring the selected
+// timespan. Plotting by plain list position instead (as this used to) avoids that blowup — xStep
+// is always exactly 1 — but silently pretends every pair of adjacent points is equally spaced in
+// time, which is wrong whenever the data itself has a gap (e.g. the device wasn't worn for a
+// stretch): the chart renders that gap with the exact same width as any other single step,
+// reading as a smooth timeline that in fact jumps between wildly different instants.
+// PlottedReading.xIndex splits the difference: ReadingsRepository.plottedReadings computes it as
+// each reading's position among a fixed, small number of equal-duration time buckets spanning
+// the *data's own* span (not the selected range), so xStep stays small and bounded (no GCD
+// blowup) while still being genuinely proportional to elapsed time — a real gap in the data
+// shows up as a real, proportionally wide gap on the chart, since xIndex skips over the buckets
+// in between instead of incrementing by 1 regardless. The axis label formatter below maps a
+// queried x-value back to the *nearest* known reading (not a direct index lookup — see
+// nearestPlottedReading), since xIndex is no longer guaranteed contiguous.
 /**
- * Whether [readings] (assumed sorted ascending by timestamp — see ReadingDao's `ORDER BY
- * timestampEpochSec ASC`) contains anything that isn't from today, comparing only the first and
- * last reading against [zone]'s current date rather than scanning the whole list — sufficient for
- * a sorted list (every date in between necessarily falls within [firstDate, lastDate]), and O(1)
- * instead of O(n) against what can be a many-thousand-row selection.
+ * Whether [points] (assumed sorted ascending by [PlottedReading.xIndex]/timestamp — see
+ * [ReadingsRepository.plottedReadings][com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository.plottedReadings])
+ * contains anything that isn't from today, comparing only the first and last reading against
+ * [zone]'s current date rather than scanning the whole list — sufficient for a sorted list (every
+ * date in between necessarily falls within [firstDate, lastDate]), and O(1) instead of O(n)
+ * against what can be a many-hundred-point selection.
  *
- * Deliberately checked against "today" rather than "does [readings] itself span more than one
+ * Deliberately checked against "today" rather than "does [points] itself span more than one
  * date": drag-to-zoom (see DragToZoomOverlay/GraphViewModel.setRange) narrows the plotted list to
  * whatever the drag selected, which — even when the *original* selection was many days wide —
  * almost always lands within a single calendar day once zoomed in. A plain first-vs-last-date
@@ -553,12 +564,36 @@ private fun StatsTableRow(
  * disappears once the user has zoomed all the way down to (or started from) data that's
  * unambiguously today, regardless of how far they've zoomed in to get there.
  */
-private fun needsDateLabel(readings: List<ReadingEntity>, zone: ZoneId): Boolean {
-    if (readings.isEmpty()) return false
+private fun needsDateLabel(points: List<PlottedReading>, zone: ZoneId): Boolean {
+    if (points.isEmpty()) return false
     val today = LocalDate.now(zone)
-    val firstDate = Instant.ofEpochSecond(readings.first().timestampEpochSec).atZone(zone).toLocalDate()
-    val lastDate = Instant.ofEpochSecond(readings.last().timestampEpochSec).atZone(zone).toLocalDate()
+    val firstDate = Instant.ofEpochSecond(points.first().reading.timestampEpochSec).atZone(zone).toLocalDate()
+    val lastDate = Instant.ofEpochSecond(points.last().reading.timestampEpochSec).atZone(zone).toLocalDate()
     return firstDate != today || lastDate != today
+}
+
+/**
+ * The [PlottedReading] in [points] whose [PlottedReading.xIndex] is closest to [xValue] — used to
+ * resolve a queried x-position (an axis tick, a drag-to-zoom pixel position) back to a real
+ * reading even though [PlottedReading.xIndex] values are sparse (see that type's own doc: a real
+ * time gap in the data means consecutive points' xIndex can differ by more than 1), so a query
+ * that lands between two real points still resolves to whichever one is actually nearer, instead
+ * of needing an exact xIndex match. [points] must already be sorted ascending by
+ * [PlottedReading.xIndex] (binary search below relies on it) and non-empty.
+ */
+private fun nearestPlottedReading(points: List<PlottedReading>, xValue: Double): PlottedReading {
+    var lo = 0
+    var hi = points.size - 1
+    while (lo < hi) {
+        val mid = (lo + hi) / 2
+        if (points[mid].xIndex < xValue) lo = mid + 1 else hi = mid
+    }
+    // lo now indexes the first point with xIndex >= xValue (or the last point if none qualify) —
+    // the actual nearest is whichever of that point and its immediate predecessor is closer.
+    if (lo > 0 && kotlin.math.abs(points[lo - 1].xIndex - xValue) <= kotlin.math.abs(points[lo].xIndex - xValue)) {
+        return points[lo - 1]
+    }
+    return points[lo]
 }
 
 private val TIME_ONLY_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
@@ -578,27 +613,29 @@ private val TIME_ONLY_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern
 private val DATE_AND_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM'\n'HH:mm")
 
 @Composable
-private fun rememberTimeAxisFormatter(readings: List<ReadingEntity>): CartesianValueFormatter {
+private fun rememberTimeAxisFormatter(points: List<PlottedReading>): CartesianValueFormatter {
     val zone = ZoneId.systemDefault()
-    return remember(readings, zone) {
-        val formatter = if (needsDateLabel(readings, zone)) DATE_AND_TIME_FORMATTER else TIME_ONLY_FORMATTER
+    return remember(points, zone) {
+        val formatter = if (needsDateLabel(points, zone)) DATE_AND_TIME_FORMATTER else TIME_ONLY_FORMATTER
         CartesianValueFormatter { _, value, _ ->
             // Vico's contract forbids ever returning a blank string here — it throws if we do
             // (see the crash this guards against). That's harder to guarantee than it looks:
             // CartesianChartModelProducer.runTransaction (below) commits a new, possibly
             // shorter series *asynchronously*, while this formatter is rebuilt *synchronously*
-            // on the very same recomposition that changed `readings`. So right after picking a
+            // on the very same recomposition that changed `points`. So right after picking a
             // new range, the axis can still be laid out against the previous (longer) committed
             // model for a frame or two while this formatter already reflects the new (shorter)
-            // list — i.e. the index the axis asks for can legitimately be out of bounds for a
-            // moment, through no misuse of the API. Clamping instead of bailing out means that
-            // transient mismatch just reuses the nearest edge reading's label for a frame
-            // instead of crashing the app; a plain "" fallback for the truly-empty case would
-            // itself be blank (and .isBlank() also rejects whitespace-only strings), so that
-            // case gets a real placeholder instead.
-            if (readings.isEmpty()) return@CartesianValueFormatter "–"
-            val reading = readings[value.toInt().coerceIn(readings.indices)]
-            val instant = Instant.ofEpochSecond(reading.timestampEpochSec)
+            // list — i.e. the x-value the axis asks for can legitimately fall outside this list's
+            // own xIndex range for a moment, through no misuse of the API.
+            // nearestPlottedReading resolves to the nearest known point regardless (clamping to
+            // an edge past the ends, same as it would for any other out-of-range query — see its
+            // own doc), so that transient mismatch just reuses the nearest edge reading's label
+            // for a frame instead of crashing the app; a plain "" fallback for the truly-empty
+            // case would itself be blank (and .isBlank() also rejects whitespace-only strings),
+            // so that case gets a real placeholder instead.
+            if (points.isEmpty()) return@CartesianValueFormatter "–"
+            val nearest = nearestPlottedReading(points, value)
+            val instant = Instant.ofEpochSecond(nearest.reading.timestampEpochSec)
             formatter.format(instant.atZone(zone))
         }
     }
@@ -636,11 +673,11 @@ private fun rememberTimeAxisLabelComponent() = rememberAxisLabelComponent(lineCo
  * different-width gutters (their values have different typical digit counts, e.g. "45" vs
  * "100"), so each chart ends up with a slightly different plot width and picks a different tick
  * spacing — visibly, the SpO2 chart labeling a point "5:46" right where the Pulse chart labels
- * the same x-position "5:45", even though both plot the exact same [ReadingEntity] list by the
- * exact same index. Since both charts already share one x-domain (identical indices, xStep
- * always 1 — see rememberTimeAxisFormatter above), tick placement here is instead computed from
- * point count alone via an explicit `spacing`, with `addExtremeLabelPadding` off — that flag is
- * what reintroduces a pixel-width-dependent multiplier even with an explicit spacing (see
+ * the same x-position "5:45", even though both plot the exact same [PlottedReading] list at the
+ * exact same [PlottedReading.xIndex] values. Since both charts already share one x-domain
+ * (identical xIndex values — see rememberTimeAxisFormatter above), tick placement here is instead
+ * computed from point count alone via an explicit `spacing`, with `addExtremeLabelPadding` off —
+ * that flag is what reintroduces a pixel-width-dependent multiplier even with an explicit spacing (see
  * AlignedHorizontalAxisItemPlacer.getLabelValues), so turning it off is what actually makes this
  * deterministic across the two charts rather than just "usually the same."
  */
@@ -790,17 +827,20 @@ private const val MIN_DRAG_FRACTION = 0.03f
 /**
  * Wraps [content] (a chart) with a horizontal drag-to-select gesture: dragging draws a
  * translucent band with a live time-range label, and releasing narrows the range to it via
- * [onRangeSelected]. Maps the drag's pixel position to an index in [readings] by straight
- * fraction-of-width, which is only accurate because the wrapped chart's own zoom/scroll is
- * disabled (see GraphScreen) — with pan/zoom off, index 0 always sits at the left edge of this
- * Box and the last index at the right edge, with no live pan offset to account for. This doesn't
- * correct for the vertical axis's label gutter eating into the left edge of that width, so the
- * mapping is approximate near the edges — acceptable for "roughly select a section," and cheap
- * to redo since every drag is undoable via the toolbar's zoom-out button.
+ * [onRangeSelected]. Maps the drag's pixel position to a [PlottedReading] by straight
+ * fraction-of-width over [PlottedReading.xIndex]'s own range (not by list position — see that
+ * type's own doc for why those two differ), then [nearestPlottedReading] resolves whatever
+ * xIndex that fraction lands on to the closest *real* point, since xIndex can be sparse. This is
+ * only accurate because the wrapped chart's own zoom/scroll is disabled (see GraphScreen) — with
+ * pan/zoom off, the minimum xIndex always sits at the left edge of this Box and the maximum at
+ * the right edge, with no live pan offset to account for. This doesn't correct for the vertical
+ * axis's label gutter eating into the left edge of that width, so the mapping is approximate near
+ * the edges — acceptable for "roughly select a section," and cheap to redo since every drag is
+ * undoable via the toolbar's zoom-out button.
  */
 @Composable
 private fun DragToZoomOverlay(
-    readings: List<ReadingEntity>,
+    points: List<PlottedReading>,
     onRangeSelected: (ClosedRange<Instant>) -> Unit,
     modifier: Modifier = Modifier,
     content: @Composable BoxScope.() -> Unit,
@@ -809,18 +849,20 @@ private fun DragToZoomOverlay(
     var dragCurrentX by remember { mutableStateOf<Float?>(null) }
     var widthPx by remember { mutableStateOf(0f) }
 
-    fun indexAt(x: Float): Int =
-        if (widthPx <= 0f) {
-            0
-        } else {
-            (x / widthPx * (readings.size - 1)).roundToInt().coerceIn(readings.indices)
-        }
+    fun pointAt(x: Float): PlottedReading {
+        val minXIndex = points.first().xIndex
+        val maxXIndex = points.last().xIndex
+        if (widthPx <= 0f || maxXIndex == minXIndex) return points.first()
+        val fraction = (x / widthPx).coerceIn(0f, 1f)
+        val targetXIndex = minXIndex + ((maxXIndex - minXIndex) * fraction).roundToInt()
+        return nearestPlottedReading(points, targetXIndex.toDouble())
+    }
 
     Box(
         modifier = modifier
             .onSizeChanged { widthPx = it.width.toFloat() }
-            .pointerInput(readings) {
-                if (readings.size < 2) return@pointerInput
+            .pointerInput(points) {
+                if (points.size < 2) return@pointerInput
                 detectHorizontalDragGestures(
                     onDragStart = { offset ->
                         dragStartX = offset.x
@@ -832,12 +874,12 @@ private fun DragToZoomOverlay(
                         if (startX != null && endX != null && widthPx > 0f &&
                             kotlin.math.abs(endX - startX) / widthPx >= MIN_DRAG_FRACTION
                         ) {
-                            val loIndex = indexAt(minOf(startX, endX))
-                            val hiIndex = indexAt(maxOf(startX, endX))
-                            if (hiIndex > loIndex) {
+                            val lo = pointAt(minOf(startX, endX))
+                            val hi = pointAt(maxOf(startX, endX))
+                            if (hi.xIndex > lo.xIndex) {
                                 onRangeSelected(
-                                    Instant.ofEpochSecond(readings[loIndex].timestampEpochSec)..
-                                        Instant.ofEpochSecond(readings[hiIndex].timestampEpochSec),
+                                    Instant.ofEpochSecond(lo.reading.timestampEpochSec)..
+                                        Instant.ofEpochSecond(hi.reading.timestampEpochSec),
                                 )
                             }
                         }
@@ -856,7 +898,7 @@ private fun DragToZoomOverlay(
 
         val startX = dragStartX
         val endX = dragCurrentX
-        if (startX != null && endX != null && readings.size >= 2) {
+        if (startX != null && endX != null && points.size >= 2) {
             val selectionColor = MaterialTheme.colorScheme.primary
             val left = minOf(startX, endX)
             val right = maxOf(startX, endX)
@@ -872,8 +914,8 @@ private fun DragToZoomOverlay(
             }
             val zone = ZoneId.systemDefault()
             val timeFormatter = DateTimeFormatter.ofPattern("HH:mm")
-            val loInstant = Instant.ofEpochSecond(readings[indexAt(left)].timestampEpochSec)
-            val hiInstant = Instant.ofEpochSecond(readings[indexAt(right)].timestampEpochSec)
+            val loInstant = Instant.ofEpochSecond(pointAt(left).reading.timestampEpochSec)
+            val hiInstant = Instant.ofEpochSecond(pointAt(right).reading.timestampEpochSec)
             Text(
                 "${timeFormatter.format(loInstant.atZone(zone))} – ${timeFormatter.format(hiInstant.atZone(zone))}",
                 modifier = Modifier.align(Alignment.TopCenter).padding(top = 4.dp),
@@ -904,7 +946,7 @@ private val CHART_LINE_STROKE = LineCartesianLayer.LineStroke.Continuous(thickne
  */
 @Composable
 private fun ChartsCard(
-    readings: List<ReadingEntity>,
+    points: List<PlottedReading>,
     thresholdConfig: ThresholdConfig,
     stats: ReadingStats,
     zoomState: VicoZoomState,
@@ -916,7 +958,7 @@ private fun ChartsCard(
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Spo2ChartContent(
-                readings = readings,
+                points = points,
                 thresholdConfig = thresholdConfig,
                 minSpo2 = stats.minSpo2,
                 maxSpo2 = stats.maxSpo2,
@@ -927,7 +969,7 @@ private fun ChartsCard(
                 zoomedIn = canZoomOut,
             )
             PulseChartContent(
-                readings = readings,
+                points = points,
                 thresholdConfig = thresholdConfig,
                 minPulse = stats.minPulse,
                 maxPulse = stats.maxPulse,
@@ -943,7 +985,7 @@ private fun ChartsCard(
 
 @Composable
 private fun Spo2ChartContent(
-    readings: List<ReadingEntity>,
+    points: List<PlottedReading>,
     thresholdConfig: ThresholdConfig,
     minSpo2: Int?,
     maxSpo2: Int?,
@@ -954,15 +996,15 @@ private fun Spo2ChartContent(
     zoomedIn: Boolean,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
-    LaunchedEffect(readings) {
+    LaunchedEffect(points) {
         modelProducer.runTransaction {
             // A series must be non-empty (Vico throws otherwise), so only add one when there's
             // actually data for the selected range — an empty transaction just renders no line.
-            if (readings.isNotEmpty()) {
+            if (points.isNotEmpty()) {
                 lineModel {
                     series(
-                        x = readings.indices.map { it.toDouble() },
-                        y = readings.map { it.spo2.toDouble() },
+                        x = points.map { it.xIndex.toDouble() },
+                        y = points.map { it.reading.spo2.toDouble() },
                     )
                 }
             }
@@ -970,7 +1012,7 @@ private fun Spo2ChartContent(
     }
 
     val spo2Color = MaterialTheme.extendedColors.chartSpo2
-    val timeAxisFormatter = rememberTimeAxisFormatter(readings)
+    val timeAxisFormatter = rememberTimeAxisFormatter(points)
     // Widened to also cover spo2Red if the actual readings never dip that low: without this, a
     // user whose SpO2 stays comfortably in the high 90s would never see the red/orange bands at
     // all, since clamping them to a visible window that sits entirely above the bands collapses
@@ -1000,7 +1042,7 @@ private fun Spo2ChartContent(
         Text("SpO2 (%)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         ProvideVicoTheme(rememberM3VicoTheme()) {
             DragToZoomOverlay(
-                readings = readings,
+                points = points,
                 onRangeSelected = onRangeSelected,
                 modifier = Modifier.fillMaxWidth().height(220.dp),
             ) {
@@ -1036,7 +1078,7 @@ private fun Spo2ChartContent(
 
 @Composable
 private fun PulseChartContent(
-    readings: List<ReadingEntity>,
+    points: List<PlottedReading>,
     thresholdConfig: ThresholdConfig,
     minPulse: Int?,
     maxPulse: Int?,
@@ -1047,13 +1089,13 @@ private fun PulseChartContent(
     zoomedIn: Boolean,
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
-    LaunchedEffect(readings) {
+    LaunchedEffect(points) {
         modelProducer.runTransaction {
-            if (readings.isNotEmpty()) {
+            if (points.isNotEmpty()) {
                 lineModel {
                     series(
-                        x = readings.indices.map { it.toDouble() },
-                        y = readings.map { it.pulse.toDouble() },
+                        x = points.map { it.xIndex.toDouble() },
+                        y = points.map { it.reading.pulse.toDouble() },
                     )
                 }
             }
@@ -1061,7 +1103,7 @@ private fun PulseChartContent(
     }
 
     val pulseColor = MaterialTheme.extendedColors.chartPulse
-    val timeAxisFormatter = rememberTimeAxisFormatter(readings)
+    val timeAxisFormatter = rememberTimeAxisFormatter(points)
     // Widened to also cover the configured low/high-red thresholds if the actual readings never
     // reach them: otherwise a visible window computed purely from the data (e.g. resting-range
     // readings that never dip toward pulseLowRed) sits entirely above/below a threshold band,
@@ -1088,7 +1130,7 @@ private fun PulseChartContent(
         Text("Pulse (bpm)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         ProvideVicoTheme(rememberM3VicoTheme()) {
             DragToZoomOverlay(
-                readings = readings,
+                points = points,
                 onRangeSelected = onRangeSelected,
                 modifier = Modifier.fillMaxWidth().height(220.dp),
             ) {

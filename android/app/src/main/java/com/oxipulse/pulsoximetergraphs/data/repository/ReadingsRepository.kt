@@ -1,6 +1,7 @@
 package com.oxipulse.pulsoximetergraphs.data.repository
 
 import com.oxipulse.pulsoximetergraphs.data.csv.CsvParser
+import com.oxipulse.pulsoximetergraphs.data.db.PlottedReading
 import com.oxipulse.pulsoximetergraphs.data.db.ReadingDao
 import com.oxipulse.pulsoximetergraphs.data.db.ReadingEntity
 import com.oxipulse.pulsoximetergraphs.data.db.ReadingStats
@@ -74,54 +75,73 @@ class ReadingsRepository(private val readingDao: ReadingDao) {
         readingDao.observeCountInRange(range.start.epochSecond, range.endInclusive.epochSecond)
 
     /**
-     * Chart-ready readings for [range], capped at [MAX_PLOTTED_POINTS] regardless of how many raw
+     * Chart-ready points for [range], capped at [MAX_PLOTTED_POINTS] regardless of how many raw
      * rows the range actually contains. [totalCount] must be the range's current row count (from
      * [observeCountInRange]) — passed in rather than queried again here so the caller's own
      * reactive count and this fetch never disagree about which path to take.
      *
-     * When [totalCount] is already at or under the cap, the exact rows are returned as-is — no
-     * decimation needed or wanted; every real reading shows up.
+     * Bucketing is always computed against the *actual data's own span* — [ReadingDao.firstInRange]
+     * to [ReadingDao.lastInRange] — not [range]'s own width. A user very often selects a wider
+     * span than the device actually has data for (an obvious example: any predefined "last N
+     * days" quick-select picked while the device was only worn for a few hours somewhere in that
+     * window). Bucketing over the full selected span in that case wastes almost the entire
+     * [MAX_PLOTTED_POINTS] budget on buckets that fall in the data-free portion — GROUP BY simply
+     * emits nothing for an empty bucket, so a span that's mostly empty could end up rendering only
+     * a small fraction of the intended point budget. Bucketing over the data's own span instead
+     * means every bucket falls somewhere data could actually exist.
      *
-     * Otherwise, [range] is split into [MAX_PLOTTED_POINTS] / 4 equal-*duration* time buckets —
-     * not equal-row-count buckets, deliberately: dividing by time keeps decimated points roughly
-     * evenly spaced across the chart's x-axis even when sampling density varies (e.g. gaps where
-     * the device wasn't worn), rather than clumping wherever data happens to be denser. For each
-     * bucket, the readings holding that bucket's min/max SpO2 and min/max pulse are kept, so a
-     * brief desaturation or pulse spike still shows up on the chart instead of being averaged
-     * away — the same guarantee a prior Kotlin-side "decimate after loading everything" approach
-     * gave, just computed as SQL aggregate queries ([ReadingDao.bucketedMinSpo2] and its three
-     * siblings) instead of after materializing every row in the range as a [ReadingEntity]. This
-     * is what actually keeps a multi-year range from having to hold millions of those in memory
-     * just to render a 500-point chart. The four per-bucket queries can return the same row for
-     * more than one extreme (e.g. one reading is both its bucket's min and max pulse, in a
-     * near-flat bucket).
+     * Each returned [PlottedReading.xIndex] is that reading's position among [MAX_PLOTTED_POINTS]
+     * / 4 equal-*duration* time buckets spanning the data (bucket index =
+     * `(timestampEpochSec - firstReadingEpochSec) * bucketCount / dataSpanSeconds`) — not its
+     * position in this returned list. That distinction is what lets the chart's index-based x-axis
+     * (see GraphScreen's own doc on why it's index-based, not raw-timestamp-based) still be
+     * genuinely linear in time: two [PlottedReading]s with a real time gap between them get
+     * [PlottedReading.xIndex] values that skip over the buckets in between, rather than sitting at
+     * the same fixed one-index step apart as any other adjacent pair regardless of how much real
+     * time actually separates them.
      *
-     * [ReadingDao.firstInRange]/[ReadingDao.lastInRange] are always folded in too (deduplicated
-     * along with everything else below), so the *first* and *last* plotted points are always the
-     * exact first/last reading actually in [range] — not just whichever reading happened to hold
-     * an extreme within the first/last time bucket. Without this, the chart's own visible x-axis
-     * could start or end noticeably later/earlier than the selected range itself: e.g. selecting
-     * 01:00–09:00 but the bucket containing 01:00 has its SpO2/pulse extremes at 01:19, so 01:19
-     * — not 01:00 — would be the leftmost thing actually drawn (and labeled) on the chart, reading
-     * as the chart's own timespan disagreeing with what was just selected.
+     * When [totalCount] is already at or under [MAX_PLOTTED_POINTS], every raw reading in [range]
+     * is returned (via [ReadingDao.rangeOrderedList]) — no extremes-only decimation, every real
+     * reading shows up — just with [PlottedReading.xIndex] attached using that same bucket formula
+     * (readings can still share an xIndex if several land in the same bucket; Vico renders that as
+     * near-overlapping points, an acceptable rarity next to the alternative of silently pretending
+     * every reading is evenly time-spaced). Above that cap, [range] is decimated exactly as before
+     * — for each bucket, the readings holding that bucket's min/max SpO2 and min/max pulse are
+     * kept (plus [ReadingDao.firstInRange]/[ReadingDao.lastInRange] themselves, so the chart's own
+     * visible edges always exactly match the data's true first/last reading, not merely whichever
+     * reading happened to hold an extreme in the first/last bucket) — computed as SQL aggregate
+     * queries ([ReadingDao.bucketedMinSpo2] and its three siblings) rather than after materializing
+     * every row in the range as a [ReadingEntity], which is what actually keeps a multi-year range
+     * from having to hold millions of those in memory just to render a chart.
      */
-    suspend fun plottedReadings(range: ClosedRange<Instant>, totalCount: Int): List<ReadingEntity> {
+    suspend fun plottedReadings(range: ClosedRange<Instant>, totalCount: Int): List<PlottedReading> {
+        if (totalCount <= 0) return emptyList()
         val startEpochSec = range.start.epochSecond
         val endEpochSec = range.endInclusive.epochSecond
-        if (totalCount <= MAX_PLOTTED_POINTS) {
-            return readingDao.rangeOrderedList(startEpochSec, endEpochSec)
-        }
+        val firstReading = readingDao.firstInRange(startEpochSec, endEpochSec) ?: return emptyList()
+        val lastReading = readingDao.lastInRange(startEpochSec, endEpochSec) ?: return emptyList()
+        val dataStartEpochSec = firstReading.timestampEpochSec
+        val dataSpanSeconds = (lastReading.timestampEpochSec - dataStartEpochSec + 1).coerceAtLeast(1)
         val bucketCount = (MAX_PLOTTED_POINTS / 4).coerceAtLeast(1)
-        val spanSeconds = (endEpochSec - startEpochSec + 1).coerceAtLeast(1)
-        val extremes = readingDao.bucketedMinSpo2(startEpochSec, endEpochSec, bucketCount, spanSeconds) +
-            readingDao.bucketedMaxSpo2(startEpochSec, endEpochSec, bucketCount, spanSeconds) +
-            readingDao.bucketedMinPulse(startEpochSec, endEpochSec, bucketCount, spanSeconds) +
-            readingDao.bucketedMaxPulse(startEpochSec, endEpochSec, bucketCount, spanSeconds)
-        val boundary = listOfNotNull(
-            readingDao.firstInRange(startEpochSec, endEpochSec),
-            readingDao.lastInRange(startEpochSec, endEpochSec),
-        )
-        return (extremes + boundary).distinctBy { it.timestampEpochSec }.sortedBy { it.timestampEpochSec }
+
+        val rawReadings = if (totalCount <= MAX_PLOTTED_POINTS) {
+            readingDao.rangeOrderedList(startEpochSec, endEpochSec)
+        } else {
+            val extremes = readingDao.bucketedMinSpo2(dataStartEpochSec, lastReading.timestampEpochSec, bucketCount, dataSpanSeconds) +
+                readingDao.bucketedMaxSpo2(dataStartEpochSec, lastReading.timestampEpochSec, bucketCount, dataSpanSeconds) +
+                readingDao.bucketedMinPulse(dataStartEpochSec, lastReading.timestampEpochSec, bucketCount, dataSpanSeconds) +
+                readingDao.bucketedMaxPulse(dataStartEpochSec, lastReading.timestampEpochSec, bucketCount, dataSpanSeconds)
+            (extremes + listOf(firstReading, lastReading)).distinctBy { it.timestampEpochSec }
+        }
+
+        return rawReadings
+            .sortedBy { it.timestampEpochSec }
+            .map { reading ->
+                PlottedReading(
+                    xIndex = ((reading.timestampEpochSec - dataStartEpochSec) * bucketCount) / dataSpanSeconds,
+                    reading = reading,
+                )
+            }
     }
 
     /**
