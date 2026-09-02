@@ -54,6 +54,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
@@ -932,6 +933,54 @@ private fun DragToZoomOverlay(
 private val CHART_LINE_STROKE = LineCartesianLayer.LineStroke.Continuous(thickness = 1.2.dp)
 
 /**
+ * A [LineCartesianLayer.Interpolator] that draws a straight line between consecutive points —
+ * the same behavior as Vico's own [LineCartesianLayer.Interpolator.Companion.getSharp] — except
+ * it lifts the pen (`Path.moveTo` instead of `Path.lineTo`) at every real session boundary (see
+ * [PlottedReading.sessionIndex]'s own doc) instead of drawing a straight line across it, so a
+ * genuine gap in the data (the device wasn't worn) reads as a real, empty break in the chart
+ * rather than a smoothly connected line spanning however much real time that gap actually was.
+ *
+ * This is deliberately built on [LineCartesianLayer.Interpolator], not the older (now-deprecated
+ * in Vico 3.2.3) [LineCartesianLayer.PointConnector]: `interpolate` hands over the *entire*
+ * series' already-computed pixel positions in one call (`offsets`, one per [points] entry, in
+ * the same order — confirmed by decompiling Vico's own `Sharp` interpolator, which walks this
+ * exact list by index) rather than one segment at a time with no index of its own to correlate
+ * calls against. That makes this implementation fully stateless: each pixel position is looked
+ * up by the same index into [points] used to build the series in the first place, with no
+ * assumptions about call count or call order across recompositions/redraws — a per-segment
+ * `PointConnector`, by contrast, would need to track "which segment is this" via mutable state
+ * with no reliable reset signal, which an earlier attempt at this feature (implemented instead
+ * as multiple Vico series, one per session) found the hard way: that approach broke the bottom
+ * axis's labels entirely, traced to a real bug in how Vico 3.2.3 builds a multi-series model's
+ * internal x-order. This interpolator doesn't touch that code path at all — still exactly one
+ * series, so [Spo2ChartContent]/[PulseChartContent] and the axis machinery are unaffected;
+ * only which pixel segments get an actual line drawn between them changes.
+ */
+@Composable
+private fun rememberGapAwareInterpolator(points: List<PlottedReading>): LineCartesianLayer.Interpolator =
+    remember(points) {
+        object : LineCartesianLayer.Interpolator {
+            override fun interpolate(
+                context: CartesianDrawingContext,
+                path: Path,
+                offsets: List<Offset>,
+                visibleIndexRange: IntRange,
+            ) {
+                for (index in visibleIndexRange) {
+                    val offset = offsets[index]
+                    val isSessionStart = index == visibleIndexRange.first ||
+                        points[index].sessionIndex != points[index - 1].sessionIndex
+                    if (isSessionStart) {
+                        path.moveTo(offset.x, offset.y)
+                    } else {
+                        path.lineTo(offset.x, offset.y)
+                    }
+                }
+            }
+        }
+    }
+
+/**
  * One shared card housing both the SpO2 and Pulse charts (stacked, each still its own
  * [CartesianChartHost] with its own scale and threshold bands — NOT one dual-axis chart: the
  * thresholds for the two metrics visually overlap in places, e.g. a pulse-high-orange band and an
@@ -1046,6 +1095,7 @@ private fun Spo2ChartContent(
     val spo2Line = LineCartesianLayer.rememberLine(
         fill = LineCartesianLayer.LineFill.single(Fill(spo2Color)),
         stroke = CHART_LINE_STROKE,
+        interpolator = rememberGapAwareInterpolator(points),
     )
     val labelFontSize = MaterialTheme.typography.labelSmall.fontSize
 
@@ -1136,6 +1186,7 @@ private fun PulseChartContent(
     val pulseLine = LineCartesianLayer.rememberLine(
         fill = LineCartesianLayer.LineFill.single(Fill(pulseColor)),
         stroke = CHART_LINE_STROKE,
+        interpolator = rememberGapAwareInterpolator(points),
     )
     val labelFontSize = MaterialTheme.typography.labelSmall.fontSize
 
