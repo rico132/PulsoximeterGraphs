@@ -1,6 +1,8 @@
 package com.oxipulse.pulsoximetergraphs.csv
 
 import com.oxipulse.pulsoximetergraphs.data.csv.CsvParser
+import com.oxipulse.pulsoximetergraphs.data.db.ReadingEntity
+import java.time.LocalDateTime
 import java.time.ZoneOffset
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -113,5 +115,30 @@ class CsvParserTest {
             3600L,
             utcResult.readings.first().timestampEpochSec - plusOneResult.readings.first().timestampEpochSec,
         )
+    }
+
+    @Test
+    fun `format renders a row that parseRow accepts back unchanged`() {
+        val epochSec = LocalDateTime.of(2026, 8, 12, 19, 15, 38).toEpochSecond(ZoneOffset.UTC)
+        val reading = ReadingEntity(timestampEpochSec = epochSec, spo2 = 96, pulse = 75)
+
+        val row = CsvParser.format(reading, utc)
+        assertEquals("2026-08-12, 19:15:38, 96, 75", row)
+
+        val roundTripped = CsvParser.parse("${CsvParser.HEADER_LINE}\r\n$row\r\n", utc)
+        assertEquals(1, roundTripped.readings.size)
+        assertEquals(reading, roundTripped.readings.first())
+    }
+
+    @Test
+    fun `format uses the supplied zone, mirroring parse`() {
+        val epochSec = LocalDateTime.of(2026, 8, 12, 19, 15, 38).toEpochSecond(ZoneOffset.UTC)
+        val reading = ReadingEntity(timestampEpochSec = epochSec, spo2 = 96, pulse = 75)
+
+        val utcRow = CsvParser.format(reading, ZoneOffset.UTC)
+        val plusOneRow = CsvParser.format(reading, ZoneOffset.ofHours(1))
+
+        assertEquals("2026-08-12, 19:15:38, 96, 75", utcRow)
+        assertEquals("2026-08-12, 20:15:38, 96, 75", plusOneRow)
     }
 }

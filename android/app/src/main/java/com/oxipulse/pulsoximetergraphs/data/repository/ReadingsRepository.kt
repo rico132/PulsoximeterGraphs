@@ -8,6 +8,7 @@ import com.oxipulse.pulsoximetergraphs.data.db.ReadingStats
 import com.oxipulse.pulsoximetergraphs.data.db.Spo2EventCounter
 import com.oxipulse.pulsoximetergraphs.data.db.ValueCount
 import java.time.Instant
+import java.time.ZoneId
 import kotlin.math.ceil
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -73,6 +74,52 @@ class ReadingsRepository(private val readingDao: ReadingDao) {
     /** See [ReadingDao.observeCountInRange]'s own doc. */
     fun observeCountInRange(range: ClosedRange<Instant>): Flow<Int> =
         readingDao.observeCountInRange(range.start.epochSecond, range.endInclusive.epochSecond)
+
+    /**
+     * Streams every reading in [range] — or the entire table when [range] is null ("export all
+     * data") — out through [onChunk] as CSV text, one page at a time via [ReadingDao.pageInRange]
+     * (the same keyset-paginated read [countSpo2EventsInRange] already uses) rather than
+     * building the whole export as one in-memory string first: the same bounded-memory concern
+     * as the rest of this repository (see its own class doc), and even more directly at stake for
+     * "export all data" on a database that, per that doc, can genuinely hold tens of millions of
+     * rows. [onChunk] is called once up front with just [CsvParser.HEADER_LINE] and its line
+     * ending, then once per page with that page's rows already formatted and concatenated — the
+     * caller is expected to write each chunk straight through to an output stream (e.g. a SAF
+     * `CreateDocument` result) rather than accumulate them itself.
+     *
+     * `null`'s two sentinel bounds ([Long.MIN_VALUE]/[Long.MAX_VALUE]) rather than a separate
+     * "no filter" code path through [ReadingDao.pageInRange]: every real `timestampEpochSec` is
+     * far inside that range, so `BETWEEN` behaves exactly like no filter at all, and the rows are
+     * still read back in ascending timestamp order via the same primary-key index scan
+     * [pageInRange] always uses — no separate sort step either way.
+     *
+     * Rows are written in [CsvParser]'s own wire format (mirroring [importCsv]'s parse side), so
+     * a file exported here reads back through [importCsv] unchanged. Returns the number of rows
+     * written (not counting the header).
+     */
+    suspend fun exportCsv(range: ClosedRange<Instant>?, onChunk: (String) -> Unit): Int {
+        val startEpochSec = range?.start?.epochSecond ?: Long.MIN_VALUE
+        val endEpochSec = range?.endInclusive?.epochSecond ?: Long.MAX_VALUE
+        val zone = ZoneId.systemDefault()
+        onChunk(CsvParser.HEADER_LINE + "\r\n")
+        var rowCount = 0
+        var cursor = startEpochSec
+        while (true) {
+            val page = readingDao.pageInRange(cursor, endEpochSec, EVENT_COUNT_PAGE_SIZE)
+            if (page.isEmpty()) break
+            val chunk = buildString {
+                for (reading in page) {
+                    append(CsvParser.format(reading, zone))
+                    append("\r\n")
+                }
+            }
+            onChunk(chunk)
+            rowCount += page.size
+            if (page.size < EVENT_COUNT_PAGE_SIZE) break
+            cursor = page.last().timestampEpochSec + 1
+        }
+        return rowCount
+    }
 
     /**
      * Chart-ready points for [range], capped at [MAX_PLOTTED_POINTS] regardless of how many raw

@@ -51,6 +51,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.oxipulse.pulsoximetergraphs.data.ble.BleFirmwareUpdateClient
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.di.AppContainer
+import com.oxipulse.pulsoximetergraphs.ui.rangepicker.DateTimeRangePickerDialog
+import com.oxipulse.pulsoximetergraphs.ui.rangepicker.PredefinedTimeSpan
+import java.time.Instant
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -123,14 +126,14 @@ fun SettingsScreen(
                     )
                     1 -> DeviceSection(viewModel, desiredTestMode)
                     2 -> DebugLogSection(debugLog, onClear = viewModel::clearDebugLog)
-                    3 -> ImportTab(viewModel)
+                    3 -> ImportExportTab(viewModel)
                 }
             }
         }
     }
 }
 
-private val SETTINGS_TABS = listOf("Config", "Device", "BLE Log", "Import")
+private val SETTINGS_TABS = listOf("Config", "Device", "BLE Log", "Import/Export")
 
 @Composable
 private fun ConfigTab(
@@ -435,22 +438,39 @@ private fun DebugLogSection(debugLog: String, onClear: () -> Unit) {
     }
 }
 
+/** Suggested filename offered to the SAF "save as" picker — the user can still rename it there. */
+private const val EXPORT_FILE_NAME = "pulsoximeter_export.csv"
+
 /**
- * Direct CSV import (SAF file picker), independent of a BLE sync — moved here from the graphs
- * screen's top app bar so device settings, OTA/WiFi, and both ways of getting readings into the
- * app live under one Settings destination.
+ * Direct CSV import (SAF file picker) and export (SAF "save as"), independent of a BLE sync —
+ * moved here from the graphs screen's top app bar so device settings, OTA/WiFi, and every way of
+ * getting readings into or out of the app live under one Settings destination. Export offers the
+ * entire database or a picked date/time range, reusing the same [DateTimeRangePickerDialog]
+ * GraphScreen's own range picker uses.
  */
 @Composable
-private fun ImportTab(viewModel: SettingsViewModel) {
+private fun ImportExportTab(viewModel: SettingsViewModel) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
-    var statusMessage by remember { mutableStateOf<String?>(null) }
+    var importStatusMessage by remember { mutableStateOf<String?>(null) }
+    var exportStatusMessage by remember { mutableStateOf<String?>(null) }
+    var exporting by remember { mutableStateOf(false) }
+    var showExportRangePicker by remember { mutableStateOf(false) }
+    // Only seeds the range picker's own initial selection on the next export — export itself
+    // doesn't care what was picked last time, this just saves re-navigating the picker back to
+    // roughly the same window on a second export.
+    var lastExportRange by remember { mutableStateOf(PredefinedTimeSpan.LAST_WEEK.toRange()) }
+    // CreateDocument's contract only takes the suggested filename, not an arbitrary payload, so
+    // the range to export (null for "all data") is stashed here right before `.launch(...)` and
+    // read back out once the user actually picks a destination file, inside that launcher's own
+    // result callback below.
+    var pendingExportRange by remember { mutableStateOf<ClosedRange<Instant>?>(null) }
 
     val openDocumentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
     ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
-        statusMessage = null
+        importStatusMessage = null
         // The activity-result callback runs on the main thread, and reading through a SAF
         // content-provider stream is a blocking IPC round trip — for anything but a tiny file
         // this would otherwise freeze the UI for a couple of seconds right after picking it.
@@ -460,12 +480,59 @@ private fun ImportTab(viewModel: SettingsViewModel) {
             }
             if (text != null) {
                 viewModel.importCsvText(text) { inserted, skipped ->
-                    statusMessage = "Imported $inserted rows ($skipped skipped)"
+                    importStatusMessage = "Imported $inserted rows ($skipped skipped)"
                 }
             } else {
-                statusMessage = "Could not read that file"
+                importStatusMessage = "Could not read that file"
             }
         }
+    }
+
+    val createDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("text/csv"),
+    ) { uri: Uri? ->
+        if (uri == null) {
+            exporting = false
+            return@rememberLauncherForActivityResult
+        }
+        exportStatusMessage = null
+        // Same blocking-IPC-round-trip reasoning as the import side above — writing through a SAF
+        // output stream (and running ReadingsRepository.exportCsv's own paginated DB reads) has
+        // to stay off the main thread.
+        coroutineScope.launch {
+            val rowCount = withContext(Dispatchers.IO) {
+                context.contentResolver.openOutputStream(uri)?.use { stream ->
+                    stream.bufferedWriter().use { writer ->
+                        viewModel.exportCsv(pendingExportRange) { chunk -> writer.write(chunk) }
+                    }
+                }
+            }
+            exporting = false
+            exportStatusMessage = if (rowCount != null) {
+                "Exported $rowCount rows"
+            } else {
+                "Could not write that file"
+            }
+        }
+    }
+
+    fun startExport(range: ClosedRange<Instant>?) {
+        exportStatusMessage = null
+        pendingExportRange = range
+        exporting = true
+        createDocumentLauncher.launch(EXPORT_FILE_NAME)
+    }
+
+    if (showExportRangePicker) {
+        DateTimeRangePickerDialog(
+            initialRange = lastExportRange,
+            onDismiss = { showExportRangePicker = false },
+            onConfirm = { range ->
+                lastExportRange = range
+                showExportRangePicker = false
+                startExport(range)
+            },
+        )
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -478,6 +545,27 @@ private fun ImportTab(viewModel: SettingsViewModel) {
         Button(onClick = { openDocumentLauncher.launch(arrayOf("text/csv", "*/*")) }) {
             Text("Choose CSV file")
         }
-        statusMessage?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
+        importStatusMessage?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
+
+        HorizontalDivider()
+
+        Text("Export CSV", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Export readings back out in the same CSV format — either every reading in the " +
+                "database, or just a chosen date/time range.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { startExport(null) }, enabled = !exporting) {
+                Text("Export all data")
+            }
+            OutlinedButton(onClick = { showExportRangePicker = true }, enabled = !exporting) {
+                Text("Export a range…")
+            }
+        }
+        if (exporting) {
+            Text("Exporting…", style = MaterialTheme.typography.bodySmall)
+        }
+        exportStatusMessage?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
     }
 }

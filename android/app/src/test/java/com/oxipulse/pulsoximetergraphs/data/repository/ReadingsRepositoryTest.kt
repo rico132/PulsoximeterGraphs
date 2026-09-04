@@ -1,5 +1,6 @@
 package com.oxipulse.pulsoximetergraphs.data.repository
 
+import com.oxipulse.pulsoximetergraphs.data.csv.CsvParser
 import com.oxipulse.pulsoximetergraphs.data.db.PlottedReading
 import com.oxipulse.pulsoximetergraphs.data.db.ReadingDao
 import com.oxipulse.pulsoximetergraphs.data.db.ReadingEntity
@@ -465,5 +466,93 @@ class ReadingsRepositoryTest {
             end,
             plotted.last().reading.timestampEpochSec,
         )
+    }
+
+    // --- exportCsv ---
+
+    @Test
+    fun `exportCsv with a null range writes every row, in timestamp order`() = runTest {
+        val readings = listOf(
+            ReadingEntity(timestampEpochSec = epochOf("2026-08-12", "19:15:39"), spo2 = 97, pulse = 76),
+            ReadingEntity(timestampEpochSec = epochOf("2026-08-12", "19:15:38"), spo2 = 96, pulse = 75),
+        )
+        val dao = FakeReadingDao(readings)
+        val repo = ReadingsRepository(dao)
+        val chunks = mutableListOf<String>()
+
+        val rowCount = repo.exportCsv(range = null) { chunks.add(it) }
+
+        assertEquals(2, rowCount)
+        val text = chunks.joinToString("")
+        assertEquals(
+            listOf(HEADER, row("2026-08-12", "19:15:38", 96, 75), row("2026-08-12", "19:15:39", 97, 76)).joinToString("\r\n") + "\r\n",
+            text,
+        )
+    }
+
+    @Test
+    fun `exportCsv with a range only includes rows inside it`() = runTest {
+        val inRange = epochOf("2026-08-12", "12:00:00")
+        val beforeRange = epochOf("2026-08-11", "12:00:00")
+        val afterRange = epochOf("2026-08-13", "12:00:00")
+        val readings = listOf(
+            ReadingEntity(timestampEpochSec = beforeRange, spo2 = 90, pulse = 60),
+            ReadingEntity(timestampEpochSec = inRange, spo2 = 95, pulse = 70),
+            ReadingEntity(timestampEpochSec = afterRange, spo2 = 99, pulse = 80),
+        )
+        val dao = FakeReadingDao(readings)
+        val repo = ReadingsRepository(dao)
+        val range = Instant.ofEpochSecond(epochOf("2026-08-12", "00:00:00"))..
+            Instant.ofEpochSecond(epochOf("2026-08-13", "00:00:00"))
+        val chunks = mutableListOf<String>()
+
+        val rowCount = repo.exportCsv(range) { chunks.add(it) }
+
+        assertEquals(1, rowCount)
+        assertTrue(chunks.joinToString("").contains(", 95, 70"))
+    }
+
+    @Test
+    fun `exportCsv on an empty database writes just the header and reports zero rows`() = runTest {
+        val dao = FakeReadingDao()
+        val repo = ReadingsRepository(dao)
+        val chunks = mutableListOf<String>()
+
+        val rowCount = repo.exportCsv(range = null) { chunks.add(it) }
+
+        assertEquals(0, rowCount)
+        assertEquals("${CsvParser.HEADER_LINE}\r\n", chunks.joinToString(""))
+    }
+
+    @Test
+    fun `exportCsv pages across a page-size boundary without dropping or duplicating rows`() = runTest {
+        val pageSize = ReadingsRepository.EVENT_COUNT_PAGE_SIZE
+        val readings = readingsOverSeconds(pageSize + 10)
+        val dao = FakeReadingDao(readings)
+        val repo = ReadingsRepository(dao)
+        val chunks = mutableListOf<String>()
+
+        val rowCount = repo.exportCsv(range = null) { chunks.add(it) }
+
+        assertEquals(readings.size, rowCount)
+        assertEquals(readings.size, chunks.joinToString("").lines().count { it.isNotBlank() } - 1) // -1 for the header
+    }
+
+    @Test
+    fun `exportCsv output round-trips through importCsv unchanged`() = runTest {
+        val readings = listOf(
+            ReadingEntity(timestampEpochSec = epochOf("2026-08-12", "19:15:38"), spo2 = 96, pulse = 75),
+            ReadingEntity(timestampEpochSec = epochOf("2026-08-12", "19:15:39"), spo2 = 97, pulse = 76),
+        )
+        val exportDao = FakeReadingDao(readings)
+        val exportRepo = ReadingsRepository(exportDao)
+        val chunks = mutableListOf<String>()
+        exportRepo.exportCsv(range = null) { chunks.add(it) }
+
+        val importDao = FakeReadingDao()
+        val importRepo = ReadingsRepository(importDao)
+        val result = importRepo.importCsv(chunks.joinToString(""))
+
+        assertEquals(readings.toSet(), result.readings.toSet())
     }
 }

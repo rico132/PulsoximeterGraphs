@@ -1,6 +1,7 @@
 package com.oxipulse.pulsoximetergraphs.data.csv
 
 import com.oxipulse.pulsoximetergraphs.data.db.ReadingEntity
+import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
@@ -28,7 +29,14 @@ import java.time.format.DateTimeParseException
  */
 object CsvParser {
 
-    private const val EXPECTED_HEADER = "DATE,TIME,SPO2,PULSE"
+    /**
+     * The wire format's header row, in both directions: [parse] skips a line matching this
+     * (case-insensitively), and [format]'s own caller
+     * ([com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository.exportCsv]) writes it
+     * once up front — a single source of truth for the exact header text so import/export can't
+     * quietly drift apart.
+     */
+    const val HEADER_LINE = "DATE,TIME,SPO2,PULSE"
 
     private val DATE_FORMATTER: DateTimeFormatter = DateTimeFormatter.ISO_LOCAL_DATE
     private val TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ISO_LOCAL_TIME
@@ -58,7 +66,7 @@ object CsvParser {
         for (rawLine in lines) {
             val line = rawLine.trim()
             if (line.isEmpty()) continue
-            if (line.equals(EXPECTED_HEADER, ignoreCase = true)) continue
+            if (line.equals(HEADER_LINE, ignoreCase = true)) continue
 
             totalDataRows++
             val reading = parseRow(line, zoneId)
@@ -70,6 +78,28 @@ object CsvParser {
         }
 
         return ParseResult(readings, skippedRowCount = skipped, totalDataRowCount = totalDataRows)
+    }
+
+    /**
+     * Formats [reading] as one CSV data row (no trailing line separator) — the export-side
+     * inverse of [parseRow], used by
+     * [com.oxipulse.pulsoximetergraphs.data.repository.ReadingsRepository.exportCsv]. [zoneId]
+     * (defaulting to the device's current default zone, same as [parse]) converts the stored
+     * epoch second back to a local date/time; since the format itself carries no zone info (see
+     * this object's own doc), a file exported here and re-imported on a device set to a
+     * *different* zone reads back shifted by the zone difference — there's no way around that
+     * without changing the wire format itself. Plain `Instant -> ZonedDateTime -> LocalDateTime`
+     * (not attempting to literally undo [parseRow]'s `LocalDateTime.atZone(zoneId)`) is
+     * deliberate: that forward conversion can be ambiguous (a DST fall-back local time maps to
+     * two different instants) or invalid (a DST spring-forward gap has no matching instant at
+     * all), but going the other way, from a real stored instant back to local date/time, is
+     * always exactly one answer.
+     */
+    fun format(reading: ReadingEntity, zoneId: ZoneId = ZoneId.systemDefault()): String {
+        val localDateTime = Instant.ofEpochSecond(reading.timestampEpochSec).atZone(zoneId).toLocalDateTime()
+        val date = DATE_FORMATTER.format(localDateTime.toLocalDate())
+        val time = TIME_FORMATTER.format(localDateTime.toLocalTime())
+        return "$date, $time, ${reading.spo2}, ${reading.pulse}"
     }
 
     private fun parseRow(line: String, zoneId: ZoneId): ReadingEntity? {

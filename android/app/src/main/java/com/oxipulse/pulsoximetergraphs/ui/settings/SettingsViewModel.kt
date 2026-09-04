@@ -11,6 +11,7 @@ import com.oxipulse.pulsoximetergraphs.data.settings.TestModePreferenceRepositor
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdConfig
 import com.oxipulse.pulsoximetergraphs.data.settings.ThresholdsRepository
 import com.oxipulse.pulsoximetergraphs.data.update.GithubReleaseChecker
+import java.time.Instant
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -70,6 +71,16 @@ class SettingsViewModel(
             onResult(result.readings.size, result.skippedRowCount)
         }
     }
+
+    /**
+     * Streams [range] (null = every reading in the database) out as CSV via [onChunk] — a thin
+     * passthrough to [ReadingsRepository.exportCsv]. This ViewModel doesn't hold a
+     * [android.content.Context] to open an output stream itself, so [onChunk] writing straight to
+     * one lives in [SettingsScreen]'s own SAF `CreateDocument` launcher — the same split
+     * [importCsvText] already uses for reading one.
+     */
+    suspend fun exportCsv(range: ClosedRange<Instant>?, onChunk: (String) -> Unit): Int =
+        readingsRepository.exportCsv(range, onChunk)
 
     /** Returns null on success, or a validation-error message. Never persists an invalid config. */
     fun save(newConfig: ThresholdConfig): String? = thresholdsRepository.update(newConfig)
